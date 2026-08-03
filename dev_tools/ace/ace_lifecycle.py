@@ -11,6 +11,7 @@ import platform
 import shutil
 import subprocess
 import re
+import sys
 
 from .ace_common import (CYAN, YELLOW, GREEN, RED, RESET, DIM)
 
@@ -446,25 +447,18 @@ class LifecycleMixin:
         print(f"[+] Created script: {filepath}")
         print(f"[+] Made executable (chmod +x)")
 
-        # Determine editor: $EDITOR env var, or fall back to nano
-        editor = os.environ.get("EDITOR")
-        if not editor:
-            # Common fallbacks in order of preference
-            for candidate in ["nano", "vim", "vi", "micro"]:
-                try:
-                    subprocess.run(["which", candidate], capture_output=True, check=True)
-                    editor = candidate
-                    break
-                except (subprocess.CalledProcessError, FileNotFoundError):
-                    continue
+        # Open in the ETCS viewer (curses TUI over the .etcs structure), not a raw
+        # editor: a .etcs script is a causal DAG of refs, and the viewer navigates
+        # that structure (handing off to $EDITOR per-layer when you actually edit).
+        viewer = self.tool_root / "dev_tools" / "etcs_viewer.py"
+        if not viewer.is_file():
+            print(f"{YELLOW}[!] ETCS viewer not found at {viewer}.{RESET} Edit manually: {filepath}")
+            return
 
-        if editor:
-            print(f"[*] Opening in {editor}...")
-            try:
-                subprocess.run([editor, str(filepath)], check=True)
-            except subprocess.CalledProcessError as e:
-                print(f"[!] Editor exited with error: {e}")
-            except FileNotFoundError:
-                print(f"[!] Editor '{editor}' not found. Please edit manually: {filepath}")
-        else:
-            print(f"[!] No editor found. Set $EDITOR or edit manually: {filepath}")
+        print(f"[*] Opening in the ETCS viewer...")
+        try:
+            subprocess.run([sys.executable, str(viewer), str(filepath)], check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"[!] Viewer exited with error: {e}")
+        except FileNotFoundError:
+            print(f"[!] Could not launch the viewer. Edit manually: {filepath}")

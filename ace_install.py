@@ -38,8 +38,8 @@ class AceManager(RegistryMixin, DepsMixin, AbiMixin, BuildMixin,
 
     def __init__(self):
         self.script_path = Path(__file__).resolve()
-        self.ace_root = self.script_path.parent
-        os.environ["ACE_ROOT"] = str(self.ace_root)
+        self.tool_root = self.script_path.parent   # where the ace tool itself lives
+        self._ace_root = None                       # ETCS project root, discovered lazily on first use
 
         self.allowed_make_targets = {
             'build', 'clean', 'test', 'install', 'all', 'help'
@@ -48,6 +48,62 @@ class AceManager(RegistryMixin, DepsMixin, AbiMixin, BuildMixin,
         self.root_make_targets = {
             'all', 'modules', 'loaders', 'clean', 'clean_modules', 'clean_loaders'
         }
+
+    @property
+    def ace_root(self):
+        """The ETCS project root, discovered on first access and cached.
+
+        Lazy so commands that don't need the ETCS tree (e.g. `script`) never
+        trigger the search or its warning. Exported to the environment for
+        child processes (make) the first time it resolves.
+        """
+        if self._ace_root is None:
+            self._ace_root = self._find_etcs_root()
+            os.environ["ACE_ROOT"] = str(self._ace_root)
+            os.environ["ETCS_ROOT"] = str(self._ace_root)
+        return self._ace_root
+
+    def _find_etcs_root(self):
+        """Locate the ETCS project root.
+
+        The ace tool no longer lives inside the ETCS tree, so the root is
+        discovered rather than assumed to be the tool's own directory:
+          1. $ETCS_ROOT if it points at a real directory
+          2. an upward search from the current directory, then the tool
+             directory, for ETCS.h (the project entry point)
+        Falls back (with a warning) to the current directory so path-based
+        commands fail with their own clear message rather than crashing here.
+        """
+        env = os.environ.get("ETCS_ROOT")
+        if env:
+            p = Path(env).expanduser().resolve()
+            if p.is_dir():
+                return p
+            print(f"{YELLOW}[!] ETCS_ROOT={env} is not a directory; searching instead.{RESET}")
+
+        def looks_like_root(d):
+            # ETCS.h is the public entry point at the base of the ETCS project,
+            # so its presence marks the root unambiguously -- and a subproject
+            # (which has its own Makefile) won't carry it, so the search keeps
+            # walking up to the real root rather than stopping short.
+            return (d / "ETCS.h").is_file()
+
+        seen = set()
+        for start in (Path.cwd(), self.script_path.parent):
+            d = start.resolve()
+            while d not in seen:
+                seen.add(d)
+                if looks_like_root(d):
+                    return d
+                if d.parent == d:
+                    break
+                d = d.parent
+
+        print(f"{YELLOW}[!] Could not locate the ETCS root "
+              f"(no ETCS.h found in this directory or any parent).{RESET}")
+        print(f"{DIM}    Set ETCS_ROOT, run ace from inside the ETCS tree, or add a .etcs-root "
+              f"marker at the project root. Falling back to the current directory.{RESET}")
+        return Path.cwd()
 
 
 if __name__ == "__main__":
