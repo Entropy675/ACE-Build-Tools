@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<language id="etcs" _name="ETCS" version="2.0" _section="Sources">
+  <metadata>
+    <property name="globs">*.etcs</property>
+  </metadata>
+
+  <styles>
+    <style id="comment" _name="Comment" map-to="def:comment"/>
+    <style id="state-shift" _name="State Shift" map-to="def:preprocessor"/>
+    <style id="operator" _name="Operator" map-to="def:builtin"/>
+    <style id="base-input" _name="Base Input" map-to="def:special-char"/>
+    <style id="payload" _name="Payload" map-to="def:string"/>
+  </styles>
+
+  <definitions>
+    <context id="comment" style-ref="comment">
+      <match>#.*$</match>
+    </context>
+
+    <context id="state-shift-sequence">
+      <match>^\s*(context|spawn)\s+([^\s]+)(?:\s+([^\s]+))?</match>
+      <include>
+        <context sub-pattern="1" style-ref="state-shift"/>   <context sub-pattern="2" style-ref="operator"/>      <context sub-pattern="3" style-ref="state-shift"/>   </include>
+    </context>
+
+    <context id="qualified-token" style-ref="operator">
+      <match>^[A-Za-z0-9_]+::[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)?</match>
+    </context>
+
+    <context id="base-input" style-ref="base-input">
+      <match>^[A-Z][a-zA-Z0-9_]*</match>
+    </context>
+
+    <context id="payload" style-ref="payload">
+      <match>\s+.*$</match>
+    </context>
+
+    <context id="etcs">
+      <include>
+        <context ref="comment"/>
+        <context ref="state-shift-sequence"/>
+        <context ref="qualified-token"/>
+        <context ref="base-input"/>
+        <context ref="payload"/>
+      </include>
+    </context>
+  </definitions>
+</language>
