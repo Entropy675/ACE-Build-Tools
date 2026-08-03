@@ -63,46 +63,148 @@ class AceManager(RegistryMixin, DepsMixin, AbiMixin, BuildMixin,
             os.environ["ETCS_ROOT"] = str(self._ace_root)
         return self._ace_root
 
-    def _find_etcs_root(self):
-        """Locate the ETCS project root.
+    @staticmethod
+    def _is_etcs_root(d):
+        """A directory is the ETCS root iff it carries ETCS.h (the entry point)."""
+        try:
+            return (Path(d) / "ETCS.h").is_file()
+        except OSError:
+            return False
 
-        The ace tool no longer lives inside the ETCS tree, so the root is
-        discovered rather than assumed to be the tool's own directory:
-          1. $ETCS_ROOT if it points at a real directory
-          2. an upward search from the current directory, then the tool
-             directory, for ETCS.h (the project entry point)
-        Falls back (with a warning) to the current directory so path-based
-        commands fail with their own clear message rather than crashing here.
+    def _root_cache_path(self):
+        base = os.environ.get("XDG_CACHE_HOME")
+        return (Path(base) if base else Path.home() / ".cache") / "ace" / "etcs_root"
+
+    def _read_root_cache(self):
+        try:
+            p = self._root_cache_path()
+            if p.is_file():
+                txt = p.read_text().strip()
+                return Path(txt) if txt else None
+        except OSError:
+            pass
+        return None
+
+    def _write_root_cache(self, path):
+        try:
+            p = self._root_cache_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(str(Path(path).resolve()))
+        except OSError:
+            pass
+
+    @staticmethod
+    def _safe_subdirs(d):
+        """Immediate subdirectories of d, skipping hidden ones and unreadable dirs."""
+        try:
+            return [c for c in d.iterdir() if c.is_dir() and not c.name.startswith(".")]
+        except OSError:
+            return []
+
+    # directory names never worth descending into during the filesystem walk
+    _WALK_SKIP = {".git", "node_modules", "__pycache__", "obj", "build", "dist",
+                  ".cache", "venv", ".venv", "target", ".mypy_cache", ".pytest_cache"}
+
+    def _bfs_for_root(self, base, max_dirs=4000, max_depth=5):
+        """Bounded breadth-first walk under `base` for a directory carrying ETCS.h.
+        Uses its own visited set (independent of the ancestor/sibling pass) so it
+        actually descends subtrees that pass only glanced at. Bounded in both
+        breadth (max_dirs scanned) and depth so it can never crawl the whole disk."""
+        visited = set()
+        queue = [(base, 0)]
+        scanned = 0
+        while queue and scanned < max_dirs:
+            d, depth = queue.pop(0)
+            if d in visited:
+                continue
+            visited.add(d)
+            scanned += 1
+            if self._is_etcs_root(d):
+                return d
+            if depth >= max_depth:
+                continue
+            for c in self._safe_subdirs(d):
+                if c.name not in self._WALK_SKIP and c not in visited:
+                    queue.append((c, depth + 1))
+        return None
+
+    def _search_etcs_root(self):
+        """Find the ETCS root without assuming it is an ancestor of the tool.
+
+        Phase 1: from cwd and the tool dir, walk up; at each level also check the
+        siblings, so an ETCS tree sitting *beside* the tool (../ETCS/ETCS.h) is
+        found. Phase 2: a bounded filesystem walk under a few bases, for a tree
+        that has been relocated off the ancestor/sibling line.
         """
-        env = os.environ.get("ETCS_ROOT")
-        if env:
-            p = Path(env).expanduser().resolve()
-            if p.is_dir():
-                return p
-            print(f"{YELLOW}[!] ETCS_ROOT={env} is not a directory; searching instead.{RESET}")
+        checked = set()
+        starts = []
+        for s0 in (Path.cwd(), self.script_path.parent):
+            r = s0.resolve()
+            if r not in starts:
+                starts.append(r)
 
-        def looks_like_root(d):
-            # ETCS.h is the public entry point at the base of the ETCS project,
-            # so its presence marks the root unambiguously -- and a subproject
-            # (which has its own Makefile) won't carry it, so the search keeps
-            # walking up to the real root rather than stopping short.
-            return (d / "ETCS.h").is_file()
-
-        seen = set()
-        for start in (Path.cwd(), self.script_path.parent):
-            d = start.resolve()
-            while d not in seen:
-                seen.add(d)
-                if looks_like_root(d):
-                    return d
+        for start in starts:
+            d = start
+            while True:
+                if d not in checked:
+                    checked.add(d)
+                    if self._is_etcs_root(d):
+                        return d
+                    for sib in self._safe_subdirs(d.parent):
+                        if sib not in checked:
+                            checked.add(sib)
+                            if self._is_etcs_root(sib):
+                                return sib
                 if d.parent == d:
                     break
                 d = d.parent
 
+        bases = []
+        for b in (self.script_path.parent.parent, Path.cwd().parent, Path.home()):
+            rb = b.resolve()
+            if rb not in bases:
+                bases.append(rb)
+        for base in bases:
+            hit = self._bfs_for_root(base)
+            if hit:
+                return hit
+        return None
+
+    def _find_etcs_root(self):
+        """Locate the ETCS project root (the directory containing ETCS.h).
+
+        The tool may live anywhere -- inside the ETCS tree, beside it, or off on
+        its own -- so resolution never assumes a parent relationship. A resolved
+        path is cached; if $ETCS_ROOT or the cache points somewhere that no longer
+        contains ETCS.h (the ETCS system moved or was deleted), that hint is
+        discarded and the search re-runs, then the new location is re-cached.
+        """
+        # 1. explicit override, honoured only while it still holds ETCS.h
+        env = os.environ.get("ETCS_ROOT")
+        if env:
+            p = Path(env).expanduser().resolve()
+            if self._is_etcs_root(p):
+                return p
+            print(f"{YELLOW}[!] ETCS_ROOT={env} no longer contains ETCS.h; re-resolving.{RESET}")
+
+        # 2. last known location, re-validated (handles a moved ETCS tree)
+        cached = self._read_root_cache()
+        if cached and self._is_etcs_root(cached):
+            return cached.resolve()
+        if cached:
+            print(f"{DIM}[i] Cached ETCS root {cached} is gone; searching for its new location.{RESET}")
+
+        # 3. discover it (ancestors, siblings, then a bounded walk)
+        found = self._search_etcs_root()
+        if found:
+            found = found.resolve()
+            self._write_root_cache(found)
+            return found
+
         print(f"{YELLOW}[!] Could not locate the ETCS root "
-              f"(no ETCS.h found in this directory or any parent).{RESET}")
-        print(f"{DIM}    Set ETCS_ROOT, run ace from inside the ETCS tree, or add a .etcs-root "
-              f"marker at the project root. Falling back to the current directory.{RESET}")
+              f"(no directory containing ETCS.h found near the tool or the cwd).{RESET}")
+        print(f"{DIM}    Set ETCS_ROOT to the directory containing ETCS.h, or run ace from "
+              f"inside/near the ETCS tree. Falling back to the current directory.{RESET}")
         return Path.cwd()
 
 
