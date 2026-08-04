@@ -235,7 +235,7 @@ if __name__ == "__main__":
         elif cmd == "registry" and args[1:] == ["verify"]: ace.registry_verify()
         elif cmd == "deps":                             ace.deps(args[1:])
         elif cmd == "abi":                              ace.abi(args[1:])
-        elif cmd == "script" and len(args) > 1:         ace.create_script(args[1])  # <<< NEW
+        elif cmd == "script" and len(args) > 1:         ace.create_script(args[1]) 
         else:
             print(f"[-] Unknown or incomplete command: '{cmd}'")
             sys.exit(1)

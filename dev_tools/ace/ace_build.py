@@ -55,8 +55,12 @@ class BuildMixin:
 
         return validated
 
-    def _run_root_make(self, target, extra_args=None):
-        """Run a target against the master Makefile at ace_root with extra flags."""
+    def _run_root_make(self, target, extra_args=None, keep_going=False):
+        """Run a target against the master Makefile at ace_root with extra flags.
+
+        keep_going passes make's -k, so one module's failure does not abort its
+        siblings -- their builds are unrelated to the failed one.
+        """
         if extra_args is None:
             extra_args = []
 
@@ -67,11 +71,15 @@ class BuildMixin:
 
         print(f"[*] Routing to master Makefile for target: {target}")
         make_cmd = ["make", "-C", str(self.ace_root), f"ACE_ROOT={self.ace_root}", target]
+        if keep_going:
+            make_cmd.append("-k")
         make_cmd.extend(extra_args)
 
         try:
             subprocess.run(make_cmd, check=True)
         except subprocess.CalledProcessError as e:
+            # Under keep_going a non-zero exit just means some target failed; the
+            # modules that built are still valid, so this is a warning, not a stop.
             print(f"[-] Build error: {e}")
 
     def make(self, args):
@@ -88,20 +96,18 @@ class BuildMixin:
         self._run_root_make("generate_hashes")
         try:
             if args[0] == "loader":
-                extras = self._validate_make_args(args[2:])
                 if len(args) >= 2:
                     loader_name = args[1]
-                    extras = self._validate_make_args(args[2:])
-                    print("With extras: ")
-                    for i in extras:
-                        print(i)
+                    user_args = args[2:]
                 else:
-                    print("loader path, args <=2")
                     loader_name = "etcs"
-                    extras = self._validate_make_args(["-DETCS_REPL_SHELL"])
-                    print("With extras: ")
-                    for i in extras:
-                        print(i)
+                    user_args = []
+                # A loader is only ever built standalone in order to run it with the
+                # shell, so -DETCS_REPL_SHELL is always on; user -D flags stack on top.
+                extras = self._validate_make_args(["-DETCS_REPL_SHELL"] + user_args)
+                print("With extras: ")
+                for i in extras:
+                    print(i)
                 if loader_name.startswith("Run_"):
                     loader_name = loader_name[4:]
                 if loader_name.endswith(".cc"):
@@ -200,10 +206,15 @@ class BuildMixin:
 
             if args[0] in self.root_make_targets:
                 extras = self._validate_make_args(args[1:])
-                if args[0] in ("all", "modules"):
+                batch = args[0] in ("all", "modules")
+                if batch:
                     self._announce_full_tagset()
-                self._run_root_make(args[0], extra_args=extras)
-                if args[0] in ("all", "modules"):
+                # Keep going so one module's failure doesn't take down its siblings...
+                self._run_root_make(args[0], extra_args=extras, keep_going=batch)
+                if batch:
+                    # ...then copy unconditionally, so every module that DID build
+                    # lands in ./bin instead of vanishing with the aborted run.
+                    self._run_root_make("copy_modules", extra_args=extras)
                     for module, so in self._all_module_sos():
                         self.introspect_and_record(module, so_path=so, announce=False)
                 return
