@@ -67,7 +67,8 @@ class AceManager(RegistryMixin, DepsMixin, AbiMixin, BuildMixin,
     def _is_etcs_root(d):
         """A directory is the ETCS root iff it carries ETCS.h (the entry point)."""
         try:
-            return (Path(d) / "ETCS.h").is_file()
+            path = Path(d)
+            return path.name == "ETCS" and (Path(d) / "ETCS.h").is_file()
         except OSError:
             return False
 

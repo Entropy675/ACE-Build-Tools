@@ -180,7 +180,15 @@ class BuildMixin:
                     print(f"[*] Current ABI interface for {mod} (pre-build):")
                     self.introspect_and_record(mod, announce=True)
                     self._run_root_make(f"module_{mod}", extra_args=extras)
-                    self.introspect_and_record(mod, announce=False)
+                    # Announced, not silent. The pre-build pass shows what the
+                    # LAST build left behind; the drift you actually want to see
+                    # is what THIS build just changed, and that only exists once
+                    # the .so has been rewritten. Recording it without printing
+                    # meant the diff was computed, persisted, and thrown away --
+                    # so an export appearing or vanishing was invisible until the
+                    # next unrelated invocation surfaced it as stale news.
+                    print(f"[*] ABI interface for {mod} (post-build):")
+                    self.introspect_and_record(mod, announce=True)
                 return
 
             if len(args) >= 3 and args[0] == "clean" and args[1] == "module":

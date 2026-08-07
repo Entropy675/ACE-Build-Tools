@@ -19,7 +19,7 @@ class AbiMixin:
 
     ABI_SUFFIX = "@@ETCS_ABI"
     _ABI_DISPATCH_KINDS = ("Work", "Stream")
-    _ABI_TRIAD = ("Make", "List", "GetHash")
+    _ABI_TRIAD = ("Make", "MakeChild", "List", "GetHash")
     _ABI_LOADER_HOOKS = ("RegisterDynamicLoader", "RegisterRootSignalContext")
     _ABI_LIFECYCLE = ("Cleanup", "GetArena", "GetHash")
     _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -333,7 +333,7 @@ class AbiMixin:
             print(line)
 
     def _composite_columns(self, blocks, per_row=None, gap=3, buffer=1,
-                           max_width=None):
+                           max_width=None, group_by_width=True):
         """Splice multi-line blocks into side-by-side columns, packing as many
         columns per band as the terminal width allows -- adaptive, not
         quantised. (C code powers-of-2 the column count because it can't
@@ -358,6 +358,30 @@ class AbiMixin:
 
         block_w = [max((self._visible_len(l) for l in blk), default=0)
                    for blk in blocks]
+
+        # Group blocks of similar width into the same band before laying out.
+        #
+        # Bands are filled sequentially, so declaration order puts whatever
+        # happens to be adjacent next to each other -- one wide block in a band
+        # of narrow ones stretches that band's tallest column and leaves the
+        # rest of the row trailing whitespace to reach it, while the NEXT band
+        # repeats the problem with a different offender. Sorting by width makes
+        # each band internally uniform: the wide ones sit together, the narrow
+        # ones sit together, and the ragged edge appears once (between bands)
+        # instead of once per band.
+        #
+        # Stable, and descending, so ties keep declaration order and the widest
+        # band leads -- which also means the column-index widths are settled by
+        # the first band rather than drifting as later bands are measured.
+        #
+        # Purely presentational: this reorders how types are DISPLAYED, not any
+        # ordering the ABI itself depends on (tag bit assignment, manifest
+        # order, dispatch). If a caller ever needs the original sequence
+        # preserved on screen, that wants a flag rather than removing this.
+        if group_by_width and len(blocks) > 1:
+            order = sorted(range(len(blocks)), key=lambda i: -block_w[i])
+            blocks  = [blocks[i]  for i in order]
+            block_w = [block_w[i] for i in order]
 
         def col_widths_for(cols):
             """Per-column-index max width across every band, for a given column
