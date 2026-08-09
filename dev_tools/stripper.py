@@ -1,60 +1,133 @@
 #!/usr/bin/env python3
 import sys
 import os
+import re
+import json
 
-def strip_comments(filepath):
-    print(f"Processing: {filepath}")
+# Regex explanation:
+# Group 1: Matches strings ("..." or '...') to ignore them.
+# Group 2: Matches block comments /* ... */ or contiguous // lines
+PATTERN = re.compile(
+    r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')|'  # Group 1: Strings (ignores them)
+    r'(/\*.*?\*/|//[^\r\n]*(?:\r?\n[ \t]*//[^\r\n]*)*)', # Group 2: Block comments OR contiguous // lines
+    re.DOTALL
+)
+
+def do_strip(filepath):
+    print(f"[STRIP] Processing: {filepath}")
     
     if not os.path.exists(filepath):
-        print(f"  ERROR: File not found!")
-        return
+        print("  FATAL ERROR: File not found!")
+        sys.exit(1)
 
-    with open(filepath, 'r') as f:
-        lines = f.readlines()
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
 
-    print(f"  Read {len(lines)} lines")
+    comments_db = {}
+    counter = 1
 
-    stripped = []
-    comments_only = []
-    
-    # This tracks the line number the comment *would* have had in the final stripped file
-    stripped_line_number = 1 
+    def replacer(match):
+        nonlocal counter
+        string_literal = match.group(1)
+        comment = match.group(2)
 
-    for line in lines:
-        if line.lstrip().startswith('//'):
-            # Extract the newline removal outside the f-string for older Python compatibility
-            clean_comment = line.rstrip('\n')
-            comments_only.append(f"{stripped_line_number}: {clean_comment}")
-        else:
-            stripped.append(line)
-            stripped_line_number += 1
+        # If it's a string, leave it completely untouched
+        if string_literal:
+            return string_literal
+
+        # If it's a comment, process and tokenize it
+        if comment:
+            # Transform contiguous // into block comments
+            if comment.startswith('//'):
+                lines = comment.split('\n')
+                # Strip leading whitespace, '//', and an optional single space
+                cleaned_lines = [re.sub(r'^[ \t]*//[ \t]?', '', line) for line in lines]
+                cleaned_lines = [
+                    line.replace('\u2014', '-')  # Em dash
+                        .replace('\u2013', '-')  # En dash
+                        .replace('\u2500', '-')  # En dash
+                        .replace('\u2192', '-->') # Rightwards arrow
+                    for line in cleaned_lines
+                ]
+
+                if len(cleaned_lines) == 1:
+                    # Single-line comment becomes an inline block
+                    formatted_comment = [f"// {cleaned_lines[0]}"]
+                else:
+                    # Multi-line comment becomes a formatted C-style block
+                    formatted_comment = ["/*"] + [f" * {line}" if line else " *" for line in cleaned_lines] + [" */"]
+            else:
+                # It's already a block comment (/* ... */), just split it for JSON formatting
+                formatted_comment = comment.split('\n')
+
+            token = f"/*@C{counter}@*/"
+            # Storing as a list makes json.dump format it cleanly on separate lines
+            comments_db[token] = formatted_comment
+            counter += 1
+            return token
+
+    # Apply the regex replacement
+    stripped_content = PATTERN.sub(replacer, content)
 
     base, ext = os.path.splitext(filepath)
     stripped_path = f"{base}.stripped{ext}"
-    comments_path = f"{base}.comments{ext}"
+    db_path = f"{base}.comments.json"
 
-    print(f"  Writing stripped code to: {stripped_path}")
-    print(f"  Writing extracted comments to: {comments_path}")
+    # Write the stripped code
+    with open(stripped_path, 'w', encoding='utf-8') as f:
+        f.write(stripped_content)
 
-    try:
-        with open(stripped_path, 'w') as f:
-            f.writelines(stripped)
+    # Write the comments database
+    with open(db_path, 'w', encoding='utf-8') as f:
+        json.dump(comments_db, f, indent=2)
+
+    print(f"  Saved {len(comments_db)} comment blocks to {db_path}")
+    print(f"  Stripped code saved to {stripped_path}\n")
+
+
+def do_merge(filepath):
+    print(f"[MERGE] Processing: {filepath}")
+    
+    base = filepath.replace(".stripped.", ".").replace(".comments.", ".")
+    base_no_ext, ext = os.path.splitext(base)
+    
+    stripped_path = f"{base_no_ext}.stripped{ext}"
+    db_path = f"{base_no_ext}.comments.json"
+
+    if not os.path.exists(stripped_path) or not os.path.exists(db_path):
+        print("  FATAL ERROR: Missing stripped code or comments JSON file.")
+        sys.exit(1)
+
+    with open(db_path, 'r', encoding='utf-8') as f:
+        comments_db = json.load(f)
+
+    with open(stripped_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # Find and replace all tokens with their original comments
+    for token, comment_data in comments_db.items():
+        # Join the list of strings back into a single multi-line string
+        if isinstance(comment_data, list):
+            original_comment = '\n'.join(comment_data)
+        else:
+            original_comment = comment_data
             
-        with open(comments_path, 'w') as f:
-            # Join the formatted comments with newlines
-            f.write('\n'.join(comments_only))
-            # Add a final newline if there were any comments
-            if comments_only:
-                f.write('\n')
-                
-        print(f"  Success! Separated {len(comments_only)} comment lines")
-    except Exception as e:
-        print(f"  ERROR writing file: {e}")
+        content = content.replace(token, original_comment)
+
+    # Overwrite the original file with the restored codebase
+    with open(base, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+    print(f"  Successfully restored {len(comments_db)} comment blocks into {base}\n")
+
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <file.h> [file2.cc ...]")
+        print(f"Usage: {sys.argv[0]} <file.ext | file.stripped.ext | file.comments.json> [...]")
         sys.exit(1)
 
     for filepath in sys.argv[1:]:
-        strip_comments(filepath)
+        if ".stripped." in filepath or ".comments." in filepath:
+            do_merge(filepath)
+        else:
+            do_strip(filepath)
