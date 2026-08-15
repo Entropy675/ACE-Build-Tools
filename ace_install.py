@@ -16,6 +16,7 @@ Layout (all under dev_tools/):
     ace_abi.py       <- ABI introspection, drift, column compositor
     ace_build.py     <- make dispatch + arg validation
     ace_lifecycle.py <- install/uninstall/setup/remove/stage/scaffold
+    ace_script.py    <- proxy for etcs_viewer.py script editor
 """
 import os
 import sys
@@ -27,11 +28,12 @@ from dev_tools.ace import (
     DepsMixin,
     AbiMixin,
     BuildMixin,
-    LifecycleMixin
+    LifecycleMixin,
+    ScriptMixin
 )
 
 class AceManager(RegistryMixin, DepsMixin, AbiMixin, BuildMixin,
-                 LifecycleMixin):
+                 LifecycleMixin, ScriptMixin):
     """Assembled from the subsystem mixins. Method resolution runs left to
     right across the bases; none of them define colliding names (verified at
     split time), so the order is for readability, not disambiguation."""
@@ -220,7 +222,7 @@ if __name__ == "__main__":
         print("           | registry verify")
         print("           | deps { check | install | arch }")
         print("           | abi [module]")
-        print("           | script <name>")
+        print("           | script [name]")
         sys.exit(0)
 
     cmd = args[0]
@@ -236,7 +238,7 @@ if __name__ == "__main__":
         elif cmd == "registry" and args[1:] == ["verify"]: ace.registry_verify()
         elif cmd == "deps":                             ace.deps(args[1:])
         elif cmd == "abi":                              ace.abi(args[1:])
-        elif cmd == "script" and len(args) > 1:         ace.create_script(args[1]) 
+        elif cmd == "script":                           ace.create_script(args[1] if len(args) > 1 else None) 
         else:
             print(f"[-] Unknown or incomplete command: '{cmd}'")
             sys.exit(1)
