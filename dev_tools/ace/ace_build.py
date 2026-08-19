@@ -102,9 +102,14 @@ class BuildMixin:
                 else:
                     loader_name = "etcs"
                     user_args = []
-                # A loader is only ever built standalone in order to run it with the
-                # shell, so -DETCS_REPL_SHELL is always on; user -D flags stack on top.
-                extras = self._validate_make_args(["-DETCS_REPL_SHELL"] + user_args)
+                # -DETCS_REPL_SHELL is on by default (loader runs interactively),
+                # but OFF when the user explicitly names 'etcs' -- that path is
+                # for building the core loader without the REPL shell wired in.
+                explicitly_etcs = len(args) >= 2 and loader_name == "etcs"
+                if explicitly_etcs:
+                    extras = self._validate_make_args(user_args)
+                else:
+                    extras = self._validate_make_args(["-DETCS_REPL_SHELL"] + user_args)
                 print("With extras: ")
                 for i in extras:
                     print(i)
@@ -245,9 +250,3 @@ class BuildMixin:
                 os.symlink(self.ace_root, etcs_link, target_is_directory=True)
             except PermissionError:
                 print("[!] Warning: Could not update ETCS link.")
-
-        try:
-            validated = self._validate_make_args(args)
-            subprocess.run(["make", f"ACE_ROOT={self.ace_root}"] + validated, check=True)
-        except (ValueError, subprocess.CalledProcessError) as e:
-            print(f"[-] Build error: {e}")
