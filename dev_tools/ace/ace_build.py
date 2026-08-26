@@ -244,6 +244,29 @@ class BuildMixin:
             if args[0] in self.root_make_targets:
                 extras = self._validate_make_args(args[1:])
                 batch = args[0] in ("all", "modules")
+
+                # Regenerate BEFORE make is invoked, not during.
+                #
+                # The master Makefile discovers modules with
+                #   MODULE_SUBDIRS := $(wildcard $(MODULES_DIR)/*/Makefile)
+                # which make expands while PARSING, before any recipe runs. A
+                # missing generated Makefile is therefore not a module that
+                # fails to build -- it is a module that is not there at all,
+                # and `ace make modules` prints "Building Modules" followed by
+                # nothing and exits 0.
+                #
+                # That went unnoticed because only the SINGULAR paths
+                # (`module <n>`, `loader <n>`) ensured their Makefile; the
+                # batch ones never did. Harmless until clean started removing
+                # them, at which point the two changes combined into a build
+                # that silently did nothing.
+                if args[0] in ("all", "modules"):
+                    for mod in sorted(set(self._all_manifests())
+                                      | set(self._defaulted_modules())):
+                        self.ensure_makefile(mod)
+                if args[0] in ("all", "loaders"):
+                    self.ensure_loaders_makefile()
+
                 if batch:
                     self._announce_full_tagset()
                 # Keep going so one module's failure doesn't take down its siblings...
