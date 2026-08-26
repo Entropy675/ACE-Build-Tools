@@ -48,6 +48,7 @@ shell escape: a dependency that needs something else is rejected, because the
 escape hatch IS the thing this format exists to stop accepting.
 """
 from pathlib import Path
+import hashlib
 import json
 import re
 import subprocess
@@ -96,6 +97,26 @@ def _sanitize(text):
 def _var(name):
     """Make variable name for a dependency."""
     return "DEP_" + re.sub(r"[^A-Za-z0-9]", "_", name).upper()
+
+
+def _abi_tag(abi_defines):
+    """Short, stable tag for a set of ABI-affecting defines.
+
+    Folded into the build-stamp and dependency-marker filenames so that
+    EDITING abi_defines invalidates everything built against the old set.
+
+    This is not tidiness. MBEDTLS_THREADING_C adds mutex members to
+    mbedTLS context structs: add it to a manifest without this tag and
+    make sees a correctly-rebuilt library sitting beside a module still
+    compiled against the old struct layout, decides nothing is out of
+    date, and produces a binary that links, loads, and corrupts memory.
+    Changing the tag changes the filenames, so the stale halves cannot
+    survive.
+    """
+    if not abi_defines:
+        return ""
+    joined = " ".join(sorted(abi_defines))
+    return "_" + hashlib.sha256(joined.encode()).hexdigest()[:8]
 
 
 class ManifestError(Exception):
@@ -324,6 +345,17 @@ class ManifestMixin:
         build = m.get("build", {})
         common = build.get("common", {})
 
+        # Collected up front because the build stamp's NAME depends on them,
+        # and the stamp is emitted above the dependency loop that declares
+        # them. Deduplicated, order-preserving: two dependencies may
+        # legitimately require the same define.
+        abi_defines = []
+        for dep in vendor:
+            for d in dep.get("abi_defines", []):
+                if d not in abi_defines:
+                    abi_defines.append(d)
+        abi_tag = _abi_tag(abi_defines)
+
         L = []
         w = L.append
 
@@ -348,10 +380,58 @@ class ManifestMixin:
         w("CXX := g++")
         w("CC  := gcc")
         w("")
-        w("# Architecture stamp. Vendored artifacts are compiled for ONE machine;")
-        w("# a tree carried to another would otherwise relink objects built for the")
-        w("# architecture it came from, which links cleanly and fails at load.")
-        w("ARCH_STAMP := .ace_arch_$(ARCH)")
+        w("# " + "-" * 66)
+        w("# Sanitizers: make ASAN=1 / make TSAN=1.")
+        w("#")
+        w("# Mutually exclusive -- they instrument the same code paths and cannot")
+        w("# coexist in one binary.")
+        w("#")
+        w("# The module and whatever loader dlopens it MUST be built the same way.")
+        w("# They share one address space, and a sanitizer runtime that sees only")
+        w("# half of it reports nonsense.")
+        w("#")
+        w("# Vendored dependencies are NOT rebuilt for ASan: it interposes malloc")
+        w("# and free process-wide, so allocation faults inside an uninstrumented")
+        w("# library are still caught -- that is exactly how mbedTLS's PSA")
+        w("# double-free was found. TSan is different: it only sees races in code")
+        w("# it instrumented, so TSAN=1 rebuilds them.")
+        w("# " + "-" * 66)
+        w("SANITIZE   :=")
+        w("SAN_SUFFIX :=")
+        w("ifeq ($(ASAN),1)")
+        w("ifeq ($(TSAN),1)")
+        w("    $(error ASAN=1 and TSAN=1 are mutually exclusive)")
+        w("endif")
+        w("    SANITIZE   := -fsanitize=address -fno-omit-frame-pointer")
+        w("    SAN_SUFFIX := _asan")
+        w("endif")
+        w("ifeq ($(TSAN),1)")
+        w("    SANITIZE   := -fsanitize=thread -fno-omit-frame-pointer")
+        w("    SAN_SUFFIX := _tsan")
+        w("endif")
+        w("")
+        w("# Vendored dependencies follow only the TSan half, per the note above:")
+        w("# rebuilding them costs minutes, and for ASan it buys only overflow")
+        w("# detection INSIDE the dependency -- allocation faults there are caught")
+        w("# either way.")
+        w("DEP_SANITIZE   :=")
+        w("DEP_SAN_SUFFIX :=")
+        w("ifeq ($(TSAN),1)")
+        w("    DEP_SANITIZE   := -fsanitize=thread -fno-omit-frame-pointer")
+        w("    DEP_SAN_SUFFIX := _tsan")
+        w("endif")
+        w("")
+        w("# Build stamp -- architecture, sanitizer, and ABI-define set.")
+        w("#")
+        w("# A REAL prerequisite of the final target, not order-only: switching")
+        w("# any of the three must force a relink, and make has no other way to")
+        w("# notice that CXXFLAGS changed. Mixing instrumented and uninstrumented")
+        w("# objects in one .so links cleanly and then misbehaves at runtime,")
+        w("# which is precisely what this stamp exists to make impossible. The")
+        w("# architecture half matters for the same reason it always did: a tree")
+        w("# carried to another machine would otherwise relink objects built for")
+        w("# the architecture it came from.")
+        w(f"BUILD_STAMP := .ace_build_$(ARCH)$(SAN_SUFFIX){abi_tag}")
         w("")
 
         # ---- per-dependency variables ------------------------------------
@@ -380,10 +460,13 @@ class ManifestMixin:
             # build
             if dep.get("build"):
                 bd = dep["build"].get("build_dir", "build")
-                marker = f"$({v}_DIR)/{bd}/.ace_built_$(ARCH)"
+                marker = (f"$({v}_DIR)/{bd}/.ace_built_$(ARCH)$(DEP_SAN_SUFFIX)"
+                          + _abi_tag(dep.get("abi_defines", [])))
                 build_markers.append(marker)
                 build_rules.append(
-                    self._emit_build_rule(v, dep, marker, fetch_markers[-1] if src["type"] == "git" else None))
+                    self._emit_build_rule(
+                        v, dep, marker,
+                        fetch_markers[-1] if src["type"] == "git" else None))
                 clean_paths.append(f"$({v}_DIR)/{bd}")
 
             for inc in prov.get("include", []):
@@ -429,9 +512,14 @@ class ManifestMixin:
         cxx.append(r'-DETCS_MODULE_NAME=\"$(TARGET_BASE_NAME)\"')
         cxx += ["-I.", "-I../.."]
         cxx += dep_includes
+        # ABI defines, emitted here AND into every dependency's own build (see
+        # _emit_build_rule). One field, two places, because that is what
+        # correctness requires -- having to remember it in both by hand is how
+        # a struct layout ends up disagreeing across a link.
+        cxx += [f"-D{d}" for d in abi_defines]
         cxx += [f"-D{d}" for d in common.get("defines", [])]
         cxx += common.get("cxxflags", [])
-        cxx += ["-pipe", "-fno-plt", "$(CUSTOM_CXXFLAGS)"]
+        cxx += ["-pipe", "-fno-plt", "$(SANITIZE)", "$(CUSTOM_CXXFLAGS)"]
         w("CXXFLAGS := " + " \\\n            ".join(cxx))
         w("")
 
@@ -508,8 +596,8 @@ class ManifestMixin:
         w('\t@echo "✓ Built $(FINAL_TARGET) for $(UNAME_S) ($(ARCH))"')
         w("")
 
-        w("$(ARCH_STAMP):")
-        w("\t@rm -f .ace_arch_*")
+        w("$(BUILD_STAMP):")
+        w("\t@rm -f .ace_build_*")
         w("\t@touch $@")
         w("")
 
@@ -532,8 +620,12 @@ class ManifestMixin:
         w("")
 
         # ---- link ---------------------------------------------------------
-        prereqs = ["$(MODULE_DEPS)", "$(HASH_HEADER)"] + obj_targets + build_markers
-        order_only = fetch_markers + ["$(ARCH_STAMP)"]
+        # BUILD_STAMP is a REAL prerequisite, not order-only: it is how a
+        # changed architecture, sanitizer or ABI-define set forces a relink.
+        # Order-only would let a stale .so built with different flags stand.
+        prereqs = (["$(MODULE_DEPS)", "$(HASH_HEADER)", "$(BUILD_STAMP)"]
+                   + obj_targets + build_markers)
+        order_only = fetch_markers
         w("# Archives come AFTER the translation unit that needs them: gold does")
         w("# not rescan an archive it has already passed, so a dependency listed")
         w("# among the flags resolves only by accident.")
@@ -570,7 +662,7 @@ class ManifestMixin:
 
         # ---- clean --------------------------------------------------------
         w("clean:")
-        w("\trm -f $(FINAL_TARGET) *.o $(HASH_HEADER) $(DEPFILE) .ace_arch_*")
+        w("\trm -f $(FINAL_TARGET) *.o $(HASH_HEADER) $(DEPFILE) .ace_build_*")
         w("\trm -rf .ace_obj")
         for p in clean_paths:
             w(f"\trm -rf {p}")
@@ -608,22 +700,48 @@ class ManifestMixin:
         system = b["system"]
         bd = b.get("build_dir", "build")
         par = "--parallel $(NPROC)" if b.get("parallel", True) else ""
+
+        # The SAME defines the module compiles with (see _emit_makefile).
+        # A define that changes struct layout has to reach both halves or
+        # the library and its consumer disagree about member offsets --
+        # which links, loads, and corrupts memory rather than failing.
+        abi = " ".join(f"-D{d}" for d in dep.get("abi_defines", []))
+        cflags = (abi + " $(DEP_SANITIZE)").strip()
+
         lines = []
         lines.append(f"# {dep['name']}: {system}")
+        if abi:
+            lines.append(f"# ABI defines: {abi} -- also in the module's own CXXFLAGS.")
         lines.append(f"{marker}:" + (f" | {fetch_marker}" if fetch_marker else ""))
 
         if system == "cmake":
-            defines = " ".join(f"-D{d}" for d in b.get("defines", []))
+            user = list(b.get("defines", []))
+            # Merge rather than append a second -DCMAKE_C_FLAGS: cmake takes
+            # the last one and would silently drop whichever lost.
+            merged, seen_cflags = [], False
+            for d in user:
+                if d.startswith("CMAKE_C_FLAGS="):
+                    seen_cflags = True
+                    merged.append(f'{d} {cflags}'.strip())
+                else:
+                    merged.append(d)
+            if cflags and not seen_cflags:
+                merged.append(f"CMAKE_C_FLAGS={cflags}")
+            defines = " ".join(f'-D{d}' if "=" not in d or " " not in d
+                               else f'-D"{d}"' for d in merged)
             lines.append(f"\t@rm -rf $({v}_DIR)/{bd}")
             lines.append(f"\t@cmake -S $({v}_DIR) -B $({v}_DIR)/{bd} {defines}".rstrip())
             lines.append(f"\t@cmake --build $({v}_DIR)/{bd} {par}".rstrip())
         elif system == "autotools":
             args = " ".join(b.get("configure_args", []))
             targets = " ".join(b.get("targets", []))
-            lines.append(f"\t@cd $({v}_DIR) && ./configure {args} && $(MAKE) {targets}".rstrip())
+            env = f'CFLAGS="{cflags}" ' if cflags else ""
+            lines.append(f"\t@cd $({v}_DIR) && {env}./configure {args} "
+                         f"&& {env}$(MAKE) {targets}".rstrip())
         elif system == "make":
             targets = " ".join(b.get("targets", []))
-            lines.append(f"\t@$(MAKE) -C $({v}_DIR) {targets}".rstrip())
+            env = f'CFLAGS="{cflags}" ' if cflags else ""
+            lines.append(f"\t@{env}$(MAKE) -C $({v}_DIR) {targets}".rstrip())
         # "none" emits no build step; the marker exists only to order the fetch.
 
         lines.append("\t@mkdir -p $(dir $@)")
@@ -633,12 +751,20 @@ class ManifestMixin:
         return "\n".join(lines)
 
     def _emit_obj_rule(self, v, dep, sources, gate=None):
-        cflags = " ".join(sources.get("cflags", []))
-        order = " ".join(["$(ARCH_STAMP)"] + list(gate or []))
+        # Own flags, plus the ABI defines (these objects are linked INTO the
+        # module, so they must agree with it) and the sanitizer -- these are
+        # cheap to rebuild, unlike a cmake dependency, so they follow the
+        # module rather than DEP_SANITIZE.
+        abi = " ".join(f"-D{d}" for d in dep.get("abi_defines", []))
+        cflags = " ".join(x for x in (" ".join(sources.get("cflags", [])),
+                                      abi, "$(SANITIZE)") if x)
         lines = []
         lines.append(f"# {dep['name']}: compiled with its own flags, not the module's")
         for ext, comp in ((".c", "$(CC)"), (".cc", "$(CXX)")):
-            lines.append(f".ace_obj/{v}_%.o: $({v}_DIR)/%{ext} | {order}")
+            # BUILD_STAMP real, gates order-only: the stamp must force a
+            # recompile when flags change; the gates only have to exist first.
+            gates = (" | " + " ".join(gate)) if gate else ""
+            lines.append(f".ace_obj/{v}_%.o: $({v}_DIR)/%{ext} $(BUILD_STAMP){gates}")
             lines.append("\t@mkdir -p $(dir $@)")
             lines.append(f"\t{comp} {cflags} -c $< -o $@")
             lines.append("")
@@ -756,12 +882,21 @@ class ManifestMixin:
         exists to prevent. Degrading quietly here would rebuild it.
         """
         includes, links, syslibs, errors = [], [], [], []
+        abi = []
         for name in module_names:
             try:
                 m = self.load_manifest(name, resolve_pins=True, silent=silent)
             except ManifestError as e:
                 errors.append(f"cannot inherit from {name}: {e}")
                 continue
+            # ABI defines travel with the headers. A loader that compiles a
+            # module's vendored headers without them sees a different struct
+            # layout than the library it links against -- the same silent
+            # corruption the module itself is protected from.
+            for dep in m.get("requires", {}).get("vendor", []):
+                for d in dep.get("abi_defines", []):
+                    if d not in abi:
+                        abi.append(d)
             base = f"../modules/{name}"
             for dep in m.get("requires", {}).get("vendor", []):
                 src = dep["source"]
@@ -778,7 +913,7 @@ class ManifestMixin:
             for lib in m.get("build", {}).get("Linux", {}).get("system_libs", []):
                 if lib not in syslibs:
                     syslibs.append(lib)
-        return includes, links, syslibs, errors
+        return includes, links, syslibs, errors, abi
 
     def _emit_loaders_makefile(self, default, overrides, silent=False):
         """Render loaders/Makefile from the default manifest plus overrides.
@@ -806,11 +941,29 @@ class ManifestMixin:
         w("CXX := g++")
         w("BIN_DIR := ../bin")
         w("")
+        w("# Sanitizers: make ASAN=1 / make TSAN=1, mutually exclusive.")
+        w("#")
+        w("# A loader and the modules it dlopens share one address space, so they")
+        w("# must be built the SAME way -- `ace make module X ASAN=1` for every")
+        w("# module the loader will load, not just the loader. A sanitizer runtime")
+        w("# that sees only half the process reports nonsense.")
+        w("SANITIZE :=")
+        w("ifeq ($(ASAN),1)")
+        w("ifeq ($(TSAN),1)")
+        w("    $(error ASAN=1 and TSAN=1 are mutually exclusive)")
+        w("endif")
+        w("    SANITIZE := -fsanitize=address -fno-omit-frame-pointer")
+        w("endif")
+        w("ifeq ($(TSAN),1)")
+        w("    SANITIZE := -fsanitize=thread -fno-omit-frame-pointer")
+        w("endif")
+        w("")
 
         cxx = [f.format(std=default.get("loader", {}).get("std", "c++17"))
                for f in BASE_LOADER_CXXFLAGS]
         cxx += [f"-D{d}" for d in common.get("defines", [])]
         cxx += common.get("cxxflags", [])
+        cxx += ["$(SANITIZE)"]
         w("CXXFLAGS := " + " \\\n            ".join(cxx))
         w("")
 
@@ -835,7 +988,7 @@ class ManifestMixin:
         for name in sorted(overrides):
             o = overrides[name]
             ob = o.get("build", {}).get("common", {})
-            inc, links, syslibs, errors = self._inherited_module_flags(
+            inc, links, syslibs, errors, abi = self._inherited_module_flags(
                 o.get("inherits_modules", []), silent=silent)
             if errors:
                 raise ManifestError(
@@ -844,7 +997,7 @@ class ManifestMixin:
                       "\n      flags this loader would still COMPILE, against whatever"
                       "\n      copy of those headers is installed system-wide, and fail"
                       "\n      with a signature mismatch in a header nobody edited.")
-            extra_cxx = inc + ob.get("cxxflags", []) + \
+            extra_cxx = [f"-D{d}" for d in abi] + inc + ob.get("cxxflags", []) + \
                 [f"-D{d}" for d in ob.get("defines", [])]
             extra_link = links + ["-l" + l for l in syslibs] + \
                 ob.get("link", [])

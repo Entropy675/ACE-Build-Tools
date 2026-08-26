@@ -141,7 +141,11 @@
               "path": "build/library/libmbedcrypto.a"
             }
           ]
-        }
+        },
+        "abi_defines": [
+          "MBEDTLS_THREADING_C",
+          "MBEDTLS_THREADING_PTHREAD"
+        ]
       }
     ]
   },
