@@ -148,11 +148,32 @@ class ManifestMixin:
     def _manifest_path(self, module):
         return self._manifest_dir() / f"{module}.json"
 
+    def _default_manifest_path(self):
+        """The manifest a module with nothing to declare resolves to.
+
+        A module with no vendored dependencies and no unusual flags has
+        nothing module-specific to say, and making every such module carry a
+        near-identical file is how those four hand-written Makefiles drifted
+        apart in the first place -- copies with no reason to differ, that
+        differed anyway. ForumWebsiteProvider and ChessProvider are both this
+        case.
+
+        Mirrors loaders/default.loader.json, which already works this way.
+        """
+        return self._manifest_dir() / "default.json"
+
     def _module_dir(self, module):
         return self.ace_root / "modules" / module
 
     def has_manifest(self, module):
-        return self._manifest_path(module).is_file()
+        """True if this module can be generated -- via its own manifest or
+        the default. `ace make module X` reaches the build path on either."""
+        return (self._manifest_path(module).is_file()
+                or self._default_manifest_path().is_file())
+
+    def uses_default(self, module):
+        return (not self._manifest_path(module).is_file()
+                and self._default_manifest_path().is_file())
 
     # ------------------------------------------------------------------
     # loading and validation
@@ -168,12 +189,28 @@ class ManifestMixin:
         them and a build.
         """
         path = self._manifest_path(module)
+        defaulted = False
         if not path.is_file():
-            raise ManifestError(f"no manifest at {path}")
+            path = self._default_manifest_path()
+            defaulted = True
+            if not path.is_file():
+                raise ManifestError(
+                    f"no manifest at {self._manifest_path(module)}, and no "
+                    f"{path.name} to fall back to")
         try:
             m = json.loads(path.read_text())
         except json.JSONDecodeError as e:
             raise ManifestError(f"{path.name} is not valid JSON: {e}")
+
+        if defaulted:
+            # The default cannot name itself, so the requested module supplies
+            # the name. Recorded so the generated header says which file it
+            # came from -- a Makefile that points at default.json when the
+            # reader expects <Module>.json is the kind of small confusion that
+            # costs a real debugging session.
+            m.setdefault("module", {})["name"] = module
+            m["_defaulted"] = True
+
         if resolve_pins:
             self._resolve_unpinned(m, module, path, silent)
         self._validate_manifest(m, module, path)
@@ -241,7 +278,14 @@ class ManifestMixin:
         user go read it out by hand just to paste it back is a chore the tool
         can do. Declining still leaves validation to reject the manifest, so
         the guarantee is unchanged -- nothing builds unpinned either way.
+
+        Never writes to default.json. It is shared by every module that has
+        nothing of its own to declare, so a pin recorded there would apply to
+        all of them -- and it carries no vendored dependencies to pin in the
+        first place.
         """
+        if path == self._default_manifest_path():
+            return False
         changed = False
         for dep in m.get("requires", {}).get("vendor", []):
             src = dep.get("source", {})
@@ -343,7 +387,7 @@ class ManifestMixin:
         name = mod["name"]
         std = mod.get("std", "c++17")
         platforms = mod.get("platforms", ["Linux"])
-        shared_impl = mod.get("impl_layout", "per_platform") == "shared"
+        layout = mod.get("impl_layout", "per_platform")
         produces = m.get("produces", {})
         exports = produces.get("exports", "exports.map")
         vendor = m.get("requires", {}).get("vendor", [])
@@ -367,7 +411,11 @@ class ManifestMixin:
         w("# " + "=" * 68)
         w("# GENERATED FILE -- do not edit.")
         w("#")
-        w(f"#   source:      <ace tool>/manifests/{name}.json")
+        src_file = "default.json" if m.get("_defaulted") else f"{name}.json"
+        w(f"#   source:      <ace tool>/manifests/{src_file}")
+        if m.get("_defaulted"):
+            w(f"#                ({name} declares nothing of its own -- no")
+            w("#                 vendored dependencies, no unusual flags)")
         w(f"#   regenerate:  ace manifest generate {name}")
         w("#")
         w("# Edits here are lost the next time this file is regenerated, which")
@@ -551,7 +599,7 @@ class ManifestMixin:
         w("CXXFLAGS := " + " \\\n            ".join(cxx))
         w("")
 
-        if shared_impl:
+        if layout == "shared":
             w("# Shared implementation layout: one OS/ directory serves every target.")
             w("PLATFORM_DIR := OS")
             w("")
@@ -574,8 +622,11 @@ class ManifestMixin:
                 w(f"{kw} ($(UNAME_S),{cond})")
             first = False
 
-            if not shared_impl:
+            if layout == "per_platform":
                 w(f"    PLATFORM_DIR := {plat}")
+            elif layout == "auto":
+                # Resolved after the chain -- see the priority block below.
+                w(f"    HOST_PLATFORM := {plat}")
             if blk.get("compiler"):
                 w(f"    CXX := {blk['compiler']}")
             if blk.get("cxxflags"):
@@ -602,6 +653,23 @@ class ManifestMixin:
         w("    $(error Unsupported platform: $(UNAME_S))")
         w("endif")
         w("")
+        if layout == "auto":
+            w("# Implementation layout: auto.")
+            w("#")
+            w("# An OS/ directory means one implementation serves every target and")
+            w("# wins outright; otherwise the host platform's own directory is used.")
+            w("# A module with NO platform directory at all resolves to a name that")
+            w("# matches nothing, which is correct -- its headers live beside it.")
+            w("#")
+            w("# Safe to infer now in a way it was not before: MODULE_HEADERS spans")
+            w("# every platform directory regardless (see the hash-scope note), so")
+            w("# guessing this wrong can no longer silently empty the attestation.")
+            w("# It only decides what gets -I'd and what a rebuild depends on.")
+            w("PLATFORM_DIR := $(HOST_PLATFORM)")
+            w("ifneq ($(wildcard OS/.),)")
+            w("    PLATFORM_DIR := OS")
+            w("endif")
+            w("")
         w("CXXFLAGS += -I$(PLATFORM_DIR)")
         w("")
 
@@ -1207,10 +1275,31 @@ class ManifestMixin:
         return f"  {YELLOW}unpinned: {', '.join(loose)}{RESET}" if loose else ""
 
     def _all_manifests(self):
+        """Modules with a manifest of their OWN. default.json is excluded --
+        it names no module and is not one."""
         d = self._manifest_dir()
         if not d.is_dir():
             return []
-        return sorted(p.stem for p in d.glob("*.json"))
+        return sorted(p.stem for p in d.glob("*.json") if p.name != "default.json")
+
+    def _defaulted_modules(self):
+        """Modules present in the tree that will build from default.json.
+
+        Discovered from the tree rather than from manifests/, since the whole
+        point is that they have no file there to enumerate."""
+        if not self._default_manifest_path().is_file():
+            return []
+        mods = self.ace_root / "modules"
+        if not mods.is_dir():
+            return []
+        own = set(self._all_manifests())
+        found = []
+        for p in sorted(mods.iterdir()):
+            if p.name.startswith(".") or p.name in own:
+                continue
+            if (p / f"{p.name}.cc").is_file():
+                found.append(p.name)
+        return found
 
     def manifest(self, args):
         """Dispatch for `ace manifest ...`."""
@@ -1228,6 +1317,15 @@ class ManifestMixin:
                 state = f"{GREEN}generated{RESET}" if mk.exists() else f"{YELLOW}missing{RESET}"
                 pins = self._pin_state(n)
                 print(f"  {CYAN}{n:<24}{RESET} Makefile: {state}{pins}")
+            defaulted = self._defaulted_modules()
+            if defaulted:
+                print(f"\n  {DIM}building from default.json (nothing of their "
+                      f"own to declare):{RESET}")
+                for n in defaulted:
+                    mk = self._module_dir(n) / "Makefile"
+                    state = (f"{GREEN}generated{RESET}" if mk.exists()
+                             else f"{YELLOW}missing{RESET}")
+                    print(f"    {CYAN}{n:<22}{RESET} Makefile: {state}")
             if default is not None:
                 mk = self.ace_root / "loaders" / "Makefile"
                 state = f"{GREEN}generated{RESET}" if mk.exists() else f"{YELLOW}missing{RESET}"
