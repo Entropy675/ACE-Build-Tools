@@ -80,7 +80,7 @@
         "source": {
           "type": "git",
           "url": "https://github.com/h2o/picohttpparser.git",
-          "ref": "TODO-PIN",
+          "ref": "f4d94b48b31e0abae029ebeafcfd9ca0680ede58",
           "shallow": true
         },
         "arch_sensitive": true,
@@ -105,7 +105,7 @@
         "source": {
           "type": "git",
           "url": "https://github.com/Mbed-TLS/mbedtls.git",
-          "ref": "TODO-PIN",
+          "ref": "522e2e4651db0758dcc7f5da6737239ce45cab22",
           "submodules": true,
           "shallow": true
         },
