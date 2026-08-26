@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "module": {
+    "name": "NetworkProvider",
+    "std": "c++17",
+    "platforms": [
+      "Linux",
+      "Win"
+    ]
+  },
+  "requires": {
+    "system": {
+      "debian": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        },
+        {
+          "package": "cmake",
+          "probe": "binary:cmake"
+        },
+        {
+          "package": "python3",
+          "probe": "binary:python3"
+        },
+        {
+          "package": "liburing-dev",
+          "probe": "header:liburing.h",
+          "provides_link": [
+            "uring"
+          ]
+        }
+      ],
+      "arch": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        },
+        {
+          "package": "cmake",
+          "probe": "binary:cmake"
+        },
+        {
+          "package": "python",
+          "probe": "binary:python3"
+        },
+        {
+          "package": "liburing",
+          "probe": "header:liburing.h",
+          "provides_link": [
+            "uring"
+          ]
+        }
+      ],
+      "fedora": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        },
+        {
+          "package": "cmake",
+          "probe": "binary:cmake"
+        },
+        {
+          "package": "python3",
+          "probe": "binary:python3"
+        },
+        {
+          "package": "liburing-devel",
+          "probe": "header:liburing.h",
+          "provides_link": [
+            "uring"
+          ]
+        }
+      ]
+    },
+    "vendor": [
+      {
+        "name": "picohttpparser",
+        "source": {
+          "type": "git",
+          "url": "https://github.com/h2o/picohttpparser.git",
+          "ref": "TODO-PIN",
+          "shallow": true
+        },
+        "arch_sensitive": true,
+        "hash_scope": false,
+        "provides": {
+          "include": [
+            "."
+          ],
+          "sources": {
+            "include": [
+              "picohttpparser.c"
+            ],
+            "cflags": [
+              "-O2",
+              "-fPIC"
+            ]
+          }
+        }
+      },
+      {
+        "name": "mbedtls",
+        "source": {
+          "type": "git",
+          "url": "https://github.com/Mbed-TLS/mbedtls.git",
+          "ref": "TODO-PIN",
+          "submodules": true,
+          "shallow": true
+        },
+        "build": {
+          "system": "cmake",
+          "build_dir": "build",
+          "defines": [
+            "ENABLE_TESTING=OFF",
+            "ENABLE_PROGRAMS=OFF",
+            "CMAKE_POSITION_INDEPENDENT_CODE=ON"
+          ],
+          "parallel": true
+        },
+        "arch_sensitive": true,
+        "hash_scope": false,
+        "provides": {
+          "include": [
+            "include",
+            "tf-psa-crypto/include",
+            "tf-psa-crypto/drivers/builtin/include",
+            "tf-psa-crypto/drivers/everest/include",
+            "tf-psa-crypto/drivers/pqcp/include",
+            "tf-psa-crypto/drivers/p256-m"
+          ],
+          "link": [
+            {
+              "path": "build/library/libmbedtls.a"
+            },
+            {
+              "path": "build/library/libmbedx509.a"
+            },
+            {
+              "path": "build/library/libmbedcrypto.a"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "build": {
+    "Linux": {
+      "system_libs": [
+        "dl",
+        "pthread"
+      ]
+    },
+    "Win": {
+      "system_libs": [
+        "ws2_32"
+      ]
+    }
+  },
+  "produces": {
+    "kind": "etcs_module",
+    "exports": "exports.map",
+    "install": "bin/"
+  }
+}

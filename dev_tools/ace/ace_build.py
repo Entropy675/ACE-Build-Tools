@@ -122,6 +122,10 @@ class BuildMixin:
                 if not loaders_dir.exists():
                     print(f"[-] Error: No loaders directory found at {loaders_dir}")
                     return
+                # Same contract as modules: the shared loaders/Makefile is a
+                # generated artifact, regenerated when missing, never
+                # overwritten when present.
+                self.ensure_loaders_makefile()
                 print(f"[*] Building loader: {loader_name}")
                 make_cmd = [
                     "make",
@@ -182,6 +186,12 @@ class BuildMixin:
                 # ...then build each, with its own pre/post ABI diff so the
                 # per-module reminder still pops regardless of batch size.
                 for mod in mods:
+                    # Generated Makefiles are build artifacts and gitignored,
+                    # so a fresh clone has none. Regenerating a MISSING one
+                    # here is what makes that a non-event; an existing one is
+                    # never touched, so a module that predates its manifest
+                    # keeps building until someone migrates it deliberately.
+                    self.ensure_makefile(mod)
                     print(f"[*] Current ABI interface for {mod} (pre-build):")
                     self.introspect_and_record(mod, announce=True)
                     self._run_root_make(f"module_{mod}", extra_args=extras)

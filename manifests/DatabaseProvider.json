@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "module": {
+    "name": "DatabaseProvider",
+    "std": "c++17",
+    "platforms": [
+      "Linux",
+      "Win"
+    ],
+    "impl_layout": "shared"
+  },
+  "requires": {
+    "system": {
+      "debian": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        }
+      ],
+      "arch": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        }
+      ],
+      "fedora": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        }
+      ]
+    },
+    "vendor": [
+      {
+        "name": "sqlite",
+        "source": {
+          "type": "git",
+          "url": "https://github.com/sqlite/sqlite.git",
+          "ref": "TODO-PIN",
+          "shallow": true
+        },
+        "build": {
+          "system": "autotools",
+          "configure_args": [],
+          "targets": [
+            "sqlite3.c"
+          ]
+        },
+        "arch_sensitive": true,
+        "hash_scope": false,
+        "provides": {
+          "include": [
+            "."
+          ],
+          "sources": {
+            "include": [
+              "sqlite3.c"
+            ],
+            "cflags": [
+              "-O2",
+              "-fPIC",
+              "-DSQLITE_ENABLE_COLUMN_METADATA",
+              "-DSQLITE_ENABLE_RTREE",
+              "-DSQLITE_THREADSAFE=1"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "build": {
+    "Linux": {
+      "system_libs": [
+        "dl",
+        "pthread"
+      ]
+    },
+    "Win": {
+      "system_libs": [
+        "ws2_32"
+      ]
+    }
+  },
+  "produces": {
+    "kind": "etcs_module",
+    "exports": "exports.map",
+    "install": "bin/"
+  }
+}

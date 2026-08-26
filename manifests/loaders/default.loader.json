@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+
+  "loader": {
+    "name": "default",
+    "std": "c++17"
+  },
+
+  "build": {
+    "common": {
+      "cxxflags": [],
+      "defines": []
+    },
+    "Linux": {
+      "ldflags": [
+        "-ldl",
+        "-Wl,--no-as-needed",
+        "-pthread",
+        "-luring",
+        "-Wl,--as-needed",
+        "-fuse-ld=gold",
+        "-Wl,--threads",
+        "-Wl,--thread-count,$(NPROC)"
+      ],
+      "system_libs": []
+    },
+    "Win": {
+      "ldflags": [],
+      "system_libs": ["ws2_32"]
+    }
+  }
+}

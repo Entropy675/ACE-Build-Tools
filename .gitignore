@@ -3,3 +3,6 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+
+# Generated module Makefiles are build artifacts, regenerated from
+# manifests/ whenever missing. See dev_tools/ace/ace_manifest.py.
