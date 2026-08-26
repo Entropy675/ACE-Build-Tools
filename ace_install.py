@@ -17,6 +17,9 @@ Layout (all under dev_tools/):
     ace_build.py     <- make dispatch + arg validation
     ace_lifecycle.py <- install/uninstall/setup/remove/stage/scaffold
     ace_script.py    <- proxy for etcs_viewer.py script editor
+    ace_manifest.py  <- module manifests -> generated Makefiles
+
+    manifests/       <- one <Module>.json per module, read by ace_manifest
 """
 import os
 import sys
@@ -29,11 +32,12 @@ from dev_tools.ace import (
     AbiMixin,
     BuildMixin,
     LifecycleMixin,
-    ScriptMixin
+    ScriptMixin,
+    ManifestMixin
 )
 
 class AceManager(RegistryMixin, DepsMixin, AbiMixin, BuildMixin,
-                 LifecycleMixin, ScriptMixin):
+                 LifecycleMixin, ScriptMixin, ManifestMixin):
     """Assembled from the subsystem mixins. Method resolution runs left to
     right across the bases; none of them define colliding names (verified at
     split time), so the order is for readability, not disambiguation."""
@@ -221,6 +225,7 @@ if __name__ == "__main__":
         print("           | make { loader <n> | clean loader <n> }")
         print("           | registry verify")
         print("           | deps { check | install | arch }")
+        print("           | manifest { list | check [mod...] | show <mod> | generate [mod...|loaders] [--force] | clean [mod...|loaders] }")
         print("           | abi [module]")
         print("           | script [name]")
         sys.exit(0)
@@ -237,6 +242,7 @@ if __name__ == "__main__":
         elif cmd == "stage" and len(args) > 2:          ace.stage(args[1], args[2])
         elif cmd == "registry" and args[1:] == ["verify"]: ace.registry_verify()
         elif cmd == "deps":                             ace.deps(args[1:])
+        elif cmd == "manifest":                         ace.manifest(args[1:])
         elif cmd == "abi":                              ace.abi(args[1:])
         elif cmd == "script":                           ace.create_script(args[1:])
         else:

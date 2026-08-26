@@ -42,7 +42,7 @@ class BuildMixin:
 
             if '=' in arg:
                 key, _ = arg.split('=', 1)
-                if key not in ['ACE_ROOT', 'VERBOSE', 'DEBUG', 'ASAN', 'LOG_TO_FILE']:
+                if key not in ['ACE_ROOT', 'VERBOSE', 'DEBUG', 'ASAN', 'TSAN', 'LOG_TO_FILE']:
                     raise ValueError(f"Disallowed variable: {key}")
                 validated.append(arg)
             else:
@@ -122,6 +122,10 @@ class BuildMixin:
                 if not loaders_dir.exists():
                     print(f"[-] Error: No loaders directory found at {loaders_dir}")
                     return
+                # Same contract as modules: the shared loaders/Makefile is a
+                # generated artifact, regenerated when missing, never
+                # overwritten when present.
+                self.ensure_loaders_makefile()
                 print(f"[*] Building loader: {loader_name}")
                 make_cmd = [
                     "make",
@@ -158,6 +162,9 @@ class BuildMixin:
                     subprocess.run(make_cmd, check=True)
                 except subprocess.CalledProcessError as e:
                     print(f"[-] Loader clean error: {e}")
+                # Deliberately NOT removed here: loaders/Makefile is shared by
+                # every loader, so cleaning ONE loader must not delete the file
+                # the others build from. `ace make clean loaders` does remove it.
                 return
 
             if len(args) >= 2 and args[0] == "module":
@@ -182,6 +189,12 @@ class BuildMixin:
                 # ...then build each, with its own pre/post ABI diff so the
                 # per-module reminder still pops regardless of batch size.
                 for mod in mods:
+                    # Generated Makefiles are build artifacts and gitignored,
+                    # so a fresh clone has none. Regenerating a MISSING one
+                    # here is what makes that a non-event; an existing one is
+                    # never touched, so a module that predates its manifest
+                    # keeps building until someone migrates it deliberately.
+                    self.ensure_makefile(mod)
                     print(f"[*] Current ABI interface for {mod} (pre-build):")
                     self.introspect_and_record(mod, announce=True)
                     self._run_root_make(f"module_{mod}", extra_args=extras)
@@ -209,17 +222,51 @@ class BuildMixin:
                                           color=CYAN)
                     print()
                 for mod in mods:
+                    # make clean FIRST -- it runs out of the very Makefile
+                    # removed next, and a generated Makefile is itself a build
+                    # artifact now, so leaving it behind means `clean` did not
+                    # clean. The next build regenerates it.
                     self._run_root_make(f"clean_module_{mod}", extra_args=extras)
+                    self.clean_makefile(mod)
                 return
 
             if len(args) >= 2 and args[0] == "clean" and args[1] in ("modules", "loaders"):
                 extras = self._validate_make_args(args[2:])
                 self._run_root_make(f"clean_{args[1]}", extra_args=extras)
+                if args[1] == "loaders":
+                    self.clean_loaders_makefile()
+                else:
+                    for mod in sorted(set(self._all_manifests())
+                                      | set(self._defaulted_modules())):
+                        self.clean_makefile(mod)
                 return
 
             if args[0] in self.root_make_targets:
                 extras = self._validate_make_args(args[1:])
                 batch = args[0] in ("all", "modules")
+
+                # Regenerate BEFORE make is invoked, not during.
+                #
+                # The master Makefile discovers modules with
+                #   MODULE_SUBDIRS := $(wildcard $(MODULES_DIR)/*/Makefile)
+                # which make expands while PARSING, before any recipe runs. A
+                # missing generated Makefile is therefore not a module that
+                # fails to build -- it is a module that is not there at all,
+                # and `ace make modules` prints "Building Modules" followed by
+                # nothing and exits 0.
+                #
+                # That went unnoticed because only the SINGULAR paths
+                # (`module <n>`, `loader <n>`) ensured their Makefile; the
+                # batch ones never did. Harmless until clean started removing
+                # them, at which point the two changes combined into a build
+                # that silently did nothing.
+                if args[0] in ("all", "modules"):
+                    for mod in sorted(set(self._all_manifests())
+                                      | set(self._defaulted_modules())):
+                        self.ensure_makefile(mod)
+                if args[0] in ("all", "loaders"):
+                    self.ensure_loaders_makefile()
+
                 if batch:
                     self._announce_full_tagset()
                 # Keep going so one module's failure doesn't take down its siblings...

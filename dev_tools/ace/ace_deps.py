@@ -138,6 +138,19 @@ class DepsMixin:
             return None
 
         entries = self._parse_deps(path)
+
+        # Module manifests declare their own system packages, in the same
+        # (package, probe) vocabulary this file already speaks. Folding them
+        # in here is what makes a manifest a COMPLETE statement of what a
+        # module needs: `ace deps check` covers the tree's modules without the
+        # machine manifest having to name every module's dependencies too.
+        try:
+            for pkg, probe in self.manifest_system_packages():
+                if not any(pkg == p for p, _ in entries):
+                    entries.append((pkg, probe))
+        except AttributeError:
+            pass  # ManifestMixin not assembled (partial tool build)
+
         if not quiet:
             print(f"\n--- ETCS Dependencies ({distro}, {platform.machine()}) ---")
             print(f"  {DIM}manifest: {path}{RESET}\n")

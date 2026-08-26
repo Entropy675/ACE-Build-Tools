@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "module": {
+    "name": "ChessProvider",
+    "std": "c++17",
+    "platforms": [
+      "Linux",
+      "Win"
+    ]
+  },
+  "requires": {
+    "system": {
+      "debian": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        }
+      ],
+      "arch": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        }
+      ],
+      "fedora": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        }
+      ]
+    },
+    "vendor": [
+      {
+        "name": "CChess",
+        "source": {
+          "type": "vendored",
+          "path": "ChessProvider/CChess"
+        },
+        "hash_scope": false,
+        "arch_sensitive": false,
+        "provides": {
+          "sources": {
+            "include": [
+              "src/*.cc",
+              "src/piece_behav/*.cc"
+            ],
+            "exclude": [
+              "src/main.cc",
+              "src/ChessGame.cc",
+              "src/ChessGameLinux.cc",
+              "src/ChessGameWindows.cc",
+              "src/NcView.cc",
+              "src/WinView.cc"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "build": {
+    "common": {
+      "cxxflags": [
+        "-fpermissive"
+      ]
+    },
+    "Linux": {
+      "ldflags": [
+        "-pthread"
+      ],
+      "system_libs": [
+        "dl"
+      ]
+    },
+    "Win": {
+      "system_libs": [
+        "ws2_32"
+      ]
+    }
+  },
+  "produces": {
+    "kind": "etcs_module",
+    "exports": "exports.map",
+    "install": "bin/"
+  }
+}

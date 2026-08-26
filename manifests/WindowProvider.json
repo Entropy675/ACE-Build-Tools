@@ -1,0 +1,247 @@
+{
+  "schema_version": 1,
+  "module": {
+    "name": "WindowProvider",
+    "std": "c++17",
+    "platforms": [
+      "Linux",
+      "Win",
+      "Web"
+    ],
+    "impl_layout": "shared"
+  },
+  "requires": {
+    "system": {
+      "debian": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        },
+        {
+          "package": "cmake",
+          "probe": "binary:cmake"
+        },
+        {
+          "package": "libx11-dev",
+          "probe": "header:X11/Xlib.h",
+          "provides_link": [
+            "X11"
+          ]
+        },
+        {
+          "package": "libxrandr-dev",
+          "probe": "header:X11/extensions/Xrandr.h",
+          "provides_link": [
+            "Xrandr"
+          ]
+        },
+        {
+          "package": "libxi-dev",
+          "probe": "header:X11/extensions/XInput2.h",
+          "provides_link": [
+            "Xi"
+          ]
+        },
+        {
+          "package": "libwayland-dev",
+          "probe": "pkgconfig:wayland-client",
+          "provides_link": [
+            "wayland-client"
+          ]
+        },
+        {
+          "package": "libxkbcommon-dev",
+          "probe": "pkgconfig:xkbcommon",
+          "provides_link": [
+            "xkbcommon"
+          ]
+        },
+        {
+          "package": "liburing-dev",
+          "probe": "header:liburing.h",
+          "provides_link": [
+            "uring"
+          ]
+        }
+      ],
+      "arch": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        },
+        {
+          "package": "cmake",
+          "probe": "binary:cmake"
+        },
+        {
+          "package": "libx11",
+          "probe": "header:X11/Xlib.h",
+          "provides_link": [
+            "X11"
+          ]
+        },
+        {
+          "package": "libxrandr",
+          "probe": "header:X11/extensions/Xrandr.h",
+          "provides_link": [
+            "Xrandr"
+          ]
+        },
+        {
+          "package": "libxi",
+          "probe": "header:X11/extensions/XInput2.h",
+          "provides_link": [
+            "Xi"
+          ]
+        },
+        {
+          "package": "wayland",
+          "probe": "pkgconfig:wayland-client",
+          "provides_link": [
+            "wayland-client"
+          ]
+        },
+        {
+          "package": "libxkbcommon",
+          "probe": "pkgconfig:xkbcommon",
+          "provides_link": [
+            "xkbcommon"
+          ]
+        },
+        {
+          "package": "liburing",
+          "probe": "header:liburing.h",
+          "provides_link": [
+            "uring"
+          ]
+        }
+      ],
+      "fedora": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        },
+        {
+          "package": "cmake",
+          "probe": "binary:cmake"
+        },
+        {
+          "package": "libX11-devel",
+          "probe": "header:X11/Xlib.h",
+          "provides_link": [
+            "X11"
+          ]
+        },
+        {
+          "package": "libXrandr-devel",
+          "probe": "header:X11/extensions/Xrandr.h",
+          "provides_link": [
+            "Xrandr"
+          ]
+        },
+        {
+          "package": "libXi-devel",
+          "probe": "header:X11/extensions/XInput2.h",
+          "provides_link": [
+            "Xi"
+          ]
+        },
+        {
+          "package": "wayland-devel",
+          "probe": "pkgconfig:wayland-client",
+          "provides_link": [
+            "wayland-client"
+          ]
+        },
+        {
+          "package": "libxkbcommon-devel",
+          "probe": "pkgconfig:xkbcommon",
+          "provides_link": [
+            "xkbcommon"
+          ]
+        },
+        {
+          "package": "liburing-devel",
+          "probe": "header:liburing.h",
+          "provides_link": [
+            "uring"
+          ]
+        }
+      ]
+    },
+    "vendor": [
+      {
+        "name": "glfw",
+        "source": {
+          "type": "git",
+          "url": "https://github.com/glfw/glfw.git",
+          "ref": "92dcf4ce74f2e2554a98fea09be7c705c17daa5a",
+          "shallow": true
+        },
+        "build": {
+          "system": "cmake",
+          "build_dir": "build",
+          "defines": [
+            "BUILD_SHARED_LIBS=OFF",
+            "GLFW_BUILD_EXAMPLES=OFF",
+            "GLFW_BUILD_TESTS=OFF",
+            "GLFW_BUILD_DOCS=OFF"
+          ],
+          "parallel": true
+        },
+        "arch_sensitive": true,
+        "hash_scope": false,
+        "provides": {
+          "include": [
+            "include"
+          ],
+          "link": [
+            {
+              "path": "build/src/libglfw3.a",
+              "mode": "whole_archive"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "build": {
+    "Linux": {
+      "cxxflags": [
+        "-fvisibility-inlines-hidden"
+      ],
+      "ldflags": [
+        "-Wl,-Bsymbolic"
+      ],
+      "system_libs": [
+        "X11",
+        "Xrandr",
+        "Xi",
+        "wayland-client",
+        "xkbcommon",
+        "uring",
+        "dl",
+        "pthread"
+      ]
+    },
+    "Win": {
+      "system_libs": [
+        "gdi32",
+        "user32",
+        "shell32"
+      ]
+    },
+    "Web": {
+      "compiler": "em++",
+      "cxxflags": [
+        "-s SIDE_MODULE=1",
+        "-s USE_GLFW=3"
+      ]
+    }
+  },
+  "produces": {
+    "kind": "etcs_module",
+    "exports": "exports.map",
+    "install": "bin/"
+  }
+}

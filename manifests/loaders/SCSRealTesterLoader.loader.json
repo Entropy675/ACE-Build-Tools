@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+
+  "loader": {
+    "name": "SCSRealTesterLoader",
+    "std": "c++17"
+  },
+
+  "inherits_modules": ["NetworkProvider"],
+
+  "build": {
+    "common": {
+      "cxxflags": [],
+      "defines": []
+    }
+  }
+}
