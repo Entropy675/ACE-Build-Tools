@@ -83,6 +83,14 @@ BASE_LOADER_CXXFLAGS = [
     "-DETCS_LOADER", r'-DETCS_MODULE_NAME=\"ROOT\"',
 ]
 
+# The line every generated Makefile opens with, and the ONLY thing that
+# authorises this tool to delete one. A hand-written Makefile -- a module not
+# yet migrated, or one someone deliberately kept -- has no such line and is
+# never touched. Emitted from here rather than written out at each emitter so
+# the marker and the check cannot drift apart into a delete that matches
+# nothing, or worse, one that matches too much.
+GENERATED_MARKER = "# GENERATED FILE -- do not edit."
+
 # Every platform-implementation directory a module can carry. The HASH scope
 # spans all of them that exist; the COMPILE scope is only the active one.
 # See _emit_makefile's header-discovery block for why those differ.
@@ -174,6 +182,66 @@ class ManifestMixin:
     def uses_default(self, module):
         return (not self._manifest_path(module).is_file()
                 and self._default_manifest_path().is_file())
+
+    # ------------------------------------------------------------------
+    # removal
+    # ------------------------------------------------------------------
+
+    def _is_generated(self, path):
+        """Did THIS tool write that Makefile?
+
+        The one question that decides whether it may be deleted. A module not
+        yet migrated, or one whose Makefile someone deliberately keeps by
+        hand, carries no marker and survives every clean -- which matters
+        because `clean` is exactly the command people run without reading it
+        first, and a generator that eats hand-written files once is a
+        generator nobody trusts again.
+        """
+        try:
+            with path.open("r", errors="replace") as f:
+                return GENERATED_MARKER in f.read(512)
+        except OSError:
+            return False
+
+    def clean_makefile(self, module, quiet=False):
+        """Delete one module's GENERATED Makefile. Returns True if removed."""
+        mk = self._module_dir(module) / "Makefile"
+        if not mk.is_file():
+            return False
+        if not self._is_generated(mk):
+            if not quiet:
+                print(f"  {YELLOW}[!]{RESET} {module}/Makefile is hand-written "
+                      f"-- left alone.")
+            return False
+        mk.unlink()
+        if not quiet:
+            print(f"  {GREEN}[-]{RESET} removed {module}/Makefile")
+        return True
+
+    def clean_loaders_makefile(self, quiet=False):
+        mk = self.ace_root / "loaders" / "Makefile"
+        if not mk.is_file():
+            return False
+        if not self._is_generated(mk):
+            if not quiet:
+                print(f"  {YELLOW}[!]{RESET} loaders/Makefile is hand-written "
+                      f"-- left alone.")
+            return False
+        mk.unlink()
+        if not quiet:
+            print(f"  {GREEN}[-]{RESET} removed loaders/Makefile")
+        return True
+
+    def clean_all_makefiles(self, quiet=False):
+        """Every generated Makefile in the tree -- own-manifest modules,
+        defaulted modules, and the shared loaders one."""
+        n = 0
+        for mod in sorted(set(self._all_manifests()) | set(self._defaulted_modules())):
+            if self.clean_makefile(mod, quiet=quiet):
+                n += 1
+        if self.clean_loaders_makefile(quiet=quiet):
+            n += 1
+        return n
 
     # ------------------------------------------------------------------
     # loading and validation
@@ -409,7 +477,7 @@ class ManifestMixin:
         w = L.append
 
         w("# " + "=" * 68)
-        w("# GENERATED FILE -- do not edit.")
+        w(GENERATED_MARKER)
         w("#")
         src_file = "default.json" if m.get("_defaulted") else f"{name}.json"
         w(f"#   source:      <ace tool>/manifests/{src_file}")
@@ -1050,7 +1118,7 @@ class ManifestMixin:
         w = L.append
 
         w("# " + "=" * 68)
-        w("# GENERATED FILE -- do not edit.")
+        w(GENERATED_MARKER)
         w("#")
         w("#   source:      <ace tool>/manifests/loaders/*.loader.json")
         w("#   regenerate:  ace manifest generate loaders")
@@ -1358,6 +1426,19 @@ class ManifestMixin:
                 print(f"  {RED}[-]{RESET} {e}")
             return
 
+        if sub == "clean":
+            names = [a for a in args[1:] if not a.startswith("--")]
+            if not names:
+                n = self.clean_all_makefiles()
+                print(f"\n  {n} generated Makefile(s) removed. The next build "
+                      f"regenerates them.\n")
+            elif names == ["loaders"]:
+                self.clean_loaders_makefile()
+            else:
+                for n_ in names:
+                    self.clean_makefile(n_)
+            return
+
         if sub == "generate":
             force = "--force" in args
             names = [a for a in args[1:] if not a.startswith("--")]
@@ -1372,4 +1453,4 @@ class ManifestMixin:
 
         print(f"[-] Unknown manifest command: '{sub}'")
         print(f"    Usage: ace manifest {{ list | check [mod...] | show <mod> "
-              f"| generate [mod...|loaders] [--force] }}")
+              f"| generate [mod...|loaders] [--force] | clean [mod...|loaders] }}")

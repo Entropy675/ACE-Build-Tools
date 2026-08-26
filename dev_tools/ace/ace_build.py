@@ -162,6 +162,9 @@ class BuildMixin:
                     subprocess.run(make_cmd, check=True)
                 except subprocess.CalledProcessError as e:
                     print(f"[-] Loader clean error: {e}")
+                # Deliberately NOT removed here: loaders/Makefile is shared by
+                # every loader, so cleaning ONE loader must not delete the file
+                # the others build from. `ace make clean loaders` does remove it.
                 return
 
             if len(args) >= 2 and args[0] == "module":
@@ -219,12 +222,23 @@ class BuildMixin:
                                           color=CYAN)
                     print()
                 for mod in mods:
+                    # make clean FIRST -- it runs out of the very Makefile
+                    # removed next, and a generated Makefile is itself a build
+                    # artifact now, so leaving it behind means `clean` did not
+                    # clean. The next build regenerates it.
                     self._run_root_make(f"clean_module_{mod}", extra_args=extras)
+                    self.clean_makefile(mod)
                 return
 
             if len(args) >= 2 and args[0] == "clean" and args[1] in ("modules", "loaders"):
                 extras = self._validate_make_args(args[2:])
                 self._run_root_make(f"clean_{args[1]}", extra_args=extras)
+                if args[1] == "loaders":
+                    self.clean_loaders_makefile()
+                else:
+                    for mod in sorted(set(self._all_manifests())
+                                      | set(self._defaulted_modules())):
+                        self.clean_makefile(mod)
                 return
 
             if args[0] in self.root_make_targets:

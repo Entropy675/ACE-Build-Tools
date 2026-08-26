@@ -225,7 +225,7 @@ if __name__ == "__main__":
         print("           | make { loader <n> | clean loader <n> }")
         print("           | registry verify")
         print("           | deps { check | install | arch }")
-        print("           | manifest { list | check [mod...] | show <mod> | generate [mod...|loaders] [--force] }")
+        print("           | manifest { list | check [mod...] | show <mod> | generate [mod...|loaders] [--force] | clean [mod...|loaders] }")
         print("           | abi [module]")
         print("           | script [name]")
         sys.exit(0)

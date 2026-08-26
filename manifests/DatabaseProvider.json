@@ -36,7 +36,7 @@
         "source": {
           "type": "git",
           "url": "https://github.com/sqlite/sqlite.git",
-          "ref": "TODO-PIN",
+          "ref": "8ded81032221fd3d1d5d19868f63715a74dd469b",
           "shallow": true
         },
         "build": {
