@@ -71,17 +71,22 @@ UNPINNED = {"TODO-PIN", "", "HEAD", "master", "main"}
 # and a module that opts out of -fvisibility=hidden silently exports its
 # internals past the version script.
 BASE_CXXFLAGS = [
-    "-std={std}", "-fvisibility=hidden", "-g", "-Wall", "-fPIC", "-Wextra", "-O2",
+    "-std={std}", "-fvisibility=hidden", "-Wall", "-fPIC", "-Wextra", "-O2",
 ]
 
 # Loader baseline. -DETCS_LOADER is what DynamicLoader's preprocessor
 # branches read; ETCS_MODULE_NAME is "ROOT" because a loader is the root
 # arena's own translation unit, not a module.
 BASE_LOADER_CXXFLAGS = [
-    "-std={std}", "-fvisibility=hidden", "-fpermissive", "-Wall", "-g",
+    "-std={std}", "-fvisibility=hidden", "-fpermissive", "-Wall",
     "-Wextra", "-O2", "-I../..", "-pipe", "-fno-plt",
     "-DETCS_LOADER", r'-DETCS_MODULE_NAME=\"ROOT\"',
 ]
+
+# Every platform-implementation directory a module can carry. The HASH scope
+# spans all of them that exist; the COMPILE scope is only the active one.
+# See _emit_makefile's header-discovery block for why those differ.
+PLATFORM_DIRS = ["Linux", "Win", "Web", "OS"]
 
 GLOBAL_HEADERS = [
     "../../ontology.h", "../../ontology_hashes.h",
@@ -380,6 +385,23 @@ class ManifestMixin:
         w("CXX := g++")
         w("CC  := gcc")
         w("")
+        w("# Debug info: make DEBUG=1. OFF by default.")
+        w("#")
+        w("# -g roughly doubles a module's on-disk size, and the hand-written")
+        w("# Makefiles disagreed about it -- NetworkProvider and DatabaseProvider")
+        w("# carried it, ChessProvider did not. Making it a mode rather than a")
+        w("# baseline is what lets all four agree without picking a winner.")
+        w("#")
+        w("# A sanitizer build turns it on regardless: a sanitizer report without")
+        w("# line numbers is a list of hex addresses, which is the situation")
+        w("# ASAN/TSAN exist to get you out of.")
+        w("DEBUGFLAGS :=")
+        w("DBG_SUFFIX :=")
+        w("ifeq ($(DEBUG),1)")
+        w("    DEBUGFLAGS := -g")
+        w("    DBG_SUFFIX := _dbg")
+        w("endif")
+        w("")
         w("# " + "-" * 66)
         w("# Sanitizers: make ASAN=1 / make TSAN=1.")
         w("#")
@@ -421,6 +443,11 @@ class ManifestMixin:
         w("    DEP_SAN_SUFFIX := _tsan")
         w("endif")
         w("")
+        w("# Symbols are not optional under a sanitizer -- see the DEBUG note.")
+        w("ifneq ($(SANITIZE),)")
+        w("    DEBUGFLAGS := -g")
+        w("endif")
+        w("")
         w("# Build stamp -- architecture, sanitizer, and ABI-define set.")
         w("#")
         w("# A REAL prerequisite of the final target, not order-only: switching")
@@ -431,7 +458,7 @@ class ManifestMixin:
         w("# architecture half matters for the same reason it always did: a tree")
         w("# carried to another machine would otherwise relink objects built for")
         w("# the architecture it came from.")
-        w(f"BUILD_STAMP := .ace_build_$(ARCH)$(SAN_SUFFIX){abi_tag}")
+        w(f"BUILD_STAMP := .ace_build_$(ARCH)$(DBG_SUFFIX)$(SAN_SUFFIX){abi_tag}")
         w("")
 
         # ---- per-dependency variables ------------------------------------
@@ -519,7 +546,8 @@ class ManifestMixin:
         cxx += [f"-D{d}" for d in abi_defines]
         cxx += [f"-D{d}" for d in common.get("defines", [])]
         cxx += common.get("cxxflags", [])
-        cxx += ["-pipe", "-fno-plt", "$(SANITIZE)", "$(CUSTOM_CXXFLAGS)"]
+        cxx += ["-pipe", "-fno-plt", "$(DEBUGFLAGS)", "$(SANITIZE)",
+                "$(CUSTOM_CXXFLAGS)"]
         w("CXXFLAGS := " + " \\\n            ".join(cxx))
         w("")
 
@@ -582,12 +610,35 @@ class ManifestMixin:
         w("# unless their manifest entry sets hash_scope: every upstream commit")
         w("# would otherwise churn this module's ABI attestation for a change no")
         w("# consumer can observe.")
-        w("LOCAL_HEADERS := $(wildcard $(PLATFORM_DIR)/*.h) $(wildcard $(TARGET_BASE_NAME)/*.h)")
+        w("LOCAL_HEADERS := $(wildcard $(TARGET_BASE_NAME)/*.h)")
+        w("PLATFORM_LOCAL_HEADERS := $(wildcard $(PLATFORM_DIR)/*.h)")
         scoped = [f"$(wildcard $({_var(d['name'])}_DIR)/*.h)"
                   for d in vendor if d.get("hash_scope")]
-        w(f"MODULE_HEADERS := $(sort $(LOCAL_HEADERS) $(TARGET_BASE_NAME).h"
+        w("")
+        w("# Every platform directory this module actually carries, whichever")
+        w("# one this build compiles against.")
+        w(f"POTENTIAL_DIRS := {' '.join(PLATFORM_DIRS)}")
+        w("EXISTING_DIRS  := $(foreach d,$(POTENTIAL_DIRS),$(if $(wildcard $(d)/.),$(d)))")
+        w("ALL_PLATFORM_HEADERS := $(foreach d,$(EXISTING_DIRS),$(wildcard $(d)/*.h))")
+        w("")
+        w("# HASH SCOPE -- every platform's headers, not just the active one.")
+        w("#")
+        w("# The manifest hash is an attestation about the MODULE, so it must not")
+        w("# depend on the machine that produced it. Hashing only $(PLATFORM_DIR)")
+        w("# means the same commit attests differently on Linux and on Windows,")
+        w("# and `ace abi` reports drift that is really just an OS difference --")
+        w("# indistinguishable, at the point you read it, from a genuine contract")
+        w("# change. WindowProvider's hand-written Makefile got this right and it")
+        w("# was lost when the four modules were unified on the per-platform")
+        w("# template; this restores it for all of them.")
+        w(f"MODULE_HEADERS := $(sort $(LOCAL_HEADERS) $(ALL_PLATFORM_HEADERS) $(TARGET_BASE_NAME).h"
           + ((" " + " ".join(scoped)) if scoped else "") + ")")
-        w("MODULE_DEPS := $(SRC_MODULE) $(MODULE_HEADERS) $(GLOBAL_HEADERS)"
+        w("")
+        w("# COMPILE SCOPE -- only the platform being built, since that is what a")
+        w("# rebuild should actually depend on. Editing Win/ must not relink a")
+        w("# Linux build; it must still change the hash above.")
+        w("COMPILE_HEADERS := $(sort $(LOCAL_HEADERS) $(PLATFORM_LOCAL_HEADERS) $(TARGET_BASE_NAME).h)")
+        w("MODULE_DEPS := $(SRC_MODULE) $(COMPILE_HEADERS) $(GLOBAL_HEADERS)"
           + ((" " + " ".join(inline_srcs)) if inline_srcs else ""))
         w("")
 
@@ -629,7 +680,12 @@ class ManifestMixin:
         w("# Archives come AFTER the translation unit that needs them: gold does")
         w("# not rescan an archive it has already passed, so a dependency listed")
         w("# among the flags resolves only by accident.")
-        w(f"$(FINAL_TARGET): {' '.join(prereqs)} | {' '.join(order_only)}")
+        # Emitted only when there is something to order against -- a module
+        # with no fetched dependencies would otherwise get a trailing "|"
+        # with nothing after it, which GNU make tolerates and other makes
+        # need not.
+        oo = (" | " + " ".join(order_only)) if order_only else ""
+        w(f"$(FINAL_TARGET): {' '.join(prereqs)}{oo}")
         tail = " ".join(inline_srcs + obj_targets + link_items)
         w(f"\t$(CXX) $(CXXFLAGS) $(EXTRADEFINES) $(LDFLAGS) -o $@ $(SRC_MODULE)"
           + ((" " + tail) if tail.strip() else "") + " $(SYSLIBS)")
@@ -941,6 +997,13 @@ class ManifestMixin:
         w("CXX := g++")
         w("BIN_DIR := ../bin")
         w("")
+        w("# Debug info: make DEBUG=1, off by default. A sanitizer build forces")
+        w("# it on -- see the module Makefiles' own note.")
+        w("DEBUGFLAGS :=")
+        w("ifeq ($(DEBUG),1)")
+        w("    DEBUGFLAGS := -g")
+        w("endif")
+        w("")
         w("# Sanitizers: make ASAN=1 / make TSAN=1, mutually exclusive.")
         w("#")
         w("# A loader and the modules it dlopens share one address space, so they")
@@ -957,13 +1020,16 @@ class ManifestMixin:
         w("ifeq ($(TSAN),1)")
         w("    SANITIZE := -fsanitize=thread -fno-omit-frame-pointer")
         w("endif")
+        w("ifneq ($(SANITIZE),)")
+        w("    DEBUGFLAGS := -g")
+        w("endif")
         w("")
 
         cxx = [f.format(std=default.get("loader", {}).get("std", "c++17"))
                for f in BASE_LOADER_CXXFLAGS]
         cxx += [f"-D{d}" for d in common.get("defines", [])]
         cxx += common.get("cxxflags", [])
-        cxx += ["$(SANITIZE)"]
+        cxx += ["$(DEBUGFLAGS)", "$(SANITIZE)"]
         w("CXXFLAGS := " + " \\\n            ".join(cxx))
         w("")
 

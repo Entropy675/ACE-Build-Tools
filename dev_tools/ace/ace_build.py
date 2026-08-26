@@ -42,7 +42,7 @@ class BuildMixin:
 
             if '=' in arg:
                 key, _ = arg.split('=', 1)
-                if key not in ['ACE_ROOT', 'VERBOSE', 'DEBUG', 'ASAN', 'LOG_TO_FILE']:
+                if key not in ['ACE_ROOT', 'VERBOSE', 'DEBUG', 'ASAN', 'TSAN', 'LOG_TO_FILE']:
                     raise ValueError(f"Disallowed variable: {key}")
                 validated.append(arg)
             else:

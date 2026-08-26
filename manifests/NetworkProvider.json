@@ -151,9 +151,11 @@
   },
   "build": {
     "Linux": {
+      "ldflags": [
+        "-pthread"
+      ],
       "system_libs": [
-        "dl",
-        "pthread"
+        "dl"
       ]
     },
     "Win": {
