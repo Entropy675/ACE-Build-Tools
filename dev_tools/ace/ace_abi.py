@@ -626,6 +626,32 @@ class AbiMixin:
             print(f"  {DIM}No modules registered or built.{RESET}")
             return
 
+        print("""\nWork Functions Reminder (○/●): 
+All types implement the full *Concrete() interface, whether they expose it to ETCS scripts or not.
+The (○/●) token indicates what is namable from an external frame of reference (from an ETCS script, not another C++ work func).
+The (●) work functions are an explicit labeling of what is callable from an external frame of reference, whereas
+The (○) work functions can only be called within C++ in other work functions with references to a type of that base, ex:\n
+requires something [Window]\n
+That something can have any (●) work function called on it for the Window base with certainty that the result will deterministically pass/fail,
+based off of the exposed work function interface. You can specify a more exact type like:\n
+requires win [Window, WindowProvider::GLFWWindow]\n
+Now win is exactly the concrete type for GLFW or the script refuses to run, that invariant is upheld for the rest of the script.\n
+Within a work function:\n
+
+DEFINE_WORK_FUNC(SomeType, SomeAction)
+{
+    (void)ctx;
+    data.writeString((self.SomeOtherUnexposedAction().toString() + "\\n" + self.SomeAction(data.restAsString()).toString()).c_str());
+}
+
+Where:
+  SomeType
+    ○ SomeOtherUnexposedAction
+    ● SomeAction
+
+ETCS scripts can only call SomeAction.
+          """)
+
         print(f"\n--- ACE Modules ({len(all_names)}) ---\n")
 
         # Registry overview first: native vs external, gridded 4-across.
