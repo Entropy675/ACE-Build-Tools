@@ -26,7 +26,7 @@ script call it by name.
 from pathlib import Path
 import re
 
-from .ace_common import (CYAN, YELLOW, GREEN, RED, RESET, DIM)
+from .ace_common import (YELLOW, RED, ORANGE, RESET, DIM)
 
 
 class OntologyMixin:
@@ -253,7 +253,7 @@ class OntologyMixin:
             if link in fams:
                 proven |= set(fams[link]['dispatch'])
 
-        lines = [f"  {CYAN}{family}{RESET}"]
+        lines = [f"  {ORANGE}{family}{RESET}"]
         if len(chain) > 1:
             lines.append(f"    {DIM}{' <- '.join(chain[1:])} <- Entity{RESET}")
 
@@ -293,7 +293,8 @@ class OntologyMixin:
             print(f"  {RED}Bases that do not prove their lineage "
                   f"({len(unproven)}):{RESET}")
             for fam, missing in sorted(unproven.items()):
-                print(f"    {fam}: no dispatch for {', '.join(missing)}")
+                print(f"    {ORANGE}{fam}{RESET}: no dispatch for "
+                      f"{', '.join(missing)}")
             print()
 
         # Incidental exclusivity: unrelated families sharing a name. Siblings
@@ -317,5 +318,6 @@ class OntologyMixin:
             print(f"  {YELLOW}Incidental exclusivity -- unrelated families "
                   f"sharing a name, foldable only with disambiguation:{RESET}")
             for meth, fs in sorted(incidental.items()):
-                print(f"    {meth:<20} {DIM}{' + '.join(fs)}{RESET}")
+                joined = " + ".join(f"{ORANGE}{f}{RESET}" for f in fs)
+                print(f"    {meth:<20} {joined}")
             print()

@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import re
 
-from .ace_common import (CYAN, YELLOW, GREEN, RED, RESET, DIM)
+from .ace_common import (CYAN, YELLOW, GREEN, RED, PURPLE, ORANGE, RESET, DIM)
 
 
 class AbiMixin:
@@ -350,8 +350,9 @@ class AbiMixin:
             families = tag_families.get(tag)
             fam_note = ""
             if families:
-                fam_note = f"  {DIM}[{' + '.join(families)}]{RESET}"
-            lines.append(f"{indent}  {mark} {tag}{missing}{fam_note}")
+                joined = " + ".join(f"{ORANGE}{f}{RESET}" for f in families)
+                fam_note = f"  [{joined}]"
+            lines.append(f"{indent}  {mark} {PURPLE}{tag}{RESET}{missing}{fam_note}")
 
             if not families:
                 for meth in sorted(info['methods']):
@@ -367,8 +368,8 @@ class AbiMixin:
 
             for family, rows in report['groups']:
                 exported_n = sum(1 for _, ok in rows if ok)
-                lines.append(f"{indent}    {DIM}{family}{RESET} "
-                             f"{DIM}({exported_n}/{len(rows)}){RESET}")
+                lines.append(f"{indent}    {ORANGE}{family} "
+                             f"({exported_n}/{len(rows)}){RESET}")
                 for meth, ok in rows:
                     if ok:
                         lines.append(f"{indent}      {GREEN}●{RESET} {meth:<18} "
@@ -377,8 +378,9 @@ class AbiMixin:
                         lines.append(f"{indent}      {DIM}○ {meth}{RESET}")
 
             for meth, fams in report['collisions']:
+                joined = f"{RED} + ".join(f"{ORANGE}{f}" for f in fams)
                 lines.append(f"{indent}    {RED}! {meth} claimed by "
-                             f"{' + '.join(fams)}{RESET}")
+                             f"{joined}{RESET}")
 
         if iface['unknown']:
             lines.append(f"{indent}  {YELLOW}unrecognised exports: "
