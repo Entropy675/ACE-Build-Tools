@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "module": {
+    "name": "RenderProvider",
+    "std": "c++17",
+    "platforms": [
+      "Linux",
+      "Win"
+    ],
+    "impl_layout": "shared"
+  },
+  "requires": {
+    "system": {
+      "debian": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        },
+        {
+          "package": "cmake",
+          "probe": "binary:cmake"
+        },
+        {
+          "package": "libvulkan-dev",
+          "probe": "header:vulkan/vulkan.h",
+          "provides_link": [
+            "vulkan"
+          ]
+        },
+        {
+          "package": "libx11-dev",
+          "probe": "header:X11/Xlib.h",
+          "provides_link": [
+            "X11"
+          ]
+        },
+        {
+          "package": "liburing-dev",
+          "probe": "header:liburing.h",
+          "provides_link": [
+            "uring"
+          ]
+        }
+      ],
+      "arch": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        },
+        {
+          "package": "cmake",
+          "probe": "binary:cmake"
+        },
+        {
+          "package": "vulkan-icd-loader",
+          "probe": "header:vulkan/vulkan.h",
+          "provides_link": [
+            "vulkan"
+          ]
+        },
+        {
+          "package": "libx11",
+          "probe": "header:X11/Xlib.h",
+          "provides_link": [
+            "X11"
+          ]
+        },
+        {
+          "package": "liburing",
+          "probe": "header:liburing.h",
+          "provides_link": [
+            "uring"
+          ]
+        }
+      ],
+      "fedora": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        },
+        {
+          "package": "cmake",
+          "probe": "binary:cmake"
+        },
+        {
+          "package": "vulkan-loader-devel",
+          "probe": "header:vulkan/vulkan.h",
+          "provides_link": [
+            "vulkan"
+          ]
+        },
+        {
+          "package": "libX11-devel",
+          "probe": "header:X11/Xlib.h",
+          "provides_link": [
+            "X11"
+          ]
+        },
+        {
+          "package": "liburing-devel",
+          "probe": "header:liburing.h",
+          "provides_link": [
+            "uring"
+          ]
+        }
+      ]
+    },
+    "vendor": [
+      {
+        "name": "vulkan-headers",
+        "source": {
+          "type": "git",
+          "url": "https://github.com/KhronosGroup/Vulkan-Headers.git",
+          "ref": "36872f9062b17b1a30b8ed1d81ca5ea6bb608a72",
+          "shallow": true
+        },
+        "arch_sensitive": false,
+        "hash_scope": false,
+        "provides": {
+          "include": [
+            "include"
+          ]
+        }
+      }
+    ]
+  },
+  "build": {
+    "Linux": {
+      "cxxflags": [
+        "-fvisibility-inlines-hidden"
+      ],
+      "ldflags": [
+        "-Wl,-Bsymbolic"
+      ],
+      "system_libs": [
+        "vulkan",
+        "X11",
+        "uring",
+        "dl",
+        "pthread"
+      ]
+    },
+    "Win": {
+      "system_libs": [
+        "vulkan-1"
+      ]
+    }
+  },
+  "produces": {
+    "kind": "etcs_module",
+    "exports": "exports.map",
+    "install": "bin/"
+  }
+}

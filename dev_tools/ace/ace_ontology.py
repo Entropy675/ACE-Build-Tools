@@ -184,13 +184,46 @@ class OntologyMixin:
             for m in self._ONT_LEAF.finditer(text):
                 bases = self._ONT_BASEREF.findall(m.group(2))
                 if bases:
-                    leaves[m.group(1)] = sorted(set(bases))
+                    leaves[m.group(1)] = self._transitive_families(sorted(set(bases)))
             for concrete, name in self._ONT_TYPEDEF.findall(text):
                 alias[concrete] = name
             for name, concrete in self._ONT_USING.findall(text):
                 alias[concrete] = name
 
         return {alias.get(leaf, leaf): fams for leaf, fams in leaves.items()}
+
+    def _transitive_families(self, families):
+        """Expand a leaf's directly-written families through the ones their
+        own Base headers compose.
+
+        A leaf's `public XBase<Leaf>` list only names what that CLASS wrote
+        down. A Base may itself compose another family AT THE FAMILY LEVEL
+        (ontology/TargetBase.h composes ResizableBase, because every render
+        target must handle resize -- it is not a per-backend opt-in the way
+        Deletable is). Every leaf of that family then carries the composed
+        family at runtime: the composed Base's own ETCS_MAKE_INSTANCE ctor
+        runs as part of constructing the leaf, registering its type tag and
+        interface pointer exactly as if the leaf had written the base down
+        itself. Stopping at the directly-written bases under-reports what
+        the tag actually answers to, which is the one thing this listing
+        exists to state correctly.
+        """
+        out, queue, seen = [], list(families), set()
+        while queue:
+            fam = queue.pop(0)
+            if fam in seen:
+                continue
+            seen.add(fam)
+            out.append(fam)
+            header = self.ace_root / "ontology" / f"{fam}Base.h"
+            try:
+                text = header.read_text(errors="ignore")
+            except OSError:
+                continue    # a family with no Base header of its own composes nothing
+            for composed in self._ONT_BASEREF.findall(text):
+                if composed not in seen:
+                    queue.append(composed)
+        return sorted(out)
 
     # ------------------------------------------------------- the correspondence
 
