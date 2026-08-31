@@ -6,6 +6,10 @@
     "std": "c++17"
   },
 
+  "produces": {
+    "exports": "exports.map"
+  },
+
   "build": {
     "common": {
       "cxxflags": [],
@@ -20,7 +24,8 @@
         "-Wl,--as-needed",
         "-fuse-ld=gold",
         "-Wl,--threads",
-        "-Wl,--thread-count,$(NPROC)"
+        "-Wl,--thread-count,$(NPROC)",
+        "-rdynamic"
       ],
       "system_libs": []
     },

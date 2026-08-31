@@ -1169,11 +1169,25 @@ class ManifestMixin:
         w("CXXFLAGS := " + " \\\n            ".join(cxx))
         w("")
 
+        exports = default.get("produces", {}).get("exports")
         for plat, cond, kw in (("Linux", "Linux", "ifeq"),
                                ("Win", "Windows_NT", "else ifeq")):
             blk = default.get("build", {}).get(plat, {})
             w(f"{kw} ($(UNAME_S),{cond})")
             parts = blk.get("ldflags", []) + ["-l" + l for l in blk.get("system_libs", [])]
+            if plat == "Linux" and exports:
+                # Same ELF-only reasoning as a module's own version script
+                # (see _emit_makefile): silently ignored on Win, which would
+                # read as an enforced export surface that isn't one.
+                #
+                # A loader needs this for the opposite reason a module does.
+                # A module restricts what it OFFERS; a loader linked
+                # -rdynamic (so a module's static-init can find
+                # ETCS_GetLoaderManifest via dlsym(RTLD_DEFAULT, ...))
+                # would otherwise offer every symbol -fvisibility=hidden
+                # happened not to catch. The version script is what keeps
+                # that an audited whitelist instead of a side effect.
+                parts.append(f"-Wl,--version-script={exports}")
             w(f"    LDFLAGS := {' '.join(parts)}".rstrip())
         w("else")
         w("    $(error Unsupported platform: $(UNAME_S))")
