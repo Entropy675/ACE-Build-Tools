@@ -14,6 +14,7 @@ Layout (all under dev_tools/):
     ace_registry.py  <- global module registry
     ace_deps.py      <- machine dependency probing
     ace_abi.py       <- ABI introspection, drift, column compositor
+    ace_ontology.py  <- constraint families, leaf composition, correspondence
     ace_build.py     <- make dispatch + arg validation
     ace_lifecycle.py <- install/uninstall/setup/remove/stage/scaffold
     ace_script.py    <- proxy for etcs_viewer.py script editor
@@ -30,13 +31,14 @@ from dev_tools.ace import (
     RegistryMixin,
     DepsMixin,
     AbiMixin,
+    OntologyMixin,
     BuildMixin,
     LifecycleMixin,
     ScriptMixin,
     ManifestMixin
 )
 
-class AceManager(RegistryMixin, DepsMixin, AbiMixin, BuildMixin,
+class AceManager(RegistryMixin, DepsMixin, AbiMixin, OntologyMixin, BuildMixin,
                  LifecycleMixin, ScriptMixin, ManifestMixin):
     """Assembled from the subsystem mixins. Method resolution runs left to
     right across the bases; none of them define colliding names (verified at
@@ -227,6 +229,7 @@ if __name__ == "__main__":
         print("           | deps { check | install | arch }")
         print("           | manifest { list | check [mod...] | show <mod> | generate [mod...|loaders] [--force] | clean [mod...|loaders] }")
         print("           | abi [module]")
+        print("           | ontology")
         print("           | script [name]")
         sys.exit(0)
 
@@ -244,6 +247,7 @@ if __name__ == "__main__":
         elif cmd == "deps":                             ace.deps(args[1:])
         elif cmd == "manifest":                         ace.manifest(args[1:])
         elif cmd == "abi":                              ace.abi(args[1:])
+        elif cmd == "ontology":                         ace.ontology(args[1:])
         elif cmd == "script":                           ace.create_script(args[1:])
         else:
             print(f"[-] Unknown or incomplete command: '{cmd}'")

@@ -288,10 +288,41 @@ class AbiMixin:
         bytes and would misalign every coloured column."""
         return len(self._ANSI_RE.sub("", s))
 
+    def _dispatch_token(self, slot):
+        """Colour one method's dispatch kind, plus its hash-pair state."""
+        d = slot['dispatch'] or f"{YELLOW}no-dispatch{RESET}"
+        if slot['dispatch'] == 'Stream':
+            d = f"{CYAN}Stream{RESET}"
+        elif slot['dispatch'] == 'Work':
+            d = f"{GREEN}Work{RESET}"
+        return d + ("" if slot['hashed'] else f"  {YELLOW}(no hash){RESET}")
+
     def _interface_lines(self, iface, indent="  "):
         """Render one module's tag-set to a LIST OF LINES instead of printing.
         This is what lets several interfaces be spliced into side-by-side
-        columns -- a printer can't be composited, a line list can."""
+        columns -- a printer can't be composited, a line list can.
+
+        Each type is shown against its ONTOLOGY CONSTRAINT SURFACE when the
+        module's sources can be read. The type's own work functions come first,
+        being the most specific thing about it; everything else is grouped
+        under the family it fulfils.
+
+        ● and ○ mark SCRIPT REACH, not implementation. Every constraint method
+        is implemented -- ETCS_DISPATCH_METHOD expands to a pure virtual, so a
+        leaf that skipped one would not compile. ● means a work function of
+        that exact name is exported, so a trace line can call it directly. ○
+        means it is C++-only: reachable by any code holding the concrete type,
+        and from a script by handing the RID to a work function that uses it.
+
+        ○ is therefore not a defect, and often not even a gap. It is the normal
+        shape for a method whose caller is the gate that owns the entity rather
+        than the trace that wired it up -- NetworkProvider's parsers export none
+        of Parser and are driven entirely through @rid arguments. The match is
+        also by NAME, so a capability exported under a different word (a
+        `Filter` work function against the `Accepts` constraint) reads as ○ too.
+        What the column tells you is which calls a script can make, and nothing
+        beyond that.
+        """
         mod = iface['module']
         types = iface['types']
         lines = [f"{indent}{CYAN}{mod}{RESET} "
@@ -299,6 +330,11 @@ class AbiMixin:
         if iface['loader']:
             lines.append(f"{indent}  {DIM}loader: "
                          f"{', '.join(iface['loader'])}{RESET}")
+
+        try:
+            tag_families = self._parse_module_leaves(mod)
+        except Exception:
+            tag_families = {}      # ontology overlay is additive; never fatal
 
         for tag in sorted(types):
             info = types[tag]
@@ -310,17 +346,39 @@ class AbiMixin:
                 missing = (f"  {YELLOW}[missing "
                            f"{', '.join(sorted(set(self._ABI_TRIAD) - triad))}]"
                            f"{RESET}")
-            lines.append(f"{indent}  {mark} {tag}{missing}")
 
-            for meth in sorted(info['methods']):
-                slot = info['methods'][meth]
-                d = slot['dispatch'] or f"{YELLOW}no-dispatch{RESET}"
-                if slot['dispatch'] == 'Stream':
-                    d = f"{CYAN}Stream{RESET}"
-                elif slot['dispatch'] == 'Work':
-                    d = f"{GREEN}Work{RESET}"
-                hmark = "" if slot['hashed'] else f"  {YELLOW}(no hash){RESET}"
-                lines.append(f"{indent}      {meth:<20} {d}{hmark}")
+            families = tag_families.get(tag)
+            fam_note = ""
+            if families:
+                fam_note = f"  {DIM}[{' + '.join(families)}]{RESET}"
+            lines.append(f"{indent}  {mark} {tag}{missing}{fam_note}")
+
+            if not families:
+                for meth in sorted(info['methods']):
+                    lines.append(f"{indent}      {meth:<20} "
+                                 f"{self._dispatch_token(info['methods'][meth])}")
+                continue
+
+            report = self._constraint_report(families, info['methods'].keys())
+
+            for meth in report['own']:
+                lines.append(f"{indent}      {meth:<20} "
+                             f"{self._dispatch_token(info['methods'][meth])}")
+
+            for family, rows in report['groups']:
+                exported_n = sum(1 for _, ok in rows if ok)
+                lines.append(f"{indent}    {DIM}{family}{RESET} "
+                             f"{DIM}({exported_n}/{len(rows)}){RESET}")
+                for meth, ok in rows:
+                    if ok:
+                        lines.append(f"{indent}      {GREEN}●{RESET} {meth:<18} "
+                                     f"{self._dispatch_token(info['methods'][meth])}")
+                    else:
+                        lines.append(f"{indent}      {DIM}○ {meth}{RESET}")
+
+            for meth, fams in report['collisions']:
+                lines.append(f"{indent}    {RED}! {meth} claimed by "
+                             f"{' + '.join(fams)}{RESET}")
 
         if iface['unknown']:
             lines.append(f"{indent}  {YELLOW}unrecognised exports: "
