@@ -1197,6 +1197,20 @@ class ManifestMixin:
         w("# Per-loader additions. EXTRA_LINK is kept OUT of LDFLAGS on purpose:")
         w("# it lands after the translation unit on the command line, because")
         w("# gold does not rescan an archive it has already passed.")
+        w("#")
+        w("# Bound with TARGET-SPECIFIC variables (`name: VAR += ...` below), not")
+        w("# an `ifeq ($(FILE),name)` gate on a global EXTRA_CXXFLAGS/EXTRA_LINK.")
+        w("# The default `loaders` target compiles every *Loader.cc in one `make`")
+        w("# invocation with no FILE set, through the single shared `%Loader:")
+        w("# %Loader.cc` pattern rule -- an ifeq keyed on FILE never matches there,")
+        w("# so a global variable silently drops every loader's inherited flags")
+        w("# except when that one loader is built alone via FILE=<name>. That is")
+        w("# the exact bug _inherited_module_flags's own docstring warns about:")
+        w("# the loader still compiles, quietly against /usr/include instead of")
+        w("# the module's vendored headers, and fails with a signature mismatch")
+        w("# in a header nobody touched. Target-specific variables are scoped to")
+        w("# the target itself, so they apply whichever way that target is asked")
+        w("# for -- `make loaders`, `make FILE=<name>`, or a direct `make <name>`.")
         w("EXTRA_CXXFLAGS :=")
         w("EXTRA_LINK :=")
         w("")
@@ -1219,14 +1233,12 @@ class ManifestMixin:
                 ob.get("link", [])
             if not extra_cxx and not extra_link:
                 continue
-            w(f"ifeq ($(FILE),{name})")
             if o.get("inherits_modules"):
-                w(f"    # inherits: {', '.join(o['inherits_modules'])}")
+                w(f"# {name} inherits: {', '.join(o['inherits_modules'])}")
             if extra_cxx:
-                w(f"    EXTRA_CXXFLAGS += {' '.join(extra_cxx)}")
+                w(f"{name}: EXTRA_CXXFLAGS += {' '.join(extra_cxx)}")
             if extra_link:
-                w(f"    EXTRA_LINK += {' '.join(extra_link)}")
-            w("endif")
+                w(f"{name}: EXTRA_LINK += {' '.join(extra_link)}")
             w("")
 
         w("# If FILE is specified, build only that one; otherwise every *Loader.cc.")
