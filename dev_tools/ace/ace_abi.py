@@ -57,7 +57,11 @@ class AbiMixin:
         rather than an empty line -- a flat tag should look flat."""
         if not families:
             return []
-        fams = list(families)
+        # Sorted SHORT FIRST, so a row of five short names stays short and the
+        # long ones cluster into their own row instead of setting the width of
+        # every row above them. Length before name, since the point is the
+        # packing; ties fall back to alphabetical so the order is stable.
+        fams = sorted(families, key=lambda f: (len(f), f))
         rows = []
         # Bracketed across the whole run, opening on the first row and closing
         # on the last, with continuations aligned under the opening bracket.
@@ -450,27 +454,32 @@ class AbiMixin:
         block_w = [max((self._visible_len(l) for l in blk), default=0)
                    for blk in blocks]
 
-        # Group blocks of similar width into the same band before laying out.
+        # Group blocks of similar HEIGHT into the same band, shortest first.
         #
-        # Bands are filled sequentially, so declaration order puts whatever
-        # happens to be adjacent next to each other -- one wide block in a band
-        # of narrow ones stretches that band's tallest column and leaves the
-        # rest of the row trailing whitespace to reach it, while the NEXT band
-        # repeats the problem with a different offender. Sorting by width makes
-        # each band internally uniform: the wide ones sit together, the narrow
-        # ones sit together, and the ragged edge appears once (between bands)
-        # instead of once per band.
+        # HEIGHT IS WHAT COSTS, and sorting by width was solving the wrong
+        # problem. A band is as tall as its tallest block and every other
+        # column in it is padded out to reach that -- so one thirty-row module
+        # sitting beside a four-row one spends twenty-six rows of nothing, and
+        # the total output is the sum of each band's tallest member. Width only
+        # ever costs horizontal space, which the terminal already has.
         #
-        # Stable, and descending, so ties keep declaration order and the widest
-        # band leads -- which also means the column-index widths are settled by
-        # the first band rather than drifting as later bands are measured.
+        # ASCENDING, so the short ones lead and the tall ones settle at the
+        # bottom. That minimises the sum of band maxima -- blocks of similar
+        # height share a band, so each band's padding is small -- and it also
+        # reads better: the small types are all together at the top where they
+        # can be taken in at a glance, instead of scattered between the giants.
+        #
+        # Width survives as the tiebreak, descending, so among equal-height
+        # blocks the wide ones still cluster and the ragged right edge appears
+        # once rather than per band.
         #
         # Purely presentational: this reorders how types are DISPLAYED, not any
         # ordering the ABI itself depends on (tag bit assignment, manifest
         # order, dispatch). If a caller ever needs the original sequence
         # preserved on screen, that wants a flag rather than removing this.
         if group_by_width and len(blocks) > 1:
-            order = sorted(range(len(blocks)), key=lambda i: -block_w[i])
+            order = sorted(range(len(blocks)),
+                           key=lambda i: (len(blocks[i]), -block_w[i]))
             blocks  = [blocks[i]  for i in order]
             block_w = [block_w[i] for i in order]
 
