@@ -778,9 +778,46 @@ class ManifestMixin:
           + ((" " + " ".join(inline_srcs)) if inline_srcs else ""))
         w("")
 
-        w(".PHONY: all clean")
-        w("all: $(FINAL_TARGET)")
+        # ---- runtime assets ------------------------------------------------
+        #
+        # Files a module needs AT RUNTIME that are not linked into it --
+        # RenderProvider's compiled SPIR-V is the first case. They belong
+        # beside the .so in bin/, because that is the one directory the
+        # module can find without being told: dladdr gives it its own path,
+        # and everything else is a guess about the caller's cwd.
+        #
+        # Without this the shader path had to be passed in from the script
+        # and resolved against the process's working directory, so the same
+        # script worked from the repo root and produced a window that never
+        # painted from anywhere else. An asset that ships with the module
+        # should be installed with the module.
+        assets = produces.get("assets", [])
+        asset_rules = []
+        if assets:
+            for a in assets:
+                src = a.get("from", "")
+                dst = a.get("to", "")
+                if not src:
+                    continue
+                dest_dir = "$(BIN_DIR)/" + dst if dst else "$(BIN_DIR)"
+                asset_rules.append((src, dest_dir))
+
+        w(".PHONY: all clean install_assets")
+        if asset_rules:
+            w("BIN_DIR := ../../bin")
+            w("all: $(FINAL_TARGET) install_assets")
+        else:
+            w("all: $(FINAL_TARGET)")
         w('\t@echo "✓ Built $(FINAL_TARGET) for $(UNAME_S) ($(ARCH))"')
+        w("")
+        w("install_assets:")
+        if asset_rules:
+            for src, dest_dir in asset_rules:
+                w(f"\t@mkdir -p {dest_dir}")
+                w(f"\t@cp -f {src} {dest_dir}/ 2>/dev/null || true")
+                w(f'\t@echo "  [assets] {src} -> {dest_dir}/"')
+        else:
+            w("\t@:")
         w("")
 
         w("$(BUILD_STAMP):")
@@ -858,6 +895,19 @@ class ManifestMixin:
         w("\trm -rf .ace_obj")
         for p in clean_paths:
             w(f"\trm -rf {p}")
+        # Installed assets are this module's output too, so this module's own
+        # clean is what removes them -- the most local path that knows they
+        # exist. Leaving them behind means `ace make clean module X` followed
+        # by a run picks up the PREVIOUS build's shaders out of bin/ and
+        # reports success, which is the failure mode a clean target exists to
+        # make impossible.
+        #
+        # Only the files this module declared, never the directory: two
+        # modules may install into the same place, and one being cleaned is
+        # not the other being uninstalled.
+        for src, dest_dir in asset_rules:
+            base = src.rsplit("/", 1)[-1]
+            w(f"\trm -f {dest_dir}/{base}")
         w("\t@echo \"✓ Cleaned $(TARGET_BASE_NAME) (vendored sources preserved)\"")
         w("")
 

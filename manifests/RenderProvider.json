@@ -149,6 +149,12 @@
   "produces": {
     "kind": "etcs_module",
     "exports": "exports.map",
-    "install": "bin/"
+    "install": "bin/",
+    "assets": [
+      {
+        "from": "shaders/*.spv",
+        "to": "shaders"
+      }
+    ]
   }
 }
