@@ -920,7 +920,19 @@ class ManifestMixin:
         lines = []
         lines.append(f"# {dep['name']}: pinned at {ref}")
         lines.append(f"{marker}:")
-        lines.append(f"\t@if [ ! -d \"$({v}_DIR)/.git\" ]; then \\")
+        # -e, not -d. A submodule checkout writes a .git FILE (a gitlink into
+        # the superproject's .git/modules/...), not a directory, so a -d test
+        # says "not fetched" for a tree that is fully present -- and the clone
+        # it then attempts fails with "destination path already exists and is
+        # not an empty directory", failing the build.
+        #
+        # That became reachable the moment modules/ became a submodule of its
+        # own: `git submodule update --init --recursive` now checks out glfw,
+        # picohttpparser, mbedtls, sqlite and CChess, and every one of them
+        # hits this guard. The fetch rule and the submodule mechanism were
+        # both trying to be the thing that puts vendored sources on disk;
+        # -e is what lets the fetch rule notice the other one already did.
+        lines.append(f"\t@if [ ! -e \"$({v}_DIR)/.git\" ]; then \\")
         if shallow:
             lines.append(f"\t    git clone --depth 1 --branch '{ref}' {url} $({v}_DIR) 2>/dev/null \\")
             lines.append(f"\t      || git clone {url} $({v}_DIR); \\")

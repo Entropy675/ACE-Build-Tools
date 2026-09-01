@@ -62,6 +62,18 @@
           "provides_link": [
             "uring"
           ]
+        },
+        {
+          "package": "libxinerama-dev",
+          "probe": "header:X11/extensions/Xinerama.h"
+        },
+        {
+          "package": "libxcursor-dev",
+          "probe": "header:X11/Xcursor/Xcursor.h"
+        },
+        {
+          "package": "libgl-dev",
+          "probe": "header:GL/gl.h"
         }
       ],
       "arch": [
@@ -114,6 +126,18 @@
           "provides_link": [
             "uring"
           ]
+        },
+        {
+          "package": "libxinerama",
+          "probe": "header:X11/extensions/Xinerama.h"
+        },
+        {
+          "package": "libxcursor",
+          "probe": "header:X11/Xcursor/Xcursor.h"
+        },
+        {
+          "package": "mesa",
+          "probe": "header:GL/gl.h"
         }
       ],
       "fedora": [
@@ -166,6 +190,18 @@
           "provides_link": [
             "uring"
           ]
+        },
+        {
+          "package": "libXinerama-devel",
+          "probe": "header:X11/extensions/Xinerama.h"
+        },
+        {
+          "package": "libXcursor-devel",
+          "probe": "header:X11/Xcursor/Xcursor.h"
+        },
+        {
+          "package": "mesa-libGL-devel",
+          "probe": "header:GL/gl.h"
         }
       ]
     },
