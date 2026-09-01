@@ -6,6 +6,8 @@ all methods are `self`-bound and may call across subsystems through the one
 assembled object, but each subsystem's *definition* lives in exactly one file.
 """
 from pathlib import Path
+import hashlib
+import json
 import os
 import platform
 import shutil
@@ -16,6 +18,190 @@ from .ace_common import (CYAN, YELLOW, GREEN, RED, RESET, DIM)
 
 
 class BuildMixin:
+
+
+    # ================================================================
+    # Change detection
+    # ================================================================
+    #
+    # WHY THIS IS ACE'S JOB AND NOT MAKE'S. Every module's own Makefile
+    # already tracks its headers correctly, and would happily do nothing on a
+    # no-op rebuild -- but the batch target depends on clean_modules, so
+    # `ace make modules` deletes every artifact before make can decide
+    # anything. The decision has to be made one level up, before the clean.
+    #
+    # WHAT A MODULE'S FINGERPRINT HAS TO COVER, and the second half is the
+    # non-obvious one:
+    #
+    #   its own sources and headers    -- changing them changes the .so
+    #   the GENERATED global hash files -- ontology_hashes.h, libs_hashes.h,
+    #                                      core_hashes.h
+    #
+    # Those three are compiled INTO every module and compared against the
+    # loader's copies at load time; a module built against an older set is
+    # refused with "built for different epochs" rather than misbehaving. So
+    # narrowing this to "the ontology families this module actually uses"
+    # would be wrong in a way that looks right: the module would skip, load,
+    # and abort, because the check is over the whole set and not over the part
+    # it uses. Hashing the generated files also covers the headers they are
+    # derived from, so an edit anywhere in ontology/, libs/ or core/ correctly
+    # invalidates every module at once.
+    #
+    # FLAGS ARE IN IT TOO. A DEBUG or ASAN build is a different artifact from
+    # the same sources, and the module Makefiles already encode that in their
+    # own build stamp; this is the same fact, one level up.
+
+    _FINGERPRINT_NAME = ".ace_build_fingerprint"
+
+    # Generated headers first: they are what the loader compares. The umbrella
+    # headers are listed because they are includable directly and are not
+    # covered by any of the generated files.
+    _GLOBAL_FINGERPRINT_FILES = (
+        "ontology_hashes.h",
+        "libs_hashes.h",
+        "core_hashes.h",
+        "ontology.h",
+        "libs.h",
+        "core_defs.h",
+    )
+
+    _SOURCE_SUFFIXES = {".h", ".hpp", ".hh", ".inc", ".c", ".cc", ".cpp", ".cxx"}
+
+    # Never part of a module's identity: build outputs, dependency files, and
+    # the per-module hash header, which is DERIVED from the very files being
+    # hashed and would make every fingerprint depend on the last build.
+    _FINGERPRINT_EXCLUDED_NAMES = {"module_hashes.h"}
+
+    @staticmethod
+    def _hash_files(paths):
+        h = hashlib.sha256()
+        for path in paths:
+            # The NAME goes in as well as the bytes: a file renamed is a
+            # change, and hashing contents alone would miss it.
+            h.update(str(path).encode("utf-8", "replace"))
+            h.update(b"\0")
+            try:
+                with open(path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 16), b""):
+                        h.update(chunk)
+            except OSError:
+                h.update(b"<unreadable>")
+            h.update(b"\0")
+        return h.hexdigest()
+
+    def _global_fingerprint(self):
+        """The generated hash headers plus the umbrella includes.
+
+        A miss here invalidates EVERY module, which is correct: these are what
+        the loader compares against, and a module out of step with them cannot
+        load at all."""
+        return self._hash_files(
+            self.ace_root / name for name in self._GLOBAL_FINGERPRINT_FILES)
+
+    def _module_source_files(self, mod):
+        """Every source and header the module owns, vendored trees excluded.
+
+        Vendored dependencies are pinned by commit and fetched into the module
+        directory (the .ace_fetched marker beside them), so their contents are
+        a function of the pin, not of anything a developer edits -- walking
+        them would hash tens of thousands of files to learn nothing. The pin
+        itself lives in the Makefile, which IS hashed."""
+        root = self.ace_root / "modules" / mod
+        if not root.is_dir():
+            return []
+        out = []
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            if any(part.startswith(".") for part in path.relative_to(root).parts):
+                continue
+            # A vendored checkout is anything with its own git metadata.
+            if any((root.joinpath(*path.relative_to(root).parts[:i + 1]) / ".git").exists()
+                   for i in range(len(path.relative_to(root).parts) - 1)):
+                continue
+            if path.name in self._FINGERPRINT_EXCLUDED_NAMES:
+                continue
+            if path.name == "Makefile" or path.suffix in self._SOURCE_SUFFIXES:
+                out.append(path)
+        return out
+
+    def _module_fingerprint(self, mod, extras):
+        """The full record for a module: what it is built FROM, and HOW.
+
+        Kept as separate components rather than one digest so a skip decision
+        can say WHICH half moved -- "the ontology changed" and "you edited this
+        module" are different answers and a developer wants to know which one
+        they are looking at."""
+        manifest = self._manifest_dir() / f"{mod}.json"
+        return {
+            "global": self._global_fingerprint(),
+            "local": self._hash_files(self._module_source_files(mod)),
+            "manifest": self._hash_files([manifest]) if manifest.is_file() else "",
+            "flags": " ".join(sorted(extras)),
+        }
+
+    def _fingerprint_path(self, mod):
+        return self.ace_root / "modules" / mod / self._FINGERPRINT_NAME
+
+    def _module_build_reason(self, mod, extras):
+        """None if the module is up to date, else why it is not.
+
+        The .so has to EXIST as well as match: a fingerprint describes what a
+        build would produce, and a fingerprint with no artifact beside it is a
+        record of a build somebody deleted."""
+        so = self._bin_dir() / f"{mod}.{self._lib_ext()}"
+        if not so.is_file():
+            return "no built artifact in bin/"
+
+        path = self._fingerprint_path(mod)
+        if not path.is_file():
+            return "never built through this check"
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                old = json.load(fh)
+        except (OSError, ValueError):
+            return "unreadable build record"
+
+        new = self._module_fingerprint(mod, extras)
+        if old.get("global") != new["global"]:
+            return "ontology / libs / core hashes changed"
+        if old.get("manifest") != new["manifest"]:
+            return "manifest changed"
+        if old.get("local") != new["local"]:
+            return "module sources changed"
+        if old.get("flags") != new["flags"]:
+            return "build flags changed"
+        return None
+
+    def _record_module_fingerprint(self, mod, extras):
+        """Written only after a build that SUCCEEDED and left an artifact.
+
+        BOTH CONDITIONS, and the first one is the one that bites. A failed
+        build leaves the PREVIOUS .so sitting in bin/, so "an artifact exists"
+        is true for a module that did not build at all -- record on that alone
+        and the next run skips a module whose binary predates the change,
+        which surfaces later as the loader refusing it for a hash mismatch.
+        Found exactly that way, by an interrupted batch.
+
+        So the caller passes make's own verdict, and a failure leaves no
+        record at all: the module is rebuilt next time, which is the only safe
+        default when the truth is unknown."""
+        so = self._bin_dir() / f"{mod}.{self._lib_ext()}"
+        if not so.is_file():
+            return
+        try:
+            with open(self._fingerprint_path(mod), "w", encoding="utf-8") as fh:
+                json.dump(self._module_fingerprint(mod, extras), fh, indent=1)
+        except OSError as e:
+            print(f"    {DIM}(could not record build fingerprint for {mod}: {e}){RESET}")
+
+    def _lib_ext(self):
+        system = platform.system()
+        if system == "Windows":
+            return "dll"
+        if system == "Darwin":
+            return "dylib"
+        return "so"
 
     def _validate_module_name(self, name):
         """Clean module name: keep alphanumerics and underscores for cross-platform safety."""
@@ -67,7 +253,7 @@ class BuildMixin:
         master_makefile = self.ace_root / "Makefile"
         if not master_makefile.exists():
             print(f"[-] Error: No master Makefile found at {self.ace_root}")
-            return
+            return False
 
         print(f"[*] Routing to master Makefile for target: {target}")
         make_cmd = ["make", "-C", str(self.ace_root), f"ACE_ROOT={self.ace_root}", target]
@@ -77,16 +263,33 @@ class BuildMixin:
 
         try:
             subprocess.run(make_cmd, check=True)
+            return True
         except subprocess.CalledProcessError as e:
             # Under keep_going a non-zero exit just means some target failed; the
             # modules that built are still valid, so this is a warning, not a stop.
             print(f"[-] Build error: {e}")
+            return False
 
     def make(self, args):
         """Run make with auto-healing ETCS links."""
         if not args:
             print("[-] Error: No make target specified.")
             print("    Usage: ace make { all | modules | loaders | clean | clean modules | clean loaders | module <n> | clean module <n> | loader <n> | clean loader <n> }")
+            return
+
+        # --force is ACE's own flag, not make's, so it comes out of the
+        # argument list before anything tries to validate it as a make target.
+        # Accepted anywhere in the line because that is where people type it.
+        force = False
+        filtered = []
+        for a in args:
+            if a in ("--force", "-B"):
+                force = True
+                continue
+            filtered.append(a)
+        args = filtered
+        if not args:
+            print("[-] Error: No make target specified.")
             return
 
         # Once per (distro, arch), then never again -- a marker read, not a
@@ -197,7 +400,7 @@ class BuildMixin:
                     self.ensure_makefile(mod)
                     print(f"[*] Current ABI interface for {mod} (pre-build):")
                     self.introspect_and_record(mod, announce=True)
-                    self._run_root_make(f"module_{mod}", extra_args=extras)
+                    ok = self._run_root_make(f"module_{mod}", extra_args=extras)
                     # Announced, not silent. The pre-build pass shows what the
                     # LAST build left behind; the drift you actually want to see
                     # is what THIS build just changed, and that only exists once
@@ -207,6 +410,12 @@ class BuildMixin:
                     # next unrelated invocation surfaced it as stale news.
                     print(f"[*] ABI interface for {mod} (post-build):")
                     self.introspect_and_record(mod, announce=True)
+                    # A named module is ALWAYS built -- asking for it by name
+                    # is the request -- but the record is written only if the
+                    # build worked, so a later `ace make modules` knows this
+                    # one is current and leaves it alone.
+                    if ok:
+                        self._record_module_fingerprint(mod, extras)
                 return
 
             if len(args) >= 3 and args[0] == "clean" and args[1] == "module":
@@ -269,14 +478,70 @@ class BuildMixin:
 
                 if batch:
                     self._announce_full_tagset()
-                # Keep going so one module's failure doesn't take down its siblings...
-                self._run_root_make(args[0], extra_args=extras, keep_going=batch)
-                if batch:
-                    # ...then copy unconditionally, so every module that DID build
-                    # lands in ./bin instead of vanishing with the aborted run.
+
+                # THE MODULE HALF IS DRIVEN PER MODULE, not through the
+                # `modules` target, and that is what makes skipping possible
+                # at all: that target depends on clean_modules, so it deletes
+                # every artifact before make can decide anything. Driving
+                # module_<name> one at a time keeps make's own incremental
+                # decisions intact underneath and lets a whole module be
+                # skipped above them.
+                if args[0] in ("all", "modules"):
+                    mods = sorted(set(self._all_manifests())
+                                  | set(self._defaulted_modules()))
+                    build, skipped = [], []
+                    for mod in mods:
+                        reason = None if force else self._module_build_reason(mod, extras)
+                        if force:
+                            reason = "forced"
+                        if reason is None:
+                            skipped.append(mod)
+                        else:
+                            build.append((mod, reason))
+
+                    if skipped:
+                        print(f"[=] Unchanged, not rebuilt ({len(skipped)}):")
+                        self._print_name_grid(skipped, per_row=4, indent="    ",
+                                              color=DIM)
+                    if build:
+                        print(f"[*] Building {len(build)} module(s):")
+                        for mod, reason in build:
+                            print(f"    {CYAN}{mod}{RESET}  {DIM}({reason}){RESET}")
+                    elif not skipped:
+                        print("[!] No modules found to build.")
+                    print()
+
+                    failed = []
+                    for mod, _ in build:
+                        if self._run_root_make(f"module_{mod}", extra_args=extras):
+                            self._record_module_fingerprint(mod, extras)
+                        else:
+                            # No record at all -- the next run rebuilds it. A
+                            # failed build leaves the OLD .so in place, so
+                            # anything that keyed off the artifact's existence
+                            # would call this module current.
+                            failed.append(mod)
+                    if failed:
+                        print(f"{RED}[-] {len(failed)} module(s) failed and were not "
+                              f"recorded; they will rebuild next run:{RESET}")
+                        self._print_name_grid(failed, per_row=4, indent="    ",
+                                              color=RED)
+
+                    # Unconditional: a module that was skipped still has to be
+                    # in bin/, and one that failed should not take its
+                    # siblings' artifacts with it.
                     self._run_root_make("copy_modules", extra_args=extras)
                     for module, so in self._all_module_sos():
                         self.introspect_and_record(module, so_path=so, announce=False)
+
+                if args[0] in ("all", "loaders"):
+                    # Loaders are NOT skipped. A loader carries the same
+                    # generated hash headers every module does and is the side
+                    # that every module is compared AGAINST at load time, so a
+                    # stale loader does not merely miss a change -- it refuses
+                    # every module built after it. It is also one link.
+                    self._run_root_make("loaders", extra_args=extras)
+                return
                 return
 
         except ValueError as e:

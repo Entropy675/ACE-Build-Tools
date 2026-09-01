@@ -48,6 +48,31 @@ class AbiMixin:
                 return name[:-len(ext)]
         return name
 
+    _FAMILIES_PER_ROW = 5
+
+    def _family_rows(self, families, indent):
+        """A tag's lineage as indented rows, _FAMILIES_PER_ROW to a row.
+
+        Returns [] for a tag with no families, so the caller appends nothing
+        rather than an empty line -- a flat tag should look flat."""
+        if not families:
+            return []
+        fams = list(families)
+        rows = []
+        # Bracketed across the whole run, opening on the first row and closing
+        # on the last, with continuations aligned under the opening bracket.
+        # The tag's own methods sit at this same indent, so without the bracket
+        # a wrapped lineage reads as two more method names -- the notation is
+        # what says "this is one note about the tag", and it is the same
+        # notation the single-line form used.
+        for i in range(0, len(fams), self._FAMILIES_PER_ROW):
+            chunk = fams[i:i + self._FAMILIES_PER_ROW]
+            joined = " + ".join(f"{ORANGE}{f}{RESET}" for f in chunk)
+            first = (i == 0)
+            last = i + self._FAMILIES_PER_ROW >= len(fams)
+            rows.append(f"{indent}{'[' if first else ' '}{joined}{']' if last else ' +'}")
+        return rows
+
     def _print_name_grid(self, names, per_row=4, indent="    ", color=""):
         """Print names in a fixed-width grid, per_row across then wrap --
         four to a line makes a tidy square. Column width tracks the widest
@@ -348,11 +373,17 @@ class AbiMixin:
                            f"{RESET}")
 
             families = tag_families.get(tag)
-            fam_note = ""
-            if families:
-                joined = " + ".join(f"{ORANGE}{f}{RESET}" for f in families)
-                fam_note = f"  [{joined}]"
-            lines.append(f"{indent}  {mark} {PURPLE}{tag}{RESET}{missing}{fam_note}")
+            lines.append(f"{indent}  {mark} {PURPLE}{tag}{RESET}{missing}")
+            # The lineage below the tag rather than beside it, five to a row.
+            #
+            # A cumulative lineage is long by design -- a camera leaf holds
+            # nine families -- and on one line it set the width of the whole
+            # report, so every other row was padded out by the widest thing
+            # in the tree. Wrapping puts the cost where the length is: a
+            # narrow tag stays one line, a wide one takes two, and nothing
+            # else moves. A trailing "+" marks a row that continues, so the
+            # break is visibly a wrap and not a second list.
+            lines.extend(self._family_rows(families, f"{indent}      "))
 
             if not families:
                 for meth in sorted(info['methods']):
