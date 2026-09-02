@@ -226,6 +226,40 @@ class LifecycleMixin:
         for sub in localFolders:
             (target_dir / sub).mkdir(parents=True, exist_ok=True)
 
+        # A module owns its own scripts. Fragments that act on this module's
+        # types live here; the ETCS root's scripts/ is for compositions that
+        # combine fragments from more than one provider. The seed below is a
+        # working fragment rather than a placeholder, so the folder shows what
+        # belongs in it.
+        scripts_dir = target_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        seed = scripts_dir / f"{module_name.lower()}_example.etcs"
+        if not seed.exists():
+            seed.write_text(
+                "#!/usr/bin/env etcs\n"
+                "#IMPORT ACE_ROOT/modules\n"
+                "\n"
+                f"# A {module_name} fragment.\n"
+                "#\n"
+                "# REQUIRES, not spawns: a fragment takes what it acts on from its\n"
+                "# caller, so the same fragment serves any provider whose type\n"
+                "# satisfies the family. Naming a concrete type here would bind this\n"
+                "# file to one implementation of something the ontology already\n"
+                "# describes generically.\n"
+                "#\n"
+                "# The import is ACE_ROOT/modules, so a fragment from another provider\n"
+                "# is referenced by its owner:\n"
+                "#\n"
+                "#     run OtherProvider/scripts/their_fragment.etcs target=thing\n"
+                "#\n"
+                "# Siblings in this folder are referenced by bare name.\n"
+                "\n"
+                f"# requires thing [{module_name}]\n"
+                "\n"
+                f"# thing.SomeVerb()\n"
+            )
+            print(f"  [+] scripts/{seed.name}")
+
         (target_dir / f"{module_name}.h").write_text(
             f"#ifndef {module_name.upper()}_H__\n"
             f"#define {module_name.upper()}_H__\n\n"
