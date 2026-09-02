@@ -53,7 +53,7 @@ import json
 import re
 import subprocess
 
-from .ace_common import (CYAN, YELLOW, GREEN, RED, RESET, DIM)
+from .ace_common import (CYAN, YELLOW, GREEN, RED, RESET, DIM, ORANGE)
 
 
 SCHEMA_VERSION = 1
@@ -202,6 +202,24 @@ class ManifestMixin:
                 return GENERATED_MARKER in f.read(512)
         except OSError:
             return False
+
+    def makefile_state(self, path):
+        """What is sitting at that path, in the three states that matter.
+
+        `generated` and `missing` were the only two reported, so a Makefile
+        this tool did not write -- a module deliberately kept by hand, or one
+        left behind by an older layout -- printed as `generated` and looked
+        managed. It is not: nothing regenerates it, `manifest clean` steps
+        around it, and its flags drift from every other module's silently.
+
+        Same marker `_is_generated` deletes on, so the listing and the delete
+        can never disagree about which files this tool owns.
+        """
+        if not path.is_file():
+            return f"{YELLOW}missing{RESET}"
+        if self._is_generated(path):
+            return f"{GREEN}generated{RESET}"
+        return f"{ORANGE}custom{RESET}"
 
     def clean_makefile(self, module, quiet=False):
         """Delete one module's GENERATED Makefile. Returns True if removed."""
@@ -1468,9 +1486,15 @@ class ManifestMixin:
                 print(f"  {DIM}No manifests in {self._manifest_dir()}{RESET}")
                 return
             print(f"\n--- Manifests ({self._manifest_dir()}) ---\n")
+            # Collected as they are printed, and named again at the end: a
+            # custom Makefile is the one state here that asks for a decision,
+            # and the whole point is being able to find them without reading
+            # every line of the listing.
+            unmanaged = []
             for n in names:
                 mk = self._module_dir(n) / "Makefile"
-                state = f"{GREEN}generated{RESET}" if mk.exists() else f"{YELLOW}missing{RESET}"
+                state = self.makefile_state(mk)
+                if mk.is_file() and not self._is_generated(mk): unmanaged.append(n)
                 pins = self._pin_state(n)
                 print(f"  {CYAN}{n:<24}{RESET} Makefile: {state}{pins}")
             defaulted = self._defaulted_modules()
@@ -1479,17 +1503,24 @@ class ManifestMixin:
                       f"own to declare):{RESET}")
                 for n in defaulted:
                     mk = self._module_dir(n) / "Makefile"
-                    state = (f"{GREEN}generated{RESET}" if mk.exists()
-                             else f"{YELLOW}missing{RESET}")
+                    state = self.makefile_state(mk)
+                    if mk.is_file() and not self._is_generated(mk): unmanaged.append(n)
                     print(f"    {CYAN}{n:<22}{RESET} Makefile: {state}")
             if default is not None:
                 mk = self.ace_root / "loaders" / "Makefile"
-                state = f"{GREEN}generated{RESET}" if mk.exists() else f"{YELLOW}missing{RESET}"
+                state = self.makefile_state(mk)
+                if mk.is_file() and not self._is_generated(mk): unmanaged.append("loaders")
                 print(f"\n  {CYAN}{'loaders':<24}{RESET} Makefile: {state}")
                 for n in sorted(overrides):
                     inh = overrides[n].get("inherits_modules", [])
                     note = f" {DIM}inherits {', '.join(inh)}{RESET}" if inh else ""
                     print(f"    {DIM}override:{RESET} {n}{note}")
+            if unmanaged:
+                print(f"\n  {ORANGE}custom{RESET}: {', '.join(unmanaged)}")
+                print(f"  {DIM}Written by hand, not by this tool -- no build "
+                      f"regenerates them and `manifest clean` leaves them "
+                      f"alone. Their flags drift from every other module's "
+                      f"until someone looks.{RESET}")
             print()
             return
 
