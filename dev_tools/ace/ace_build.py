@@ -99,13 +99,20 @@ class BuildMixin:
             self.ace_root / name for name in self._GLOBAL_FINGERPRINT_FILES)
 
     def _module_source_files(self, mod):
-        """Every source and header the module owns, vendored trees excluded.
+        """Every source and header the module owns, FETCHED trees excluded.
 
-        Vendored dependencies are pinned by commit and fetched into the module
-        directory (the .ace_fetched marker beside them), so their contents are
-        a function of the pin, not of anything a developer edits -- walking
-        them would hash tens of thousands of files to learn nothing. The pin
-        itself lives in the Makefile, which IS hashed."""
+        A dependency pinned by commit and fetched into the module directory is
+        a function of its pin, not of anything a developer edits -- walking it
+        would hash tens of thousands of files to learn nothing. The pin itself
+        lives in the Makefile, which IS hashed. The test below is for git
+        metadata, so it catches exactly those.
+
+        A tree vendored by COMMITTING IT (source.type "vendored" in the
+        manifest -- LayoutProvider/clay) has no .git and is therefore hashed
+        like our own code. That is the right answer rather than an oversight:
+        those bytes are in our history, an upgrade is a commit here, and a
+        rebuild is exactly what should follow one. It costs a single SHA-256
+        over a few hundred KB."""
         root = self.ace_root / "modules" / mod
         if not root.is_dir():
             return []

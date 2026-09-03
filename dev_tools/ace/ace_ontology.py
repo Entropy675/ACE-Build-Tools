@@ -48,7 +48,13 @@ class OntologyMixin:
 
     # Vendored trees carry their own `class X : public YBase<...>` shapes that
     # are not ETCS ontology. Skipped by path rather than by guessing.
-    _ONT_SKIP_DIRS = ("glfw", "mbedtls", "sqlite", "picohttpparser",
+    #
+    # `clay` is the first entry here that is NOT a git submodule -- it is
+    # committed into the tree whole (LayoutProvider/clay). That difference is
+    # invisible to this scan, which is the argument for naming directories
+    # rather than testing for .git: a vendored tree is vendored because of
+    # where it came from, not because of how it got here.
+    _ONT_SKIP_DIRS = ("glfw", "mbedtls", "sqlite", "picohttpparser", "clay",
                       "build", "tf-psa-crypto", ".git")
 
     def _ontology_dir(self):
