@@ -401,16 +401,21 @@ class AbiMixin:
                 lines.append(f"{indent}      {meth:<20} "
                              f"{self._dispatch_token(info['methods'][meth])}")
 
-            for family, rows in report['groups']:
+            # Indented by lineage depth: a family sitting under another one
+            # refines it, and the methods listed are only what it adds. The
+            # accumulated obligation is the column above, read upward.
+            for family, depth, rows in report['groups']:
+                step = "  " * depth
                 exported_n = sum(1 for _, ok in rows if ok)
-                lines.append(f"{indent}    {ORANGE}{family} "
+                lines.append(f"{indent}    {step}{ORANGE}{family} "
                              f"({exported_n}/{len(rows)}){RESET}")
                 for meth, ok in rows:
                     if ok:
-                        lines.append(f"{indent}      {GREEN}●{RESET} {meth:<18} "
+                        lines.append(f"{indent}      {step}{GREEN}●{RESET} "
+                                     f"{meth:<18} "
                                      f"{self._dispatch_token(info['methods'][meth])}")
                     else:
-                        lines.append(f"{indent}      {DIM}○ {meth}{RESET}")
+                        lines.append(f"{indent}      {step}{DIM}○ {meth}{RESET}")
 
             for meth, fams in report['collisions']:
                 joined = f"{RED} + ".join(f"{ORANGE}{f}" for f in fams)

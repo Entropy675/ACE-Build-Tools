@@ -26,7 +26,7 @@ script call it by name.
 from pathlib import Path
 import re
 
-from .ace_common import (YELLOW, RED, ORANGE, RESET, DIM)
+from .ace_common import (YELLOW, RED, GREEN, ORANGE, RESET, DIM)
 
 
 class OntologyMixin:
@@ -105,7 +105,6 @@ class OntologyMixin:
             src = ifaces.get(fam)
             if not src:
                 continue
-            info['parent'] = src['parents'][0] if src['parents'] else None
             owed, seen, cur = [], set(), fam
             while cur and cur in ifaces and cur not in seen:
                 seen.add(cur)
@@ -114,43 +113,209 @@ class OntologyMixin:
                 cur = nxt[0] if nxt else None
             info['owes'] = sorted(set(owed))
 
+        # ── REFINEMENT IS DECLARED IN EITHER OF TWO PLACES ────────────────
+        #
+        # `class LocalDatabase_ : public Database_` states it on the interface.
+        # `DrawableBase : public SurfaceBase<Derived>` states it on the Base.
+        # Both mean "X refines Y", and reading only the first is what made the
+        # entire Drawable lineage -- Surface, Drawable, Drawable2D, Drawable3D,
+        # Camera -- read as five unrelated families sitting flat beside each
+        # other.
+        #
+        # The second spelling is not a shortcut, it is the ONLY one available
+        # to that lineage. ontology/Drawable.h has the reasoning: the supertype
+        # macro inherits its interface non-virtually, so an interface that also
+        # inherited its parent interface would reach it twice and every call
+        # through it would be ambiguous. The rule the ontology settled on is
+        #
+        #     an interface declares only its own INCREMENT,
+        #     a Base carries the LINEAGE
+        #
+        # and a model that reads only interfaces is reading the half of that
+        # sentence which the Drawable family deliberately leaves empty.
+        #
+        # It is also the half that carries the EXCLUSIVITY. Drawable2D and
+        # Drawable3D are siblings, so a leaf may hold one or the other and
+        # never both -- a rule C++ already enforces (two non-virtual Drawable
+        # subobjects, every call ambiguous) and this tool could not previously
+        # even state, let alone check.
+        for fam, info in fams.items():
+            parents = []
+            src = ifaces.get(fam)
+            if src:
+                parents.extend(p for p in src['parents'] if p != fam)
+            for composed in self._base_composes(fam):
+                if composed != fam and composed not in parents:
+                    parents.append(composed)
+            info['parents'] = parents
+            # Kept singular for callers that want the primary line of descent.
+            info['parent'] = parents[0] if parents else None
+
         self._ont_iface_cache = ifaces
         self._ont_cache = fams
         return fams
 
-    def _family_chain(self, family):
-        """[family, parent, ...] up to the Entity root.
+    def _base_composes(self, family):
+        """The families <family>Base.h composes -- its refinement parents.
 
-        Walks the INTERFACE lineage, not the set of families that happen to
-        have a Base: `Database_` has no DatabaseBase.h, but it is still what
-        makes LocalDatabase and RemoteDatabase siblings rather than strangers.
+        Cached because the forest is walked repeatedly and this is a file read
+        per family per walk otherwise.
+        """
+        cache = getattr(self, "_ont_composes_cache", None)
+        if cache is None:
+            cache = self._ont_composes_cache = {}
+        if family in cache:
+            return cache[family]
+        header = self.ace_root / "ontology" / f"{family}Base.h"
+        try:
+            text = header.read_text(errors="ignore")
+        except OSError:
+            out = []               # no Base of its own composes nothing
+        else:
+            out = []
+            for c in self._ONT_BASEREF.findall(text):
+                if c not in out:
+                    out.append(c)
+        cache[family] = out
+        return out
+
+    def _family_parents(self, family):
+        fams = self._parse_ontology()
+        info = fams.get(family)
+        if info is not None:
+            return info.get('parents', [])
+        ifaces = getattr(self, "_ont_iface_cache", {})
+        src = ifaces.get(family)
+        return list(src['parents']) if src else []
+
+    def _family_children(self):
+        """{parent: [child, ...]} over every family, primary parent first.
+
+        A family with two parents (Surface refines Resizable AND Orderable --
+        every surface has a size and a stacking position) is a child of both.
+        The renderer expands it under the first and cross-references it under
+        the rest, so the DAG is stated without being printed twice.
+        """
+        fams = self._parse_ontology()
+        kids = {}
+        for fam in sorted(fams):
+            for parent in self._family_parents(fam):
+                kids.setdefault(parent, []).append(fam)
+        return kids
+
+    def _family_ancestors(self, family):
+        """Every family above this one, through ALL parents. The set that
+        makes `related` and `owes` correct; _family_chain is the single line
+        of descent used for display."""
+        out, queue, seen = [], list(self._family_parents(family)), {family}
+        while queue:
+            cur = queue.pop(0)
+            if cur in seen:
+                continue
+            seen.add(cur)
+            out.append(cur)
+            queue.extend(self._family_parents(cur))
+        return out
+
+    def _family_increment(self, family):
+        """What this family adds, not what it accumulates.
+
+        The pairing with a tree view: the shape shows the inheritance, so each
+        node states only its own contribution and a reader gets the total by
+        reading upward instead of by reading the same six method names at
+        every depth.
+        """
+        fams = self._parse_ontology()
+        ifaces = getattr(self, "_ont_iface_cache", {})
+        own = set()
+        if family in fams:
+            own |= set(fams[family]['dispatch'])
+        if family in ifaces:
+            own |= set(ifaces[family]['virtuals'])
+        for anc in self._family_ancestors(family):
+            if anc in fams:
+                own -= set(fams[anc]['dispatch'])
+            if anc in ifaces:
+                own -= set(ifaces[anc]['virtuals'])
+        return sorted(own)
+
+    def _family_chain(self, family):
+        """[family, primary parent, ...] up to the Entity root -- ONE line of
+        descent, for display. `_family_ancestors` is the full set.
+
+        Walks the lineage wherever it is declared: an interface parent
+        (`Database_` has no DatabaseBase.h and is still what makes
+        LocalDatabase and RemoteDatabase siblings rather than strangers) or a
+        Base composition (the whole Drawable lineage).
         """
         self._parse_ontology()
-        ifaces = getattr(self, "_ont_iface_cache", {})
         chain, seen, cur = [], set(), family
         while cur and cur not in seen:
             seen.add(cur)
             chain.append(cur)
-            src = ifaces.get(cur)
-            cur = src['parents'][0] if src and src['parents'] else None
+            parents = self._family_parents(cur)
+            cur = parents[0] if parents else None
         return chain
 
     def _related_families(self, a, b):
         """True when two families share an ancestor -- siblings or a lineage.
         Their shared method names are inherited obligation (§2), not the
         incidental collision (§4) that only arises between unrelated axes."""
-        ca, cb = set(self._family_chain(a)), set(self._family_chain(b))
+        ca = set(self._family_ancestors(a)) | {a}
+        cb = set(self._family_ancestors(b)) | {b}
         return bool(ca & cb)
 
     def _family_surface(self, family):
         """Every method this family demands, its whole lineage included."""
         fams = self._parse_ontology()
         out = set()
-        for link in self._family_chain(family):
+        for link in [family] + self._family_ancestors(family):
             if link in fams:
                 out |= set(fams[link]['dispatch'])
                 out |= set(fams[link]['owes'])
         return sorted(out)
+
+    def _exclusive_sets(self):
+        """[(parent, [sibling, ...])] -- the branch points, §2's exclusivity.
+
+        Two families under one parent are two specializations of the same
+        constraint, so a leaf holds at most one. Only branch points with more
+        than one child are exclusive of anything; a lone child constrains
+        nobody.
+        """
+        out = []
+        for parent, kids in sorted(self._family_children().items()):
+            if len(kids) > 1:
+                out.append((parent, sorted(kids)))
+        return out
+
+    def _exclusivity_violations(self):
+        """Leaves that claim two siblings. [(module, tag, parent, [fams])]
+
+        The check the model could not previously express. C++ already stops the
+        Drawable case at compile time -- two non-virtual Drawable subobjects,
+        every call through them ambiguous -- but that enforcement is a property
+        of how those particular Bases happen to be written, not of the rule. A
+        branch point whose Bases compose virtually would be silently claimable
+        from both sides, and nothing would say so.
+        """
+        exclusive = self._exclusive_sets()
+        if not exclusive:
+            return []
+        native, external = self._registered_modules()
+        out = []
+        for path in list(native) + list(external):
+            try:
+                leaves = self._parse_module_leaves(path.name)
+            except Exception:
+                continue           # the audit is additive; never fatal
+            for tag, fams in sorted(leaves.items()):
+                held = set(fams)
+                for parent, kids in exclusive:
+                    both = sorted(held & set(kids))
+                    if len(both) > 1:
+                        out.append((path.name, tag, parent, both))
+        return out
 
     def _unproven_families(self):
         """Families whose Base does not cover what its interface lineage owes --
@@ -159,7 +324,7 @@ class OntologyMixin:
         out = {}
         for fam, info in fams.items():
             proven = set()
-            for link in self._family_chain(fam):
+            for link in [fam] + self._family_ancestors(fam):
                 if link in fams:
                     proven |= set(fams[link]['dispatch'])
             missing = sorted(set(info['owes']) - proven)
@@ -237,8 +402,16 @@ class OntologyMixin:
         """Correspondence between what a type's families demand and what it
         actually exports.
 
-        Returns {'own': [...], 'groups': [(family, [(method, exported)])],
+        Returns {'own': [...], 'groups': [(family, depth, [(method, exported)])],
                  'collisions': [(method, [family, family])]}.
+
+        GROUPS ARE ORDERED AND DEPTHED BY LINEAGE, and each one carries only
+        what it ADDS to the families already listed above it. A camera leaf
+        holds nine families across a five-deep lineage; listing each one's full
+        accumulated surface printed Blit, Clear, DrawRect and GetSize five
+        times each and buried the two methods that were actually the camera's.
+        The indent is the lineage, so the accumulation is read by looking up
+        the column rather than by repeating it.
 
         `own` is every work function belonging to no constraint -- the type's
         own vocabulary, and the most specific thing about it.
@@ -249,12 +422,13 @@ class OntologyMixin:
         (it may be exported under another name, or driven from C++ through an
         @rid argument).
         """
-        surfaces = {f: self._family_surface(f) for f in tag_families}
+        held = list(tag_families)
+        surfaces = {f: self._family_surface(f) for f in held}
 
         owner = {}
         collisions = {}
-        for fam, methods in surfaces.items():
-            for meth in methods:
+        for fam in sorted(surfaces):
+            for meth in surfaces[fam]:
                 prior = owner.get(meth)
                 if prior and prior != fam and not self._related_families(prior, fam):
                     collisions.setdefault(meth, {prior}).add(fam)
@@ -263,11 +437,46 @@ class OntologyMixin:
         constrained = set(owner)
         exported = set(work_functions)
 
+        # Order the families the way the lineage runs: a root the leaf holds,
+        # then whatever it holds beneath it, depth-first. A family whose parent
+        # the leaf does NOT hold is itself a root here -- the listing describes
+        # this leaf's obligations, not the whole ontology.
+        held_set = set(held)
+        kids = self._family_children()
+        roots = sorted(f for f in held
+                       if not (set(self._family_parents(f)) & held_set))
+
+        ordered, seen = [], set()
+
+        def walk(fam, depth):
+            if fam in seen:
+                return
+            seen.add(fam)
+            ordered.append((fam, depth))
+            for kid in sorted(kids.get(fam, [])):
+                if kid in held_set:
+                    # Only under its primary held parent, so a two-parent
+                    # family is not listed twice.
+                    primary = [p for p in self._family_parents(kid)
+                               if p in held_set]
+                    if primary and primary[0] != fam:
+                        continue
+                    walk(kid, depth + 1)
+
+        for root in roots:
+            walk(root, 0)
+        for fam in sorted(held):        # anything a cycle or oddity missed
+            walk(fam, 0)
+
         groups = []
-        for fam in sorted(surfaces):
-            rows = [(m, m in exported) for m in surfaces[fam]]
+        for fam, depth in ordered:
+            covered = set()
+            for anc in self._family_ancestors(fam):
+                if anc in held_set:
+                    covered |= set(surfaces.get(anc, ()))
+            rows = [(m, m in exported) for m in surfaces[fam] if m not in covered]
             if rows:
-                groups.append((fam, rows))
+                groups.append((fam, depth, rows))
 
         return {
             'own': sorted(exported - constrained),
@@ -280,19 +489,23 @@ class OntologyMixin:
     def _family_block(self, family):
         """One family as a column block: name, lineage, then its methods.
 
+        Used for the STANDALONE grid -- families that neither refine anything
+        nor are refined, where there is no shape to draw and the whole surface
+        is the increment.
+
         A method is RED when the family's interface lineage owes it but no
         Base in that lineage declares a dispatch for it -- ETCS_DISPATCH_METHOD
         is what expands to the pure virtual, so an owed method with no dispatch
         obliges the leaf to nothing.
         """
         fams = self._parse_ontology()
-        chain = self._family_chain(family)
         proven = set()
-        for link in chain:
+        for link in [family] + self._family_ancestors(family):
             if link in fams:
                 proven |= set(fams[link]['dispatch'])
 
         lines = [f"  {ORANGE}{family}{RESET}"]
+        chain = self._family_chain(family)
         if len(chain) > 1:
             lines.append(f"    {DIM}{' <- '.join(chain[1:])} <- Entity{RESET}")
 
@@ -307,25 +520,158 @@ class OntologyMixin:
                 lines.append(f"    {RED}{meth}  (no dispatch){RESET}")
         return lines
 
+    # ------------------------------------------------------------- the forest
+
+    def _lineage_lines(self, family, kids, expanded, prefix="", connector="",
+                       via=None):
+        """One family and its descendants, as tree rows.
+
+        EACH NODE STATES ITS INCREMENT, not its accumulated surface. The shape
+        already carries the accumulation -- that is the whole reason to draw it
+        -- and repeating Blit/Clear/DrawRect at all five depths of the Drawable
+        lineage would make the tree less informative than the flat list it
+        replaces.
+
+        A family reachable by two paths (Surface refines Resizable AND
+        Orderable) is expanded the first time it is reached and shown as a
+        cross-reference afterwards. Printing its subtree twice would suggest
+        two families rather than one with two obligations.
+        """
+        fams = self._parse_ontology()
+        proven = set()
+        for link in [family] + self._family_ancestors(family):
+            if link in fams:
+                proven |= set(fams[link]['dispatch'])
+        # An interface with no Base of its own obliges nobody directly -- each
+        # child's Base proves the inherited set, and whether one of them fails
+        # to is a fact about that child. Flagging it here would red-flag four
+        # methods LocalDatabase demonstrably dispatches, on the strength of
+        # RemoteDatabase not doing so.
+        interface_only = family not in fams
+
+        parents = self._family_parents(family)
+
+        # Expanded under its FIRST parent, cross-referenced under the rest, so
+        # a two-parent family (Surface refines Resizable AND Orderable) has one
+        # home and the forest stays a forest.
+        elsewhere = (via is not None and parents and parents[0] != via)
+        if elsewhere or family in expanded:
+            where = parents[0] if parents else None
+            note = f"  {DIM}(shown under {where}){RESET}" if where else ""
+            return [f"  {prefix}{connector}{ORANGE}{family}{RESET}{note}"]
+        expanded.add(family)
+
+        notes = []
+        if len(parents) > 1:
+            notes.append("also refines " + ", ".join(parents[1:]))
+        siblings = [k for p in parents for k in kids.get(p, []) if k != family]
+        if siblings:
+            notes.append("exclusive with " + ", ".join(sorted(set(siblings))))
+        if family not in fams:
+            notes.append("interface only -- no Base of its own")
+
+        note = f"   {DIM}{' -- '.join(notes)}{RESET}" if notes else ""
+        lines = [f"  {prefix}{connector}{ORANGE}{family}{RESET}{note}"]
+
+        child_prefix = prefix + ("   " if not connector else
+                                 ("   " if connector.startswith("\u2514") else "\u2502  "))
+        own = self._family_increment(family)
+        my_kids = kids.get(family, [])
+        if own:
+            rail = "\u2502  " if my_kids else "   "
+            for meth in own:
+                token = (meth if (interface_only or meth in proven)
+                         else f"{RED}{meth}  (no dispatch){RESET}")
+                lines.append(f"  {child_prefix}{rail}{token}")
+        elif not my_kids:
+            lines.append(f"  {child_prefix}   {DIM}(no methods of its own){RESET}")
+
+        for i, kid in enumerate(my_kids):
+            last = i == len(my_kids) - 1
+            # Expanded under its FIRST parent, cross-referenced under the rest,
+            # so a two-parent family has one home and the tree stays a tree.
+            lines.extend(self._lineage_lines(
+                kid, kids, expanded, child_prefix,
+                "\u2514\u2500 " if last else "\u251c\u2500 ", via=family))
+        return lines
+
+    # ------------------------------------------------------------------ command
+
     def ontology(self, args):
         """`ace ontology` -- the constraint surface itself, without a module.
 
-        Families are composited into terminal-width columns, one block each,
-        the same way `ace abi` lays out tag-types: a name at the top and what
-        it demands underneath. Cross-family faults do not belong in a
-        per-family block, so they follow underneath as their own sections.
+        Two sections, because there are two shapes. Families that refine or are
+        refined are drawn as a FOREST: refinement is cumulative going down and
+        exclusive going across, and neither of those is legible in a flat list.
+        Everything else -- an independent axis a leaf folds in on its own terms
+        -- stays a column grid, which is the right rendering for a set with no
+        structure to show.
+
+        Cross-family faults do not belong in either, so they follow underneath
+        as their own sections.
         """
         fams = self._parse_ontology()
         if not fams:
             print(f"  {YELLOW}No ontology/ directory under {self.ace_root}.{RESET}")
             return
 
-        print(f"\n--- ETCS Ontology ({len(fams)} famil"
-              f"{'y' if len(fams) == 1 else 'ies'}) ---\n")
+        kids = self._family_children()
 
-        blocks = [self._family_block(fam) for fam in sorted(fams)]
-        for line in self._composite_columns(blocks):
-            print(line)
+        # A branch point need not be a family in its own right: Database_ has
+        # no DatabaseBase.h and is still what makes LocalDatabase and
+        # RemoteDatabase siblings. It is a node in the forest either way --
+        # dropping it would leave its two children as orphans belonging to a
+        # lineage the listing never shows.
+        in_tree = set()
+        for parent, children in kids.items():
+            in_tree.add(parent)
+            in_tree.update(children)
+
+        roots = sorted(f for f in in_tree if not self._family_parents(f))
+        standalone = sorted(set(fams) - in_tree)
+
+        print(f"\n--- ETCS Ontology ({len(fams)} famil"
+              f"{'y' if len(fams) == 1 else 'ies'}: "
+              f"{len(in_tree)} in {len(roots)} lineage"
+              f"{'' if len(roots) == 1 else 's'}, "
+              f"{len(standalone)} standalone) ---\n")
+
+        if roots:
+            print(f"  {DIM}Refinement is cumulative downward and exclusive "
+                  f"across siblings. Every root sits directly under Entity; "
+                  f"each node lists only what it ADDS.{RESET}\n")
+            expanded = set()
+            for root in roots:
+                for line in self._lineage_lines(root, kids, expanded):
+                    print(line)
+                print()
+
+        if standalone:
+            print(f"  {DIM}Standalone -- independent axes, folded in on their "
+                  f"own terms:{RESET}\n")
+            blocks = [self._family_block(fam) for fam in standalone]
+            for line in self._composite_columns(blocks):
+                print(line)
+
+        exclusive = self._exclusive_sets()
+        if exclusive:
+            print(f"  {DIM}Exclusive sets -- a leaf holds AT MOST ONE from "
+                  f"each:{RESET}")
+            for parent, siblings in exclusive:
+                joined = " | ".join(f"{ORANGE}{s}{RESET}" for s in siblings)
+                print(f"    under {ORANGE}{parent}{RESET}:  {joined}")
+            print()
+
+        violations = self._exclusivity_violations()
+        if violations:
+            print(f"  {RED}Leaves claiming two siblings ({len(violations)}):"
+                  f"{RESET}")
+            for mod, tag, parent, both in violations:
+                print(f"    {mod}::{tag} holds {' + '.join(both)} "
+                      f"(both under {parent})")
+            print()
+        elif exclusive:
+            print(f"  {GREEN}No leaf in any module claims two siblings.{RESET}\n")
 
         unproven = self._unproven_families()
         if unproven:
