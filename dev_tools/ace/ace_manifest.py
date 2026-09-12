@@ -837,7 +837,18 @@ class ManifestMixin:
             if blk.get("compiler"):
                 w(f"    CXX := {blk['compiler']}")
             if blk.get("cxxflags"):
-                w(f"    CXXFLAGS += {' '.join(blk['cxxflags'])}")
+                # Web: -sSIDE_MODULE belongs on the link line (emitted below).
+                # A stale manifest that still lists it under cxxflags would
+                # pass it to the compile step harmlessly on some em++ versions
+                # and confuse others -- drop it here; USE_GLFW-style -s flags
+                # stay on CXXFLAGS so the port headers resolve at compile.
+                cxf = list(blk["cxxflags"])
+                if plat == "Web":
+                    cxf = [f for f in cxf
+                           if f.replace(" ", "") not in
+                           ("-sSIDE_MODULE", "-sSIDE_MODULE=1", "-sSIDE_MODULE=2")]
+                if cxf:
+                    w(f"    CXXFLAGS += {' '.join(cxf)}")
             if blk.get("defines"):
                 w(f"    CXXFLAGS += {' '.join('-D' + d for d in blk['defines'])}")
 

@@ -205,41 +205,78 @@
         }
       ]
     },
-    "vendor": [
-      {
-        "name": "glfw",
-        "source": {
-          "type": "git",
-          "url": "https://github.com/glfw/glfw.git",
-          "ref": "92dcf4ce74f2e2554a98fea09be7c705c17daa5a",
-          "shallow": true
-        },
-        "build": {
-          "system": "cmake",
-          "build_dir": "build",
-          "defines": [
-            "BUILD_SHARED_LIBS=OFF",
-            "GLFW_BUILD_EXAMPLES=OFF",
-            "GLFW_BUILD_TESTS=OFF",
-            "GLFW_BUILD_DOCS=OFF"
-          ],
-          "parallel": true
-        },
-        "arch_sensitive": true,
-        "hash_scope": false,
-        "provides": {
-          "include": [
-            "include"
-          ],
-          "link": [
-            {
-              "path": "build/src/libglfw3.a",
-              "mode": "whole_archive"
-            }
-          ]
+    "vendor": {
+      "Linux": [
+        {
+          "name": "glfw",
+          "source": {
+            "type": "git",
+            "url": "https://github.com/glfw/glfw.git",
+            "ref": "92dcf4ce74f2e2554a98fea09be7c705c17daa5a",
+            "shallow": true
+          },
+          "build": {
+            "system": "cmake",
+            "build_dir": "build",
+            "defines": [
+              "BUILD_SHARED_LIBS=OFF",
+              "GLFW_BUILD_EXAMPLES=OFF",
+              "GLFW_BUILD_TESTS=OFF",
+              "GLFW_BUILD_DOCS=OFF"
+            ],
+            "parallel": true
+          },
+          "arch_sensitive": true,
+          "hash_scope": false,
+          "provides": {
+            "include": [
+              "include"
+            ],
+            "link": [
+              {
+                "path": "build/src/libglfw3.a",
+                "mode": "whole_archive"
+              }
+            ]
+          }
         }
-      }
-    ]
+      ],
+      "Win": [
+        {
+          "name": "glfw",
+          "source": {
+            "type": "git",
+            "url": "https://github.com/glfw/glfw.git",
+            "ref": "92dcf4ce74f2e2554a98fea09be7c705c17daa5a",
+            "shallow": true
+          },
+          "build": {
+            "system": "cmake",
+            "build_dir": "build",
+            "defines": [
+              "BUILD_SHARED_LIBS=OFF",
+              "GLFW_BUILD_EXAMPLES=OFF",
+              "GLFW_BUILD_TESTS=OFF",
+              "GLFW_BUILD_DOCS=OFF"
+            ],
+            "parallel": true
+          },
+          "arch_sensitive": true,
+          "hash_scope": false,
+          "provides": {
+            "include": [
+              "include"
+            ],
+            "link": [
+              {
+                "path": "build/src/libglfw3.a",
+                "mode": "whole_archive"
+              }
+            ]
+          }
+        }
+      ]
+    }
   },
   "build": {
     "Linux": {
@@ -270,8 +307,10 @@
     "Web": {
       "compiler": "em++",
       "cxxflags": [
-        "-s SIDE_MODULE=1",
-        "-s USE_GLFW=3"
+        "-sUSE_GLFW=3"
+      ],
+      "ldflags": [
+        "-sUSE_GLFW=3"
       ]
     }
   },
