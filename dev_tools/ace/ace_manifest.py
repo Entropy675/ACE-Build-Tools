@@ -750,15 +750,18 @@ class ManifestMixin:
                     inline_srcs.append(f"$({v}_SRCS)")
                 w("")
 
+            dep_link = []
             for art in prov.get("link", []):
                 path = f"$({v}_DIR)/{art['path']}"
                 if art.get("mode") == "whole_archive":
-                    link_val = f"-Wl,--whole-archive {path} -Wl,--no-whole-archive"
+                    dep_link.append(f"-Wl,--whole-archive {path} -Wl,--no-whole-archive")
                 else:
-                    link_val = path
-                # Variable, not a baked path: platform blocks void {v}_LINK for
-                # profiles that do not carry this dep (e.g. Web + USE_GLFW port).
-                w(f"{v}_LINK := {link_val}")
+                    dep_link.append(path)
+            # One variable per dependency, joined: assigning inside the loop
+            # (last wins) while appending per artifact linked the LAST entry
+            # once per artifact and dropped the rest.
+            w(f"{v}_LINK := {' '.join(dep_link)}")
+            if dep_link:
                 link_items.append(f"$({v}_LINK)")
 
         # ---- flags --------------------------------------------------------
@@ -838,6 +841,10 @@ class ManifestMixin:
                 # Vendored C compiles through $(CC); a native gcc object
                 # cannot link into a wasm side module.
                 w(f"    CC := {blk.get('cc', 'emcc')}")
+                # em++ is the Web default, like emcc above: manifests name a
+                # compiler only when it is NOT em++.
+                if not blk.get("compiler"):
+                    w("    CXX := em++")
             if blk.get("compiler"):
                 w(f"    CXX := {blk['compiler']}")
             if blk.get("cxxflags"):
@@ -879,6 +886,16 @@ class ManifestMixin:
         w("    $(error Unsupported platform: $(UNAME_S))")
         w("endif")
         w("")
+        if "Web" not in platforms:
+            # Without a Web branch, EMSCRIPTEN=1 falls through to the Linux
+            # branch (uname reports Linux under emsdk) and builds a native
+            # .so wearing a _web stamp. Refuse instead.
+            w("ifeq (,$(filter clean,$(MAKECMDGOALS)))")
+            w("ifdef EMSCRIPTEN")
+            w(f"    $(error {name} declares no Web platform -- add \"Web\" to module.platforms in its manifest)")
+            w("endif")
+            w("endif")
+            w("")
         if layout == "auto":
             w("# Implementation layout: auto.")
             w("#")
