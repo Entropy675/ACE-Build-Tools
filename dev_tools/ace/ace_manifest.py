@@ -136,6 +136,63 @@ class ManifestError(Exception):
     """Raised for a manifest that cannot be trusted to describe a build."""
 
 
+
+def _vendor_profiles(m, module_name):
+    """requires.vendor as {profile: [dep, ...]}.
+
+    Profile keys mirror the source tree: the module's own name (the
+    general-headers folder, modules/<Mod>/<Mod>/) is the universal
+    profile, carried on every platform the module builds; a platform
+    directory name (Linux/Win/Web/OS) carries only that platform. A plain
+    list is shorthand for the universal profile.
+    """
+    if module_name in PLATFORM_DIRS:
+        raise ManifestError(
+            f"module name {module_name!r} collides with a platform directory "
+            f"name -- its universal vendor profile key would be ambiguous")
+    raw = m.get("requires", {}).get("vendor", [])
+    if isinstance(raw, list):
+        return {module_name: raw}
+    if not isinstance(raw, dict):
+        raise ManifestError(
+            "requires.vendor must be a list or a profile-keyed object "
+            f'{{"{module_name}": [...], "Linux": [...], ...}}')
+    out = {}
+    for key, deps in raw.items():
+        if key != module_name and key not in PLATFORM_DIRS:
+            raise ManifestError(
+                f"vendor profile {key!r} is neither this module's name "
+                f"({module_name!r}, the universal profile) nor a platform "
+                f"directory ({', '.join(PLATFORM_DIRS)})")
+        if not isinstance(deps, list):
+            raise ManifestError(f"vendor profile {key!r} must be a list")
+        out[key] = deps
+    return out
+
+
+def _vendor_union(profiles):
+    """Every profile's dependencies, deduplicated by name, in order.
+
+    A name repeated across profiles must repeat identically -- profiles
+    that disagree about what a dependency IS is a manifest bug, not a
+    merge to arbitrate.
+    """
+    seen, order = {}, []
+    for deps in profiles.values():
+        for dep in deps:
+            name = dep.get("name", "<unnamed>")
+            if name in seen:
+                if json.dumps(seen[name], sort_keys=True) != json.dumps(dep, sort_keys=True):
+                    raise ManifestError(
+                        f"dependency {name!r} appears in multiple vendor profiles "
+                        f"with different declarations -- declare it once per "
+                        f"carrying profile instead")
+                continue
+            seen[name] = dep
+            order.append(dep)
+    return order
+
+
 class ManifestMixin:
 
     # ------------------------------------------------------------------
@@ -373,7 +430,7 @@ class ManifestMixin:
         if path == self._default_manifest_path():
             return False
         changed = False
-        for dep in m.get("requires", {}).get("vendor", []):
+        for dep in _vendor_union(_vendor_profiles(m, module)):
             src = dep.get("source", {})
             if src.get("type") != "git" or src.get("ref") not in UNPINNED:
                 continue
@@ -417,7 +474,13 @@ class ManifestMixin:
             raise ManifestError(
                 f"{path.name} declares module.name {name!r} but is filed as {module!r}")
 
-        for dep in m.get("requires", {}).get("vendor", []):
+        profiles = _vendor_profiles(m, module)
+        module_platforms = m.get("module", {}).get("platforms", ["Linux"])
+        for p in profiles:
+            if p != module and p not in module_platforms:
+                print(f"  {YELLOW}[!]{RESET} {module}: vendor profile '{p}' is outside "
+                      f"this module's platforms {module_platforms} -- carried nowhere.")
+        for dep in _vendor_union(profiles):
             dname = dep.get("name", "<unnamed>")
             src = dep.get("source", {})
             stype = src.get("type")
@@ -476,7 +539,8 @@ class ManifestMixin:
         layout = mod.get("impl_layout", "per_platform")
         produces = m.get("produces", {})
         exports = produces.get("exports", "exports.map")
-        vendor = m.get("requires", {}).get("vendor", [])
+        profiles = _vendor_profiles(m, name)
+        vendor = _vendor_union(profiles)
         build = m.get("build", {})
         common = build.get("common", {})
 
@@ -582,24 +646,46 @@ class ManifestMixin:
         w("    DEBUGFLAGS := -g")
         w("endif")
         w("")
-        w("# Build stamp -- architecture, sanitizer, and ABI-define set.")
-        w("#")
-        w("# A REAL prerequisite of the final target, not order-only: switching")
-        w("# any of the three must force a relink, and make has no other way to")
-        w("# notice that CXXFLAGS changed. Mixing instrumented and uninstrumented")
-        w("# objects in one .so links cleanly and then misbehaves at runtime,")
-        w("# which is precisely what this stamp exists to make impossible. The")
-        w("# architecture half matters for the same reason it always did: a tree")
-        w("# carried to another machine would otherwise relink objects built for")
-        w("# the architecture it came from.")
-        w(f"BUILD_STAMP := .ace_build_$(ARCH)$(DBG_SUFFIX)$(SAN_SUFFIX){abi_tag}")
+        w("# Build stamp -- architecture, PLATFORM, sanitizer, ABI-define set.")
+        w("# Real prerequisite, not order-only: switching any of them must force")
+        w("# a relink. The platform tag exists because uname reports the HOST")
+        w("# under emscripten, so native and web artifacts of one module would")
+        w("# otherwise share a stamp and switching between them would relink")
+        w("# nothing.")
+        w("PLATFORM_TAG :=")
+        w("ifdef EMSCRIPTEN")
+        w("  PLATFORM_TAG := _web")
+        w("endif")
+        w(f"BUILD_STAMP := .ace_build_$(ARCH)$(PLATFORM_TAG)$(DBG_SUFFIX)$(SAN_SUFFIX){abi_tag}")
         w("")
 
         # ---- per-dependency variables ------------------------------------
+        # Markers, sources, objects and link items are emitted as VARIABLES
+        # and referenced deferred (at rule-expansion time), so a platform
+        # block can void them for dependencies that platform does not
+        # carry -- an empty variable in a prerequisite list is no
+        # prerequisite: nothing fetches, builds or links.
         fetch_markers, build_markers, obj_targets = [], [], []
-        inline_srcs, link_items, dep_includes = [], [], []
+        inline_srcs, link_items = [], []
         obj_rules, fetch_rules, build_rules = [], [], []
         clean_paths = []
+        dep_carriage = []  # (var, carried platforms, include flags)
+
+        # Param is dep_name, NOT name: the module's own name (the universal
+        # profile key) is captured from the enclosing scope, and a parameter
+        # called `name` would shadow it -- profiles.get(name) would then look
+        # up the DEPENDENCY's name as a profile key and silently find nothing.
+        def carried(dep_name):
+            """Platforms carrying this dependency: every module platform if
+            it sits in the module's own (universal) profile, plus each
+            platform profile naming it."""
+            plats = set()
+            if any(d.get("name") == dep_name for d in profiles.get(name, [])):
+                plats.update(platforms)
+            for p, deps in profiles.items():
+                if p != name and any(d.get("name") == dep_name for d in deps):
+                    plats.add(p)
+            return plats
 
         for dep in vendor:
             v = _var(dep["name"])
@@ -612,10 +698,15 @@ class ManifestMixin:
                 w(f"{v}_DIR := {dep['name']}")
             w("")
 
+            incs = [f"-I$({v}_DIR)/{inc}" if inc != "." else f"-I$({v}_DIR)"
+                    for inc in prov.get("include", [])]
+            dep_carriage.append((v, carried(dep["name"]), incs))
+
             # fetch
             if src["type"] == "git":
                 marker = f"$({v}_DIR)/.ace_fetched_{_sanitize(src['ref'])}"
-                fetch_markers.append(marker)
+                w(f"{v}_FETCHMK := {marker}")
+                fetch_markers.append(f"$({v}_FETCHMK)")
                 fetch_rules.append(self._emit_fetch_rule(v, dep, marker))
 
             # build
@@ -623,15 +714,13 @@ class ManifestMixin:
                 bd = dep["build"].get("build_dir", "build")
                 marker = (f"$({v}_DIR)/{bd}/.ace_built_$(ARCH)$(DEP_SAN_SUFFIX)"
                           + _abi_tag(dep.get("abi_defines", [])))
-                build_markers.append(marker)
+                w(f"{v}_BUILDMK := {marker}")
+                build_markers.append(f"$({v}_BUILDMK)")
                 build_rules.append(
                     self._emit_build_rule(
                         v, dep, marker,
-                        fetch_markers[-1] if src["type"] == "git" else None))
+                        f"$({v}_FETCHMK)" if src["type"] == "git" else None))
                 clean_paths.append(f"$({v}_DIR)/{bd}")
-
-            for inc in prov.get("include", []):
-                dep_includes.append(f"-I$({v}_DIR)/{inc}" if inc != "." else f"-I$({v}_DIR)")
 
             sources = prov.get("sources")
             if sources:
@@ -653,8 +742,8 @@ class ManifestMixin:
                     # run, and without this make reports it as a missing
                     # target rather than building it.
                     gate = [mk for mk in (
-                        fetch_markers[-1] if src["type"] == "git" else None,
-                        build_markers[-1] if dep.get("build") else None,
+                        f"$({v}_FETCHMK)" if src["type"] == "git" else None,
+                        f"$({v}_BUILDMK)" if dep.get("build") else None,
                     ) if mk]
                     obj_rules.append(self._emit_obj_rule(v, dep, sources, gate))
                 else:
@@ -672,7 +761,9 @@ class ManifestMixin:
         cxx = [f.format(std=std) for f in BASE_CXXFLAGS]
         cxx.append(r'-DETCS_MODULE_NAME=\"$(TARGET_BASE_NAME)\"')
         cxx += ["-I.", "-I../.."]
-        cxx += dep_includes
+        # Vendored -I flags are emitted inside the platform blocks, not here:
+        # CXXFLAGS is simply expanded at this point, so a global -I could
+        # never be retracted for a platform that does not carry the dep.
         # ABI defines, emitted here AND into every dependency's own build (see
         # _emit_build_rule). One field, two places, because that is what
         # correctness requires -- having to remember it in both by hand is how
@@ -713,6 +804,36 @@ class ManifestMixin:
             elif layout == "auto":
                 # Resolved after the chain -- see the priority block below.
                 w(f"    HOST_PLATFORM := {plat}")
+
+            # Void the variables of dependencies this platform does not carry
+            # (vendor profiles). Every downstream reference -- prerequisites,
+            # depfile gate, link tail -- expands deferred, so empty means
+            # absent: no fetch, no build, no link.
+            for v_, plats_, _incs in dep_carriage:
+                if plat not in plats_:
+                    w(f"    {v_}_SRCS :=")
+                    w(f"    {v_}_OBJS :=")
+                    w(f"    {v_}_LINK :=")
+                    w(f"    {v_}_FETCHMK :=")
+                    w(f"    {v_}_BUILDMK :=")
+            inc_here = [i for _v, plats_, incs in dep_carriage
+                        if plat in plats_ for i in incs]
+            if inc_here:
+                w(f"    CXXFLAGS += {' '.join(inc_here)}")
+
+            if plat == "Web":
+                # Web contract: facts about what a module under emscripten IS,
+                # not manifest preferences. -pthread and -fwasm-exceptions
+                # must match the loader's MAIN module exactly or the browser
+                # refuses instantiation; wasm exceptions because the JS
+                # default does not survive dylink (work functions throw).
+                # -fvisibility=default overrides BASE's hidden (last flag
+                # wins) so the @@ETCS_ABI trampolines reach the dylink export
+                # table.
+                w("    CXXFLAGS += -pthread -fwasm-exceptions -fvisibility=default")
+                # Vendored C compiles through $(CC); a native gcc object
+                # cannot link into a wasm side module.
+                w(f"    CC := {blk.get('cc', 'emcc')}")
             if blk.get("compiler"):
                 w(f"    CXX := {blk['compiler']}")
             if blk.get("cxxflags"):
@@ -720,10 +841,14 @@ class ManifestMixin:
             if blk.get("defines"):
                 w(f"    CXXFLAGS += {' '.join('-D' + d for d in blk['defines'])}")
 
-            ext = ".dll" if plat == "Win" else ".so"
+            ext = ".wasm" if plat == "Web" else (".dll" if plat == "Win" else ".so")
             w(f"    FINAL_TARGET := $(TARGET_BASE_NAME){ext}")
 
-            ld = ["-shared"]
+            # Under emscripten a module IS a side module: -sSIDE_MODULE
+            # replaces -shared; -pthread/-fwasm-exceptions ride the link
+            # line for the same must-match reasons as the compile line.
+            ld = (["-sSIDE_MODULE", "-pthread", "-fwasm-exceptions"]
+                  if plat == "Web" else ["-shared"])
             if plat != "Web":
                 ld += ["-fuse-ld=gold", "-Wl,--threads", "-Wl,--thread-count,$(NPROC)"]
             ld += blk.get("ldflags", [])
@@ -826,7 +951,7 @@ class ManifestMixin:
             w("all: $(FINAL_TARGET) install_assets")
         else:
             w("all: $(FINAL_TARGET)")
-        w('\t@echo "✓ Built $(FINAL_TARGET) for $(UNAME_S) ($(ARCH))"')
+        w('\t@echo "✓ Built $(FINAL_TARGET) for $(UNAME_S)$(PLATFORM_TAG) ($(ARCH))"')
         w("")
         w("install_assets:")
         if asset_rules:
@@ -910,6 +1035,7 @@ class ManifestMixin:
         # ---- clean --------------------------------------------------------
         w("clean:")
         w("\trm -f $(FINAL_TARGET) *.o $(HASH_HEADER) $(DEPFILE) .ace_build_*")
+        w("\trm -f $(TARGET_BASE_NAME).so $(TARGET_BASE_NAME).dll $(TARGET_BASE_NAME).wasm")
         w("\trm -rf .ace_obj")
         for p in clean_paths:
             w(f"\trm -rf {p}")
@@ -1165,12 +1291,13 @@ class ManifestMixin:
             # module's vendored headers without them sees a different struct
             # layout than the library it links against -- the same silent
             # corruption the module itself is protected from.
-            for dep in m.get("requires", {}).get("vendor", []):
+            vendor = _vendor_union(_vendor_profiles(m, name))
+            for dep in vendor:
                 for d in dep.get("abi_defines", []):
                     if d not in abi:
                         abi.append(d)
             base = f"../modules/{name}"
-            for dep in m.get("requires", {}).get("vendor", []):
+            for dep in vendor:
                 src = dep["source"]
                 ddir = f"{base}/{src['path']}" if src["type"] == "vendored" \
                     else f"{base}/{dep['name']}"
@@ -1441,9 +1568,10 @@ class ManifestMixin:
         stops a manifest from building, so they belong in the overview."""
         try:
             m = json.loads(self._manifest_path(module).read_text())
-        except (json.JSONDecodeError, OSError):
+            vendor = _vendor_union(_vendor_profiles(m, module))
+        except (json.JSONDecodeError, OSError, ManifestError):
             return f"  {RED}unreadable{RESET}"
-        loose = [d["name"] for d in m.get("requires", {}).get("vendor", [])
+        loose = [d["name"] for d in vendor
                  if d.get("source", {}).get("type") == "git"
                  and d["source"].get("ref") in UNPINNED]
         return f"  {YELLOW}unpinned: {', '.join(loose)}{RESET}" if loose else ""

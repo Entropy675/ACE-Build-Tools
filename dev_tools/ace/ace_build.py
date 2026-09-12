@@ -156,7 +156,7 @@ class BuildMixin:
         The .so has to EXIST as well as match: a fingerprint describes what a
         build would produce, and a fingerprint with no artifact beside it is a
         record of a build somebody deleted."""
-        so = self._bin_dir() / f"{mod}.{self._lib_ext()}"
+        so = self._bin_dir() / f"{mod}.{self._artifact_ext(extras)}"
         if not so.is_file():
             return "no built artifact in bin/"
 
@@ -193,7 +193,7 @@ class BuildMixin:
         So the caller passes make's own verdict, and a failure leaves no
         record at all: the module is rebuilt next time, which is the only safe
         default when the truth is unknown."""
-        so = self._bin_dir() / f"{mod}.{self._lib_ext()}"
+        so = self._bin_dir() / f"{mod}.{self._artifact_ext(extras)}"
         if not so.is_file():
             return
         try:
@@ -209,6 +209,15 @@ class BuildMixin:
         if system == "Darwin":
             return "dylib"
         return "so"
+
+    def _is_web_build(self, extras):
+        return any(a.startswith("EMSCRIPTEN=") for a in (extras or []))
+
+    def _artifact_ext(self, extras):
+        """The suffix this module's artifact wears under these flags: a web
+        build produces a .wasm side module, and every existence check and
+        fingerprint record must ask for the file these flags produce."""
+        return "wasm" if self._is_web_build(extras) else self._lib_ext()
 
     def _validate_module_name(self, name):
         """Clean module name: keep alphanumerics and underscores for cross-platform safety."""
@@ -234,9 +243,12 @@ class BuildMixin:
                 continue
 
             if '=' in arg:
-                key, _ = arg.split('=', 1)
-                if key not in ['ACE_ROOT', 'VERBOSE', 'DEBUG', 'ASAN', 'TSAN', 'LOG_TO_FILE']:
+                key, val = arg.split('=', 1)
+                if key not in ['ACE_ROOT', 'VERBOSE', 'DEBUG', 'ASAN', 'TSAN',
+                                   'LOG_TO_FILE', 'EMSCRIPTEN']:
                     raise ValueError(f"Disallowed variable: {key}")
+                if key == 'EMSCRIPTEN' and val != '1':
+                    raise ValueError("EMSCRIPTEN=1 is the only supported form")
                 validated.append(arg)
             else:
                 if arg not in self.allowed_make_targets | self.root_make_targets:
@@ -298,6 +310,12 @@ class BuildMixin:
         if not args:
             print("[-] Error: No make target specified.")
             return
+
+        if self._is_web_build(args):
+            if not shutil.which("em++"):
+                print(f"{RED}[-] EMSCRIPTEN build requested but em++ is not on PATH.{RESET}")
+                print(f"{DIM}    source <emsdk-root>/emsdk_env.sh first{RESET}")
+                return
 
         # Once per (distro, arch), then never again -- a marker read, not a
         # probe sweep, on every subsequent build.
@@ -405,18 +423,20 @@ class BuildMixin:
                     # never touched, so a module that predates its manifest
                     # keeps building until someone migrates it deliberately.
                     self.ensure_makefile(mod)
-                    print(f"[*] Current ABI interface for {mod} (pre-build):")
-                    self.introspect_and_record(mod, announce=True)
+                    # nm cannot read wasm: ELF-side ABI introspection is
+                    # skipped for web builds rather than run to failure.
+                    web = self._is_web_build(extras)
+                    if web:
+                        print(f"[*] {mod}: web build -- ABI introspection skipped.")
+                    else:
+                        print(f"[*] Current ABI interface for {mod} (pre-build):")
+                        self.introspect_and_record(mod, announce=True)
                     ok = self._run_root_make(f"module_{mod}", extra_args=extras)
-                    # Announced, not silent. The pre-build pass shows what the
-                    # LAST build left behind; the drift you actually want to see
-                    # is what THIS build just changed, and that only exists once
-                    # the .so has been rewritten. Recording it without printing
-                    # meant the diff was computed, persisted, and thrown away --
-                    # so an export appearing or vanishing was invisible until the
-                    # next unrelated invocation surfaced it as stale news.
-                    print(f"[*] ABI interface for {mod} (post-build):")
-                    self.introspect_and_record(mod, announce=True)
+                    if not web:
+                        # Announced, not silent: the post-build pass is the
+                        # drift THIS build just produced, not stale news.
+                        print(f"[*] ABI interface for {mod} (post-build):")
+                        self.introspect_and_record(mod, announce=True)
                     # A named module is ALWAYS built -- asking for it by name
                     # is the request -- but the record is written only if the
                     # build worked, so a later `ace make modules` knows this
