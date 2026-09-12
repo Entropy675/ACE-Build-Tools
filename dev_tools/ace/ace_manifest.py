@@ -753,9 +753,13 @@ class ManifestMixin:
             for art in prov.get("link", []):
                 path = f"$({v}_DIR)/{art['path']}"
                 if art.get("mode") == "whole_archive":
-                    link_items.append(f"-Wl,--whole-archive {path} -Wl,--no-whole-archive")
+                    link_val = f"-Wl,--whole-archive {path} -Wl,--no-whole-archive"
                 else:
-                    link_items.append(path)
+                    link_val = path
+                # Variable, not a baked path: platform blocks void {v}_LINK for
+                # profiles that do not carry this dep (e.g. Web + USE_GLFW port).
+                w(f"{v}_LINK := {link_val}")
+                link_items.append(f"$({v}_LINK)")
 
         # ---- flags --------------------------------------------------------
         cxx = [f.format(std=std) for f in BASE_CXXFLAGS]
@@ -1388,25 +1392,32 @@ class ManifestMixin:
         w("")
 
         exports = default.get("produces", {}).get("exports")
-        for plat, cond, kw in (("Linux", "Linux", "ifeq"),
-                               ("Win", "Windows_NT", "else ifeq")):
-            blk = default.get("build", {}).get(plat, {})
-            w(f"{kw} ($(UNAME_S),{cond})")
-            parts = blk.get("ldflags", []) + ["-l" + l for l in blk.get("system_libs", [])]
-            if plat == "Linux" and exports:
-                # Same ELF-only reasoning as a module's own version script
-                # (see _emit_makefile): silently ignored on Win, which would
-                # read as an enforced export surface that isn't one.
-                #
-                # A loader needs this for the opposite reason a module does.
-                # A module restricts what it OFFERS; a loader linked
-                # -rdynamic (so a module's static-init can find
-                # ETCS_GetLoaderManifest via dlsym(RTLD_DEFAULT, ...))
-                # would otherwise offer every symbol -fvisibility=hidden
-                # happened not to catch. The version script is what keeps
-                # that an audited whitelist instead of a side effect.
-                parts.append(f"-Wl,--version-script={exports}")
-            w(f"    LDFLAGS := {' '.join(parts)}".rstrip())
+        # Web FIRST: under emscripten uname still reports Linux, so a Linux
+        # branch above would steal the match and skip em++ / MAIN_MODULE.
+        w("# Web FIRST: under emscripten uname still reports Linux.")
+        w("ifdef EMSCRIPTEN")
+        w("    # Loader = MAIN module. Side modules load at runtime via dylink.")
+        w("    # MAIN_MODULE=1 + EXPORT_ALL so side-module GOT imports resolve.")
+        w("    # -pthread / -fwasm-exceptions MUST match every side module.")
+        w("    CXX := em++")
+        w("    CC  := emcc")
+        w("    CXXFLAGS += -pthread -fwasm-exceptions -fvisibility=default")
+        w("    LDFLAGS := -sMAIN_MODULE=1 -sEXPORT_ALL=1 -pthread -fwasm-exceptions \\")
+        w("               -sALLOW_MEMORY_GROWTH=1 -sERROR_ON_UNDEFINED_SYMBOLS=0 \\")
+        w("               -sPTHREAD_POOL_SIZE=8")
+        w("else ifeq ($(UNAME_S),Linux)")
+        blk = default.get("build", {}).get("Linux", {})
+        parts = list(blk.get("ldflags", [])) + ["-l" + l for l in blk.get("system_libs", [])]
+        if exports:
+            # ELF-only: audited export surface under -rdynamic (see module
+            # version-script note). Loader needs this so module static-init
+            # can dlsym(RTLD_DEFAULT, ETCS_GetLoaderManifest).
+            parts.append(f"-Wl,--version-script={exports}")
+        w(f"    LDFLAGS := {' '.join(parts)}".rstrip())
+        w("else ifeq ($(UNAME_S),Windows_NT)")
+        blk = default.get("build", {}).get("Win", {})
+        parts = list(blk.get("ldflags", [])) + ["-l" + l for l in blk.get("system_libs", [])]
+        w(f"    LDFLAGS := {' '.join(parts)}".rstrip())
         w("else")
         w("    $(error Unsupported platform: $(UNAME_S))")
         w("endif")
@@ -1482,7 +1493,7 @@ class ManifestMixin:
         w("\t@mkdir -p $(BIN_DIR)")
         w('\t@echo "--- Moving Loaders to $(BIN_DIR)/ ---"')
         w("\t@found=0; \\")
-        w("\tfor f in Run_*Loader etcs; do \\")
+        w("\tfor f in Run_*Loader etcs Run_*Loader.js Run_*Loader.wasm etcs.js etcs.wasm; do \\")
         w('\t    if [ -f "$$f" ]; then \\')
         w('\t        mv -f "$$f" $(BIN_DIR)/; \\')
         w('\t        echo " [✓] Moved: $$f -> $(BIN_DIR)/"; \\')
@@ -1492,7 +1503,7 @@ class ManifestMixin:
         w("\tif [ $$found -eq 0 ]; then echo \" [!] No binaries found to move\"; fi")
         w("")
         w("clean:")
-        w("\trm -f Run_*Loader etcs *.o")
+        w("\trm -f Run_*Loader etcs *.o Run_*Loader.js Run_*Loader.wasm etcs.js etcs.wasm")
         w("\t@for f in Run_*Loader etcs; do rm -f $(BIN_DIR)/$$f; done")
         w("")
         return "\n".join(L)
