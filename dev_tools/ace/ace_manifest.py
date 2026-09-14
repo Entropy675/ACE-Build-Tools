@@ -1421,7 +1421,7 @@ class ManifestMixin:
         w("    CXXFLAGS += -pthread -fwasm-exceptions -fvisibility=default")
         w("    LDFLAGS := -sMAIN_MODULE=1 -sEXPORT_ALL=1 -pthread -fwasm-exceptions \\")
         w("               -sALLOW_MEMORY_GROWTH=1 -sERROR_ON_UNDEFINED_SYMBOLS=0 \\")
-        w("               -sPTHREAD_POOL_SIZE=8")
+        w("               -sPTHREAD_POOL_SIZE=0 -sASYNCIFY")
         w("else ifeq ($(UNAME_S),Linux)")
         blk = default.get("build", {}).get("Linux", {})
         parts = list(blk.get("ldflags", [])) + ["-l" + l for l in blk.get("system_libs", [])]
