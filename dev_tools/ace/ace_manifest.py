@@ -1366,6 +1366,78 @@ class ManifestMixin:
                     syslibs.append(lib)
         return includes, links, syslibs, errors, abi
 
+    # Flags that pull a JS LIBRARY into the glue, as opposed to only affecting
+    # codegen. The distinction is the whole point of _web_jslib_flags below: a
+    # side module compiled with -sUSE_GLFW=3 gets the GLFW HEADERS and emits
+    # imports for glfwCreateWindow and the rest, but -sSIDE_MODULE emits no
+    # JavaScript at all, so library_glfw.js never arrives. Only the MAIN module
+    # has glue, so only the main link can carry these.
+    _WEB_JSLIB_PREFIXES = ("-sUSE_",)
+    _WEB_JSLIB_EXACT = (
+        "-sFULL_ES2", "-sFULL_ES3", "-sLEGACY_GL_EMULATION",
+        "-sGL_ENABLE_GET_PROC_ADDRESS", "-sOFFSCREEN_FRAMEBUFFER",
+        "-sMIN_WEBGL_VERSION", "-sMAX_WEBGL_VERSION",
+    )
+
+    def _web_jslib_flags(self, silent=False):
+        """Every JS-library flag any module's Web profile asks for.
+
+        THE FAILURE THIS PREVENTS, because it does not look like a link error.
+        A -sMAIN_MODULE build needs -sERROR_ON_UNDEFINED_SYMBOLS=0 (a side
+        module legitimately imports what it finds at runtime), so a symbol
+        NOBODY defines is not rejected. emscripten hands the side module a lazy
+        stub instead -- proxyHandler.get in the glue:
+
+            stubs[prop] = (...args) => {
+                resolved ||= resolveSymbol(prop); return resolved(...args) }
+
+        resolveSymbol returns undefined and the program dies the first time that
+        import is actually CALLED, as "TypeError: resolved is not a function",
+        under doRewind/handleSleep because the call lands inside dlopen's
+        asyncify rewind. Nothing in that stack names the symbol.
+
+        A stub that is never called never throws, so the same two binaries look
+        fine until a code path reaches one. Observed exactly that way: 30
+        unresolved glfw* imports in WindowProvider.wasm against an etcs.js
+        containing no GLFW, silent on the shell page and fatal on the window
+        page, where boot.etcs calls Window.Create -> CreateWindow -> glfwInit.
+
+        Collected from EVERY module, not only the ones a loader inherits:
+        modules arrive by dlopen at runtime, so the loader cannot know which
+        will show up, and a JS library that is present but unused costs glue
+        size and nothing else.
+        """
+        flags, sources = [], {}
+        mdir = self.ace_root / "modules"
+        if not mdir.is_dir():
+            return flags, sources
+        for entry in sorted(mdir.iterdir()):
+            if not (entry.is_dir() or entry.is_symlink()):
+                continue
+            try:
+                m = self.load_manifest(entry.name, silent=True)
+            except Exception:
+                # A module whose manifest will not load is the module build's
+                # problem to report, not the loader generator's -- and refusing
+                # to emit a Makefile over it would block every other loader.
+                continue
+            web = m.get("build", {}).get("Web")
+            if not web:
+                continue
+            for f in list(web.get("cxxflags", [])) + list(web.get("ldflags", [])):
+                base = f.split("=")[0]
+                if not (f.startswith(self._WEB_JSLIB_PREFIXES)
+                        or base in self._WEB_JSLIB_EXACT):
+                    continue
+                if f not in flags:
+                    flags.append(f)
+                    sources[f] = entry.name
+        if flags and not silent:
+            for f in flags:
+                print(f"  {DIM}web jslib{RESET} {f} "
+                      f"{DIM}(from {sources[f]}; the loader owns the glue){RESET}")
+        return flags, sources
+
     def _emit_loaders_makefile(self, default, overrides, silent=False):
         """Render loaders/Makefile from the default manifest plus overrides.
 
@@ -1499,8 +1571,35 @@ class ManifestMixin:
         w("    #   make FILE=etcs EMSCRIPTEN=1 ETCS_WEB_POOL='-sPTHREAD_POOL_SIZE=0'")
         w("    ETCS_WEB_POOL ?= -sPTHREAD_POOL_SIZE=0")
         w("")
+        jslibs, jslib_src = self._web_jslib_flags(silent=silent)
+        w("    # ── JS LIBRARIES THE SIDE MODULES WILL IMPORT ────────────────────")
+        w("    #")
+        w("    # Collected from every module manifest's Web profile, because only the")
+        w("    # MAIN module has glue. A side module built with -sUSE_GLFW=3 gets the")
+        w("    # GLFW headers and emits imports for glfwCreateWindow and the rest, but")
+        w("    # -sSIDE_MODULE emits no JavaScript, so library_glfw.js never arrives")
+        w("    # unless THIS link asks for it.")
+        w("    #")
+        w("    # And it does not fail at link time. -sERROR_ON_UNDEFINED_SYMBOLS=0 is")
+        w("    # required here, so an unresolvable symbol becomes a lazy stub that")
+        w("    # throws \"TypeError: resolved is not a function\" the first time it is")
+        w("    # CALLED -- from inside dlopen's asyncify rewind, which looks nothing")
+        w("    # like a missing function. A stub that is never called never throws, so")
+        w("    # the binaries look fine until a code path reaches one: WindowProvider's")
+        w("    # 30 glfw* imports were silent on the shell page and fatal on the window")
+        w("    # page, where boot.etcs calls Window.Create.")
+        w("    #")
+        w("    # tools/wasm_link_check.py does this set difference against the built")
+        w("    # binaries, which is the check ERROR_ON_UNDEFINED_SYMBOLS=0 gives up.")
+        if jslibs:
+            for f in jslibs:
+                w(f"    #   {f}   <- {jslib_src[f]}")
+        else:
+            w("    #   (no module declares one)")
+        w(f"    ETCS_WEB_JSLIBS ?= {' '.join(jslibs)}".rstrip())
+        w("")
         w("    LDFLAGS := -sMAIN_MODULE=1 -sEXPORT_ALL=1 -pthread -fwasm-exceptions \\")
-        w("               $(ETCS_WEB_MEMORY) $(ETCS_WEB_POOL) \\")
+        w("               $(ETCS_WEB_MEMORY) $(ETCS_WEB_POOL) $(ETCS_WEB_JSLIBS) \\")
         w("               -sERROR_ON_UNDEFINED_SYMBOLS=0 -sASYNCIFY")
         w("    # THE OUTPUT NAME, and it is not cosmetic. `-o etcs` on the web path")
         w("    # writes JAVASCRIPT to the name the NATIVE loader binary has, and")
