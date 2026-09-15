@@ -889,7 +889,9 @@ class ManifestMixin:
             # CODEGEN, so they have to be on the compile line too; Asyncify is
             # a Binaryen pass over the finished wasm, and for a side module the
             # SIDE_MODULE link is where that wasm is finished.
-            ld = (["-sSIDE_MODULE", "-pthread", "-fwasm-exceptions", "-sASYNCIFY"]
+            # No -sASYNCIFY here either: instrumented exports cannot be tabled
+            # by a pool thread. The loader block below says why in full.
+            ld = (["-sSIDE_MODULE", "-pthread", "-fwasm-exceptions"]
                   if plat == "Web" else ["-shared"])
             if plat != "Web":
                 ld += ["-fuse-ld=gold", "-Wl,--threads", "-Wl,--thread-count,$(NPROC)"]
@@ -1598,9 +1600,23 @@ class ManifestMixin:
             w("    #   (no module declares one)")
         w(f"    ETCS_WEB_JSLIBS ?= {' '.join(jslibs)}".rstrip())
         w("")
+        w("    # ── NO -sASYNCIFY, AND IT IS NOT AVAILABLE TO THIS PROGRAM ───────")
+        w("    #")
+        w("    # Asyncify replaces a module's exports with JS closures, and dylink")
+        w("    # stores those as the library's exports. Emscripten's cross-thread table")
+        w("    # catch-up then calls addFunction(sym, sym.sig) on a closure that has no")
+        w("    # .sig, dies on sig.slice, and leaves that thread's table short -- so the")
+        w("    # next indirect call reports \"table index is out of bounds\". Calling")
+        w("    # module functions from pool threads is what `detach` and every `->` edge")
+        w("    # do, so this is the normal case, not a corner.")
+        w("    #")
+        w("    # Nothing here needs it: etcs_cooperative_pause_ms refuses to wait on the")
+        w("    # browser's main thread instead of unwinding, and the REPL's line wait runs")
+        w("    # on a Worker. dlopen remains async, driven from the page's promise chain")
+        w("    # at startup rather than from inside a wasm call.")
         w("    LDFLAGS := -sMAIN_MODULE=1 -sEXPORT_ALL=1 -pthread -fwasm-exceptions \\")
         w("               $(ETCS_WEB_MEMORY) $(ETCS_WEB_POOL) $(ETCS_WEB_JSLIBS) \\")
-        w("               -sERROR_ON_UNDEFINED_SYMBOLS=0 -sASYNCIFY")
+        w("               -sERROR_ON_UNDEFINED_SYMBOLS=0")
         w("    # THE OUTPUT NAME, and it is not cosmetic. `-o etcs` on the web path")
         w("    # writes JAVASCRIPT to the name the NATIVE loader binary has, and")
         w("    # copy_loaders then moves it over bin/etcs -- one web build and the")
