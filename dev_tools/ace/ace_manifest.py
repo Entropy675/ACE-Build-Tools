@@ -869,7 +869,27 @@ class ManifestMixin:
             # Under emscripten a module IS a side module: -sSIDE_MODULE
             # replaces -shared; -pthread/-fwasm-exceptions ride the link
             # line for the same must-match reasons as the compile line.
-            ld = (["-sSIDE_MODULE", "-pthread", "-fwasm-exceptions"]
+            #
+            # -sASYNCIFY IS IN THAT MUST-MATCH SET, and leaving it off here
+            # while the loader carries it is not a missing optimisation -- it
+            # is a broken program. Asyncify unwinds and rewinds the whole
+            # stack, and it can only do that through frames it INSTRUMENTED.
+            # An emscripten_sleep reached from a side module therefore unwinds
+            # out through uninstrumented frames and comes back wrong on the
+            # rewind: the observed failure is "TypeError: resolved is not a
+            # function" inside a dylink lazy-symbol stub, under
+            # doRewind/handleSleep, after which the runtime is dead and never
+            # reaches drive_main_loop_then_exit -- so the terminal never opens.
+            # Every cooperative pause in ETCS is in a module, not the loader
+            # (etcs_cooperative_pause_ms's call sites are all WindowProvider),
+            # so with the flag on the loader alone NO sleep in the program is
+            # instrumented end to end.
+            #
+            # LINK LINE ONLY, unlike -fwasm-exceptions. Wasm exceptions change
+            # CODEGEN, so they have to be on the compile line too; Asyncify is
+            # a Binaryen pass over the finished wasm, and for a side module the
+            # SIDE_MODULE link is where that wasm is finished.
+            ld = (["-sSIDE_MODULE", "-pthread", "-fwasm-exceptions", "-sASYNCIFY"]
                   if plat == "Web" else ["-shared"])
             if plat != "Web":
                 ld += ["-fuse-ld=gold", "-Wl,--threads", "-Wl,--thread-count,$(NPROC)"]
@@ -1419,9 +1439,69 @@ class ManifestMixin:
         w("    CXX := em++")
         w("    CC  := emcc")
         w("    CXXFLAGS += -pthread -fwasm-exceptions -fvisibility=default")
+        w("")
+        w("    # ── MEMORY: FIXED, NOT GROWABLE, and this is the throw site ──────")
+        w("    #")
+        w("    # emscripten emits this ONLY for ALLOW_MEMORY_GROWTH together with")
+        w("    # threads (preamble.js, #if ALLOW_MEMORY_GROWTH && PTHREADS):")
+        w("    #")
+        w("    #   function growMemViews() {")
+        w("    #     if (wasmMemory.buffer != HEAP8.buffer) { updateMemoryViews() }")
+        w("    #   }")
+        w("    #")
+        w("    # and calls it at the head of every JS library function that touches a")
+        w("    # memory view, so each worker can re-derive its views after a grow. In")
+        w("    # a pthread worker that has not yet been handed its wasmMemory, that")
+        w("    # first line is `undefined.buffer` -- which is exactly the observed")
+        w("    # failure, one per worker:")
+        w("    #")
+        w("    #   worker sent an error! etcs.js:1: TypeError: can't access")
+        w("    #   property \"buffer\", wasmMemory is undefined")
+        w("    #")
+        w("    # With growth OFF the function is never generated, so the line cannot")
+        w("    # throw. That is why this defaults to fixed rather than tuning around")
+        w("    # it: it removes the failing code instead of hoping the race that")
+        w("    # reaches it stops being reached.")
+        w("    #")
+        w("    # A -pthread build's memory is shared either way, so it needs a maximum")
+        w("    # either way; with growth off emscripten uses initial as the maximum and")
+        w("    # nothing more has to be said. Bump INITIAL_MEMORY if a bigger world")
+        w("    # needs it -- there is no growth to fall back on now, so exhaustion is")
+        w("    # an abort rather than a stall.")
+        w("    ETCS_WEB_MEMORY ?= -sINITIAL_MEMORY=268435456")
+        w("")
+        w("    # To go back to growth for a comparison, in one command and without")
+        w("    # regenerating anything -- MAXIMUM_MEMORY is not optional in that")
+        w("    # variant, because shared memory must be created with a maximum:")
+        w("    #")
+        w("    #   make FILE=etcs EMSCRIPTEN=1 \\")
+        w("    #     ETCS_WEB_MEMORY='-sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=1073741824'")
+        w("")
+        w("    # ── THE POOL: PREWARMED, AND IT DOES NOT UNDO THE DEFERRAL ───────")
+        w("    #")
+        w("    # PTHREAD_POOL_SIZE creates its workers during MODULE STARTUP -- before")
+        w("    # main(), so before preload_web_modules opens the first side module. The")
+        w("    # hazard the deferred arming exists for is a Worker starting WHILE the")
+        w("    # main module is inside loadDynamicLibrary; a prewarmed pool is created")
+        w("    # before that window opens, so the two fixes approach the same window")
+        w("    # from opposite sides rather than cancelling out. Each worker also gets")
+        w("    # its wasmMemory as part of that startup, when nothing else is in")
+        w("    # flight.")
+        w("    #")
+        w("    # WHAT IT COSTS, because it is a trade and not a free win: every later")
+        w("    # dlopen now has to be replicated into workers that already exist, which")
+        w("    # is the direction emscripten's own advice warns about. With 0 it was the")
+        w("    # mirror problem -- no worker to replicate into, and every worker created")
+        w("    # later had to replay the whole library list by itself. Overridable for")
+        w("    # exactly that reason, and worth testing SEPARATELY from the memory")
+        w("    # change so a fix cannot be credited to the wrong one:")
+        w("    #")
+        w("    #   make FILE=etcs EMSCRIPTEN=1 ETCS_WEB_POOL='-sPTHREAD_POOL_SIZE=0'")
+        w("    ETCS_WEB_POOL ?= -sPTHREAD_POOL_SIZE=0")
+        w("")
         w("    LDFLAGS := -sMAIN_MODULE=1 -sEXPORT_ALL=1 -pthread -fwasm-exceptions \\")
-        w("               -sALLOW_MEMORY_GROWTH=1 -sERROR_ON_UNDEFINED_SYMBOLS=0 \\")
-        w("               -sPTHREAD_POOL_SIZE=0 -sASYNCIFY")
+        w("               $(ETCS_WEB_MEMORY) $(ETCS_WEB_POOL) \\")
+        w("               -sERROR_ON_UNDEFINED_SYMBOLS=0 -sASYNCIFY")
         w("    # THE OUTPUT NAME, and it is not cosmetic. `-o etcs` on the web path")
         w("    # writes JAVASCRIPT to the name the NATIVE loader binary has, and")
         w("    # copy_loaders then moves it over bin/etcs -- one web build and the")
