@@ -5,7 +5,8 @@
     "std": "c++17",
     "platforms": [
       "Linux",
-      "Win"
+      "Win",
+      "Web"
     ],
     "impl_layout": "shared"
   },
@@ -144,6 +145,9 @@
       "system_libs": [
         "vulkan-1"
       ]
+    },
+    "Web": {
+      "compiler": "em++"
     }
   },
   "produces": {

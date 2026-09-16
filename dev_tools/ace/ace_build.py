@@ -365,6 +365,20 @@ class BuildMixin:
                     subprocess.run(make_cmd, check=True)
                 except subprocess.CalledProcessError as e:
                     print(f"[-] Loader build error: {e}")
+                    return
+                if self._is_web_build(extras):
+                    # THE MAIN LINK IS WHERE THIS CAN BE ANSWERED, which is why the
+                    # check runs here and not after a module build. A side module
+                    # emits no JavaScript, so the JS library behind a `-sUSE_*`
+                    # flag arrives only if the LOADER link asked for it -- and with
+                    # -sERROR_ON_UNDEFINED_SYMBOLS=0 (mandatory for MAIN_MODULE) a
+                    # symbol nobody defines is not rejected, it becomes a stub that
+                    # throws the first time something calls it. Silent at link
+                    # time, silent at load time, and fatal in a browser with a
+                    # stack that names neither the symbol nor the module. See
+                    # ace_wasm. Reported, not fatal: the link itself succeeded, and
+                    # an unreached stub is a real (if fragile) state to ship.
+                    self.wasm_link([], quiet_when_clean=True)
                 return
 
             if len(args) >= 2 and args[0] == "clean" and args[1] == "loader":

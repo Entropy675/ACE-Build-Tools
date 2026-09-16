@@ -8,3 +8,4 @@ from .ace_build import BuildMixin
 from .ace_lifecycle import LifecycleMixin
 from .ace_script import ScriptMixin
 from .ace_manifest import ManifestMixin, ManifestError
+from .ace_wasm import WasmMixin
