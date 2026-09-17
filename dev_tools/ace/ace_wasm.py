@@ -261,6 +261,19 @@ class WasmMixin:
                 out.append(name)
         return out
 
+    def _web_unclaimed(self):
+        """Modules in the tree that this cannot speak for either way.
+
+        A module with no manifest of its own builds from default.json, and
+        default.json declares every platform -- so "declares Web" says nothing
+        about it, and a set built from that would sweep in every module in the
+        tree whether or not it has ever been compiled for the web. They are
+        LISTED rather than guessed at: a module that does build for the web and
+        is missing here wants a manifest, and one that does not wants to stay
+        out, and only its author knows which.
+        """
+        return [m for m in self._defaulted_modules() if m not in self._web_modules()]
+
     def wasm_make(self, args):
         """`ace make ... EMSCRIPTEN=1`, over the set that declares Web.
 
@@ -299,7 +312,15 @@ class WasmMixin:
                       f"to module.platforms.{RESET}")
                 return 1
             print(f"\n--- Web build: {len(mods)} module(s) declaring Web ---")
-            print(f"  {DIM}{', '.join(mods)}{RESET}\n")
+            print(f"  {DIM}{', '.join(mods)}{RESET}")
+            unclaimed = self._web_unclaimed()
+            if unclaimed:
+                print(f"  {YELLOW}not built{RESET} {DIM}(no manifest of their own, so "
+                      f"nothing declares them either way):{RESET}")
+                print(f"    {DIM}{', '.join(unclaimed)}{RESET}")
+                print(f"    {DIM}ace wasm make module <n> builds one anyway; a manifest "
+                      f"with \"Web\" in module.platforms puts it in this set.{RESET}")
+            print()
             failed = []
             for name in mods:
                 try:
