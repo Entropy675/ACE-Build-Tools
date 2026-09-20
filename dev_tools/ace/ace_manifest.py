@@ -834,10 +834,19 @@ class ManifestMixin:
                 # must match the loader's MAIN module exactly or the browser
                 # refuses instantiation; wasm exceptions because the JS
                 # default does not survive dylink (work functions throw).
-                # -fvisibility=default overrides BASE's hidden (last flag
-                # wins) so the @@ETCS_ABI trampolines reach the dylink export
-                # table.
-                w("    CXXFLAGS += -pthread -fwasm-exceptions -fvisibility=default")
+                #
+                # BASE's -fvisibility=hidden STAYS, and not for tidiness: it
+                # is what makes each header-inline static (EventNode,
+                # ThreadPool, MemoryArena, the RID seed) this module's OWN,
+                # as on native. A default-visibility definition is not
+                # dso_local under -fPIC, so wasm codegen reaches even the
+                # module's own copy through the GOT, and dylink resolves that
+                # import to the loader's -- one shared singleton of
+                # everything core/ documents as per-DSO. Exports do not need
+                # default: wasm-ld has no version script, and a side module
+                # exports exactly what is marked visibility("default"), which
+                # ETCS_API puts on every symbol the loader dlsym()s.
+                w("    CXXFLAGS += -pthread -fwasm-exceptions")
                 # Vendored C compiles through $(CC); a native gcc object
                 # cannot link into a wasm side module.
                 w(f"    CC := {blk.get('cc', 'emcc')}")
@@ -1510,9 +1519,17 @@ class ManifestMixin:
         w("    # Loader = MAIN module. Side modules load at runtime via dylink.")
         w("    # MAIN_MODULE=1 + EXPORT_ALL so side-module GOT imports resolve.")
         w("    # -pthread / -fwasm-exceptions MUST match every side module.")
+        w("    #")
+        w("    # -fvisibility=hidden stays in force here too. A side module imports")
+        w("    # libc/libc++ and the JS libraries from the MAIN module, which this")
+        w("    # flag does not touch. What it removes from the export table is the")
+        w("    # loader's own header-inline statics -- EventNode, ThreadPool,")
+        w("    # MemoryArena -- so a module can only ever bind to its own copy, the")
+        w("    # per-DSO grain core/ is written to. The one symbol a module dlsym()s")
+        w("    # out of the loader, ETCS_GetLoaderManifest, marks itself default.")
         w("    CXX := em++")
         w("    CC  := emcc")
-        w("    CXXFLAGS += -pthread -fwasm-exceptions -fvisibility=default")
+        w("    CXXFLAGS += -pthread -fwasm-exceptions")
         w("")
         w("    # ── MEMORY: FIXED, NOT GROWABLE, and this is the throw site ──────")
         w("    #")
@@ -1614,9 +1631,27 @@ class ManifestMixin:
         w("    # browser's main thread instead of unwinding, and the REPL's line wait runs")
         w("    # on a Worker. dlopen remains async, driven from the page's promise chain")
         w("    # at startup rather than from inside a wasm call.")
+        w("    #")
+        w("    # ── STACK: 4 MiB, MAIN THREAD AND EVERY PTHREAD ───────────────────")
+        w("    #")
+        w("    # emscripten's default is 64 KiB, and one stream call needs well over")
+        w("    # that: Entity::call keeps two MirrorBuffers (~13.8 KB each) and two")
+        w("    # 4 KB transport MBuffers on ONE frame, ~36 KB before anything it")
+        w("    # calls gets a byte. Exhaustion is silent in wasm -- no guard page,")
+        w("    # the stack pointer walks into whatever sits below it -- and it")
+        w("    # surfaced as the 'unresolved tag' and 'signature mismatch' boots that")
+        w("    # only ever happened in the browser. STACK_SIZE is the main thread's;")
+        w("    # DEFAULT_PTHREAD_STACK_SIZE is what pool workers and the ordering")
+        w("    # threads get, and stream calls run on those. Side modules take no")
+        w("    # stack flag: emcc passes -z stack-size only to a MAIN link, and a")
+        w("    # side module runs on whichever thread's stack calls into it.")
+        w("    #")
+        w("    # This makes the stacks safe for those frames. It is NOT a fix for the")
+        w("    # frame sizes, which are a defect in core/ on their own.")
         w("    LDFLAGS := -sMAIN_MODULE=1 -sEXPORT_ALL=1 -pthread -fwasm-exceptions \\")
         w("               $(ETCS_WEB_MEMORY) $(ETCS_WEB_POOL) $(ETCS_WEB_JSLIBS) \\")
-        w("               -sERROR_ON_UNDEFINED_SYMBOLS=0")
+        w("               -sERROR_ON_UNDEFINED_SYMBOLS=0 \\")
+        w("               -sSTACK_SIZE=4MB -sDEFAULT_PTHREAD_STACK_SIZE=4MB")
         w("    # THE OUTPUT NAME, and it is not cosmetic. `-o etcs` on the web path")
         w("    # writes JAVASCRIPT to the name the NATIVE loader binary has, and")
         w("    # copy_loaders then moves it over bin/etcs -- one web build and the")
