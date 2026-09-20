@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "module": {
+    "name": "ShellProvider",
+    "std": "c++17",
+    "platforms": [
+      "Linux",
+      "Win",
+      "Web"
+    ],
+    "impl_layout": "shared"
+  },
+  "requires": {
+    "system": {
+      "debian": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        }
+      ],
+      "arch": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        }
+      ],
+      "fedora": [
+        {
+          "package": "git",
+          "probe": "binary:git"
+        }
+      ]
+    }
+  },
+  "build": {
+    "Linux": {
+      "system_libs": [
+        "dl",
+        "pthread"
+      ]
+    },
+    "Win": {
+      "system_libs": [
+        "ws2_32"
+      ]
+    },
+    "Web": {
+      "compiler": "em++"
+    }
+  },
+  "produces": {
+    "kind": "etcs_module",
+    "exports": "exports.map",
+    "install": "bin/"
+  }
+}

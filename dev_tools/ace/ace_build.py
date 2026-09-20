@@ -260,6 +260,68 @@ class BuildMixin:
 
         return validated
 
+    def _announce_loader_variant(self, loader_name, extras):
+        """Say WHICH etcs this build produced, because the file cannot.
+
+        -DETCS_REPL_SHELL selects the top-level loop and nothing else
+        (loaders/etcs.cc): with it the binary takes ShellProvider's terminal and
+        prompts, without it the same source drains and exits. Both write
+        bin/etcs(.js), so whichever target ran last wins and the artifact carries
+        no mark of which one it is.
+
+        That asymmetry is easy to walk into. `ace make loader` defaults the flag
+        ON; naming `etcs` explicitly turns it OFF (that spelling is how you ask
+        for the daemon); and the PLURAL `loaders` -- which `ace wasm make all`
+        routes through -- passes no flag at all, so "build everything for the
+        web" emits the draining variant. A page whose terminal expects a
+        navigator then loads its modules and exits 0, with nothing on the
+        console to say why.
+        """
+        if loader_name != "etcs":
+            return
+        repl = any("ETCS_REPL_SHELL" in str(a) for a in (extras or []))
+        art = "bin/etcs.js" if self._is_web_build(extras) else "bin/etcs"
+        if repl:
+            print(f"{GREEN}[=] {art} is the INTERACTIVE loader "
+                  f"(-DETCS_REPL_SHELL).{RESET}")
+        else:
+            print(f"{YELLOW}[=] {art} is the DAEMON loader -- no REPL shell. "
+                  f"A script runs and then drains.{RESET}")
+            print(f"    {DIM}For the interactive one: "
+                  f"ace make loader etcs -DETCS_REPL_SHELL{RESET}")
+
+    def _drop_stale_artifact(self, name, extras, kind="module"):
+        """Remove what a FAILED build left behind in bin/.
+
+        A build that fails leaves the PREVIOUS artifact sitting there, and
+        nothing downstream can tell the difference: copying bin/*.wasm into a
+        page, or serving it, then ships a binary that does not match the source
+        it was built from. That is the worst shape a build failure can take --
+        it does not look like one. Staging a stale module beside fresh ones is
+        also how a manifest-epoch mismatch appears at runtime instead of here.
+
+        Removed rather than renamed: the next thing to touch it should fail
+        loudly for a missing file, which every consumer already handles, rather
+        than succeed against something older than the tree.
+        """
+        bin_dir = self.ace_root / "bin"
+        if not bin_dir.is_dir():
+            return
+        web = self._is_web_build(extras)
+        if kind == "loader":
+            names = [f"{name}.js", f"{name}.wasm"] if web else [name]
+        else:
+            names = [f"{name}.{self._artifact_ext(extras)}"]
+        for n in names:
+            art = bin_dir / n
+            if art.exists():
+                try:
+                    art.unlink()
+                    print(f"{YELLOW}[!] removed stale bin/{n} -- the build that "
+                          f"should have replaced it failed.{RESET}")
+                except OSError as ex:
+                    print(f"{RED}[-] could not remove stale bin/{n}: {ex}{RESET}")
+
     def _run_root_make(self, target, extra_args=None, keep_going=False):
         """Run a target against the master Makefile at ace_root with extra flags.
 
@@ -309,13 +371,13 @@ class BuildMixin:
         args = filtered
         if not args:
             print("[-] Error: No make target specified.")
-            return
+            return 1
 
         if self._is_web_build(args):
             if not shutil.which("em++"):
                 print(f"{RED}[-] EMSCRIPTEN build requested but em++ is not on PATH.{RESET}")
                 print(f"{DIM}    source <emsdk-root>/emsdk_env.sh first{RESET}")
-                return
+                return 1
 
         # Once per (distro, arch), then never again -- a marker read, not a
         # probe sweep, on every subsequent build.
@@ -349,7 +411,7 @@ class BuildMixin:
                 loaders_dir = self.ace_root / "loaders"
                 if not loaders_dir.exists():
                     print(f"[-] Error: No loaders directory found at {loaders_dir}")
-                    return
+                    return 1
                 # Same contract as modules: the shared loaders/Makefile is a
                 # generated artifact, regenerated when missing, never
                 # overwritten when present.
@@ -365,7 +427,8 @@ class BuildMixin:
                     subprocess.run(make_cmd, check=True)
                 except subprocess.CalledProcessError as e:
                     print(f"[-] Loader build error: {e}")
-                    return
+                    self._drop_stale_artifact(loader_name, extras, "loader")
+                    return 1
                 if self._is_web_build(extras):
                     # THE MAIN LINK IS WHERE THIS CAN BE ANSWERED, which is why the
                     # check runs here and not after a module build. A side module
@@ -379,7 +442,8 @@ class BuildMixin:
                     # ace_wasm. Reported, not fatal: the link itself succeeded, and
                     # an unreached stub is a real (if fragile) state to ship.
                     self.wasm_link([], quiet_when_clean=True)
-                return
+                self._announce_loader_variant(loader_name, extras)
+                return 0
 
             if len(args) >= 2 and args[0] == "clean" and args[1] == "loader":
                 loader_name = args[2] if len(args) >= 3 else "etcs"
@@ -391,7 +455,7 @@ class BuildMixin:
                 loaders_dir = self.ace_root / "loaders"
                 if not loaders_dir.exists():
                     print(f"[-] Error: No loaders directory found at {loaders_dir}")
-                    return
+                    return 1
                 print(f"[*] Cleaning loader: {loader_name}")
                 make_cmd = [
                     "make",
@@ -413,7 +477,7 @@ class BuildMixin:
                 raw_names, raw_flags = self._split_names_and_flags(args[1:])
                 if not raw_names:
                     print("[-] Error: `make module` needs at least one module name.")
-                    return
+                    return 1
                 mods = [self._validate_module_name(n) for n in raw_names]
                 # Flags validate ONCE and apply to every named module.
                 extras = self._validate_make_args(raw_flags)
@@ -430,6 +494,7 @@ class BuildMixin:
 
                 # ...then build each, with its own pre/post ABI diff so the
                 # per-module reminder still pops regardless of batch size.
+                failed = []
                 for mod in mods:
                     # Generated Makefiles are build artifacts and gitignored,
                     # so a fresh clone has none. Regenerating a MISSING one
@@ -457,13 +522,20 @@ class BuildMixin:
                     # one is current and leaves it alone.
                     if ok:
                         self._record_module_fingerprint(mod, extras)
-                return
+                    else:
+                        failed.append(mod)
+                        self._drop_stale_artifact(mod, extras, "module")
+                if failed:
+                    print(f"{RED}[-] {len(failed)} module(s) failed: "
+                          f"{', '.join(failed)}{RESET}")
+                    return 1
+                return 0
 
             if len(args) >= 3 and args[0] == "clean" and args[1] == "module":
                 raw_names, raw_flags = self._split_names_and_flags(args[2:])
                 if not raw_names:
                     print("[-] Error: `make clean module` needs a module name.")
-                    return
+                    return 1
                 mods = [self._validate_module_name(n) for n in raw_names]
                 extras = self._validate_make_args(raw_flags)
                 if len(mods) > 1:
@@ -527,6 +599,7 @@ class BuildMixin:
                 # module_<name> one at a time keeps make's own incremental
                 # decisions intact underneath and lets a whole module be
                 # skipped above them.
+                failed = []
                 if args[0] in ("all", "modules"):
                     mods = sorted(set(self._all_manifests())
                                   | set(self._defaulted_modules()))
@@ -552,16 +625,18 @@ class BuildMixin:
                         print("[!] No modules found to build.")
                     print()
 
-                    failed = []
                     for mod, _ in build:
                         if self._run_root_make(f"module_{mod}", extra_args=extras):
                             self._record_module_fingerprint(mod, extras)
                         else:
-                            # No record at all -- the next run rebuilds it. A
-                            # failed build leaves the OLD .so in place, so
-                            # anything that keyed off the artifact's existence
-                            # would call this module current.
+                            # No record at all -- the next run rebuilds it, and
+                            # the OLD artifact goes with it. Leaving it was the
+                            # quiet half of this failure: anything that keyed
+                            # off the artifact's existence called the module
+                            # current, and staging bin/ shipped a binary older
+                            # than its source.
                             failed.append(mod)
+                            self._drop_stale_artifact(mod, extras, "module")
                     if failed:
                         print(f"{RED}[-] {len(failed)} module(s) failed and were not "
                               f"recorded; they will rebuild next run:{RESET}")
@@ -581,19 +656,28 @@ class BuildMixin:
                     # that every module is compared AGAINST at load time, so a
                     # stale loader does not merely miss a change -- it refuses
                     # every module built after it. It is also one link.
-                    self._run_root_make("loaders", extra_args=extras)
-                return
-                return
+                    if not self._run_root_make("loaders", extra_args=extras):
+                        failed.append("loaders")
+                        self._drop_stale_artifact("etcs", extras, "loader")
+                    else:
+                        # This batch passes no -DETCS_REPL_SHELL, so `ace make
+                        # all` emits the DRAINING etcs. Said out loud because
+                        # the artifact cannot say it -- see
+                        # _announce_loader_variant.
+                        self._announce_loader_variant("etcs", extras)
+                if failed:
+                    return 1
+                return 0
 
         except ValueError as e:
             print(f"[-] Flag validation error: {e}")
-            return
+            return 1
 
         current_dir = Path.cwd()
 
         if not (current_dir / "Makefile").exists():
             print("[-] Error: No Makefile found in current directory.")
-            return
+            return 1
 
         etcs_link = current_dir.parent / "ETCS"
         if not etcs_link.is_symlink() or etcs_link.resolve() != self.ace_root:

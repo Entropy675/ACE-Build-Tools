@@ -298,12 +298,15 @@ class WasmMixin:
                 print(f"{RED}[-] ace wasm make {target} needs a name.{RESET}")
                 return 1
             name, tail = rest[0], rest[1:]
-            self.make([target, name] + list(tail) + ["EMSCRIPTEN=1"])
-            return 0
+            # PROPAGATED, not discarded. make() reports a failed build in its
+            # return value; swallowing it here is what let `ace wasm make module
+            # X && stage` succeed against the PREVIOUS binary (make() now also
+            # removes that, so the two halves of this fix answer the same
+            # question from both ends).
+            return self.make([target, name] + list(tail) + ["EMSCRIPTEN=1"]) or 0
 
         if target == "loaders":
-            self.make(["loaders"] + extras)
-            return 0
+            return self.make(["loaders"] + extras) or 0
 
         if target in ("modules", "all"):
             mods = self._web_modules()
@@ -323,17 +326,23 @@ class WasmMixin:
             print()
             failed = []
             for name in mods:
+                # BOTH failure shapes. make() raises for a broken invocation and
+                # RETURNS non-zero for a build that ran and failed; catching only
+                # the first meant every compile error in this loop was reported
+                # to the console and then to the caller as success.
                 try:
-                    self.make(["module", name] + list(rest) + ["EMSCRIPTEN=1"])
+                    if self.make(["module", name] + list(rest) + ["EMSCRIPTEN=1"]):
+                        failed.append((name, "build failed"))
                 except Exception as ex:
                     failed.append((name, ex))
+            rc = 0
             if target == "all":
-                self.make(["loaders"] + extras)
+                rc = self.make(["loaders"] + extras) or 0
             if failed:
                 for name, ex in failed:
                     print(f"  {RED}[-] {name}: {ex}{RESET}")
                 return 1
-            return 0
+            return rc
 
         print(f"{RED}[-] Unknown wasm make target: '{target}'{RESET}")
         return 1

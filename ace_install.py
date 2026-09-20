@@ -244,7 +244,7 @@ if __name__ == "__main__":
         elif cmd == "list":                             ace.list_modules()
         elif cmd == "setup" and len(args) > 1:          ace.setup(args[1], args[2] if len(args) > 2 else "default")
         elif cmd == "remove" and len(args) > 1:         ace.remove(args[1])
-        elif cmd == "make":                             ace.make(args[1:])
+        elif cmd == "make":                             sys.exit(ace.make(args[1:]) or 0)
         elif cmd == "stage" and len(args) > 2:          ace.stage(args[1], args[2])
         elif cmd == "registry" and args[1:] == ["verify"]: ace.registry_verify()
         elif cmd == "deps":                             ace.deps(args[1:])
