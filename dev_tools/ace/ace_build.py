@@ -5,6 +5,7 @@ build surface and nothing else. Mixed into AceManager in ace_install.py --
 all methods are `self`-bound and may call across subsystems through the one
 assembled object, but each subsystem's *definition* lives in exactly one file.
 """
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import hashlib
 import json
@@ -238,7 +239,11 @@ class BuildMixin:
             if any(char in arg for char in [';', '&', '|', '$', '`', '\n', '\r']):
                 raise ValueError(f"Illegal characters: {arg}")
 
-            if arg.startswith("-D"):
+            # -U as well as -D: both are preprocessor flags and both belong in
+            # EXTRADEFINES. -U is what makes an always-on define (see
+            # LOADER_DEFAULT_DEFINES) something a caller can still turn off,
+            # instead of a wall.
+            if arg.startswith("-D") or arg.startswith("-U"):
                 defines.append(arg)
                 continue
 
@@ -260,35 +265,56 @@ class BuildMixin:
 
         return validated
 
-    def _announce_loader_variant(self, loader_name, extras):
-        """Say WHICH etcs this build produced, because the file cannot.
+    # EVERY LOADER BUILD IS THE INTERACTIVE ONE, unless a caller undefines it.
+    #
+    # -DETCS_REPL_SHELL selects the top-level loop and nothing else
+    # (loaders/etcs.cc): with it the binary takes ShellProvider's terminal and
+    # prompts, without it the same source drains and exits. Both write
+    # bin/etcs(.js), so whichever build ran last wins and the artifact carries
+    # no mark of which one it is.
+    #
+    # It used to be per-spelling -- ON for `ace make loader <n>`, OFF when you
+    # named `etcs` explicitly, and absent from the PLURAL `loaders` that
+    # `ace make all` and `ace wasm make all` both route through. So "build
+    # everything" emitted the draining variant, and a page whose terminal
+    # expects a navigator loaded its modules and exited 0 with nothing on the
+    # console to say why. On the web there is no daemon to be: nothing calls
+    # into a wasm loader that has already returned from main.
+    #
+    # The escape is an ordinary compiler flag rather than a mode: pass
+    # -UETCS_REPL_SHELL for the draining loader. Spelled that way because it
+    # says what it does to the build, and _validate_make_args now carries -U
+    # through for the same reason.
+    LOADER_DEFAULT_DEFINES = ("-DETCS_REPL_SHELL",)
 
-        -DETCS_REPL_SHELL selects the top-level loop and nothing else
-        (loaders/etcs.cc): with it the binary takes ShellProvider's terminal and
-        prompts, without it the same source drains and exits. Both write
-        bin/etcs(.js), so whichever target ran last wins and the artifact carries
-        no mark of which one it is.
+    @staticmethod
+    def _loader_extras(user_args):
+        """The loader's own defines in front of the caller's.
 
-        That asymmetry is easy to walk into. `ace make loader` defaults the flag
-        ON; naming `etcs` explicitly turns it OFF (that spelling is how you ask
-        for the daemon); and the PLURAL `loaders` -- which `ace wasm make all`
-        routes through -- passes no flag at all, so "build everything for the
-        web" emits the draining variant. A page whose terminal expects a
-        navigator then loads its modules and exits 0, with nothing on the
-        console to say why.
+        In front, not appended, so an explicit -UETCS_REPL_SHELL wins by being
+        later; and skipped entirely when the caller already spelled either half
+        of the pair, so EXTRADEFINES never carries both.
         """
+        def macro(a):
+            return a[2:].split("=", 1)[0]
+
+        spoken = {macro(a) for a in user_args if a.startswith(("-D", "-U"))}
+        defaults = [d for d in BuildMixin.LOADER_DEFAULT_DEFINES
+                    if macro(d) not in spoken]
+        return defaults + list(user_args)
+
+    def _announce_loader_variant(self, loader_name, extras):
+        """Say WHICH etcs this build produced, because the file cannot."""
         if loader_name != "etcs":
             return
-        repl = any("ETCS_REPL_SHELL" in str(a) for a in (extras or []))
         art = "bin/etcs.js" if self._is_web_build(extras) else "bin/etcs"
-        if repl:
-            print(f"{GREEN}[=] {art} is the INTERACTIVE loader "
-                  f"(-DETCS_REPL_SHELL).{RESET}")
-        else:
+        joined = " ".join(str(a) for a in (extras or []))
+        if "-UETCS_REPL_SHELL" in joined:
             print(f"{YELLOW}[=] {art} is the DAEMON loader -- no REPL shell. "
                   f"A script runs and then drains.{RESET}")
-            print(f"    {DIM}For the interactive one: "
-                  f"ace make loader etcs -DETCS_REPL_SHELL{RESET}")
+        else:
+            print(f"{GREEN}[=] {art} is the INTERACTIVE loader "
+                  f"(-DETCS_REPL_SHELL).{RESET}")
 
     def _drop_stale_artifact(self, name, extras, kind="module"):
         """Remove what a FAILED build left behind in bin/.
@@ -322,11 +348,122 @@ class BuildMixin:
                 except OSError as ex:
                     print(f"{RED}[-] could not remove stale bin/{n}: {ex}{RESET}")
 
+    # ================================================================
+    # Parallelism
+    # ================================================================
+
+    @staticmethod
+    def _host_cores():
+        """Cores this process may actually run on, not cores the box has.
+
+        sched_getaffinity is the honest number inside a container or under
+        taskset, where cpu_count reports the host and a build sized by it
+        oversubscribes a two-core cgroup by an order of magnitude.
+        """
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except (AttributeError, OSError):
+            return max(1, os.cpu_count() or 1)
+
+    def _job_count(self):
+        """How many things ace builds at once -- the one number, for both halves.
+
+        Every core by default, which is the whole point; ACE_JOBS overrides it,
+        and ACE_JOBS=1 is a serial build, which is how you read an error log that
+        several compilers would otherwise be interleaving.
+        """
+        override = os.environ.get("ACE_JOBS", "").strip()
+        if not override:
+            return self._host_cores()
+        try:
+            n = int(override)
+        except ValueError:
+            print(f"{YELLOW}[!] ACE_JOBS={override!r} is not a number -- "
+                  f"using the core count.{RESET}")
+            return self._host_cores()
+        return max(1, n)
+
+    def _job_args(self, extra_args=()):
+        """make's -j, or nothing when someone has already decided.
+
+        THREE WAYS TO NOT DECIDE HERE, in the order they are checked:
+
+          a -j/--jobs already in extra_args   the caller asked for a number;
+                                              a second -j silently wins and
+                                              would override it
+          -j already in MAKEFLAGS             ace was invoked from inside a
+                                              make, which hands its job SERVER
+                                              down through MAKEFLAGS -- adding
+                                              our own here detaches this
+                                              sub-make from it and the two
+                                              pools multiply
+          one job                             ACE_JOBS=1; -j1 and no flag are
+                                              the same build, and the flag would
+                                              only claim a decision was made
+
+        Bare `-j` is deliberately not used: unbounded make on a linker-heavy
+        tree is how a build ends as the OOM killer's problem instead of the
+        compiler's.
+        """
+        for a in extra_args:
+            if a == "-j" or a.startswith("-j") or a.startswith("--jobs"):
+                return []
+        if any(f == "-j" or f.startswith("-j") or f.startswith("--jobs")
+               for f in os.environ.get("MAKEFLAGS", "").split()):
+            return []
+        n = self._job_count()
+        return [] if n <= 1 else [f"-j{n}"]
+
+    def _build_modules_concurrently(self, mods, extras):
+        """Build these modules at once, bounded by the cores available.
+
+        Returns [(module, ok)] in the order given.
+
+        OUTPUT IS HELD AND PRINTED WHOLE, one block per module. Streaming it
+        would interleave several compilers' diagnostics exactly when it matters,
+        which is when one of them is the error -- and a wall of warnings whose
+        module cannot be told apart is the same as no output. The blocks are
+        printed in the order asked for rather than the order they finish, so two
+        runs of the same build produce logs that can be diffed.
+        """
+        if not mods:
+            return []
+        workers = max(1, min(self._job_count(), len(mods)))
+        if workers > 1:
+            print(f"{DIM}    parallel: {workers} modules at a time{RESET}")
+
+        def one(mod):
+            cmd = ["make", "-C", str(self.ace_root), f"ACE_ROOT={self.ace_root}",
+                   f"module_{mod}"] + list(extras)
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True)
+            except OSError as ex:
+                return False, f"[-] could not run make: {ex}\n"
+            return p.returncode == 0, (p.stdout or "") + (p.stderr or "")
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [(mod, pool.submit(one, mod)) for mod in mods]
+            out = []
+            for mod, fut in futures:
+                ok, log = fut.result()
+                mark = f"{CYAN}{mod}{RESET}" if ok else f"{RED}{mod}{RESET}"
+                print(f"\n--- {mark} ---")
+                if log.strip():
+                    print(log.rstrip())
+                out.append((mod, ok))
+        return out
+
     def _run_root_make(self, target, extra_args=None, keep_going=False):
         """Run a target against the master Makefile at ace_root with extra flags.
 
         keep_going passes make's -k, so one module's failure does not abort its
         siblings -- their builds are unrelated to the failed one.
+
+        -j GOES ON THE ROOT INVOCATION AND NOWHERE ELSE. Every sub-make below
+        this one inherits the job server through MAKEFLAGS, so one flag here
+        parallelises modules against each other and loaders against each other
+        without any Makefile passing anything on by hand -- and without the two
+        levels each opening a pool of their own.
         """
         if extra_args is None:
             extra_args = []
@@ -338,6 +475,10 @@ class BuildMixin:
 
         print(f"[*] Routing to master Makefile for target: {target}")
         make_cmd = ["make", "-C", str(self.ace_root), f"ACE_ROOT={self.ace_root}", target]
+        jobs = self._job_args(extra_args)
+        if jobs:
+            print(f"{DIM}    parallel: make {jobs[0]}{RESET}")
+        make_cmd.extend(jobs)
         if keep_going:
             make_cmd.append("-k")
         make_cmd.extend(extra_args)
@@ -383,7 +524,19 @@ class BuildMixin:
         # probe sweep, on every subsequent build.
         self._deps_first_run()
 
-        self._run_root_make("generate_hashes")
+        # ONCE, HERE, AND THEN DECLARED DONE.
+        #
+        # module_%, modules and loaders all name generate_hashes as a
+        # prerequisite, so the pass used to run again for every one of them --
+        # an openssl invocation per header in ontology/, libs/ and core/, times
+        # the number of modules. Harmless while the modules were built in
+        # series; a correctness problem the moment they are not, because N
+        # processes then rewrite the same three headers while N compiles read
+        # them. ACE_HASHES_READY (see the master Makefile's HASH_PREREQ) is how
+        # the phase says it has happened, and it goes in the environment so that
+        # every make below inherits it without a flag being threaded through.
+        if self._run_root_make("generate_hashes"):
+            os.environ["ACE_HASHES_READY"] = "1"
         try:
             if args[0] == "loader":
                 if len(args) >= 2:
@@ -392,14 +545,10 @@ class BuildMixin:
                 else:
                     loader_name = "etcs"
                     user_args = []
-                # -DETCS_REPL_SHELL is on by default (loader runs interactively),
-                # but OFF when the user explicitly names 'etcs' -- that path is
-                # for building the core loader without the REPL shell wired in.
-                explicitly_etcs = len(args) >= 2 and loader_name == "etcs"
-                if explicitly_etcs:
-                    extras = self._validate_make_args(user_args)
-                else:
-                    extras = self._validate_make_args(["-DETCS_REPL_SHELL"] + user_args)
+                # Unconditional now, including when 'etcs' is named explicitly:
+                # see LOADER_DEFAULT_DEFINES for what that spelling used to mean
+                # and why -UETCS_REPL_SHELL replaced it.
+                extras = self._validate_make_args(self._loader_extras(user_args))
                 print("With extras: ")
                 for i in extras:
                     print(i)
@@ -417,12 +566,14 @@ class BuildMixin:
                 # overwritten when present.
                 self.ensure_loaders_makefile()
                 print(f"[*] Building loader: {loader_name}")
+                # FILE= narrows the sources to one, but `all` still links that
+                # loader AND etcs, so -j has two things to overlap here.
                 make_cmd = [
                     "make",
                     "-C", str(loaders_dir),
                     f"ACE_ROOT={self.ace_root}",
                     f"FILE={loader_name}",
-                ] + extras
+                ] + self._job_args(extras) + extras
                 try:
                     subprocess.run(make_cmd, check=True)
                 except subprocess.CalledProcessError as e:
@@ -492,28 +643,36 @@ class BuildMixin:
                               f"{' '.join(extras)}{RESET}")
                     print()
 
-                # ...then build each, with its own pre/post ABI diff so the
-                # per-module reminder still pops regardless of batch size.
+                # ...then build them, with a pre/post ABI diff around the batch
+                # so the per-module reminder still pops regardless of batch size.
+                #
+                # THE THREE STEPS ARE PHASES, not a per-module cycle, because the
+                # builds in the middle now run concurrently. pre-build still means
+                # "before this build" and post-build still means "the drift this
+                # build produced" -- the pairing is over the batch instead of over
+                # one module, which is what it already meant for a batch of one.
                 failed = []
+                # Generated Makefiles are build artifacts and gitignored, so a
+                # fresh clone has none. Regenerating a MISSING one here is what
+                # makes that a non-event; an existing one is never touched, so a
+                # module that predates its manifest keeps building until someone
+                # migrates it deliberately.
                 for mod in mods:
-                    # Generated Makefiles are build artifacts and gitignored,
-                    # so a fresh clone has none. Regenerating a MISSING one
-                    # here is what makes that a non-event; an existing one is
-                    # never touched, so a module that predates its manifest
-                    # keeps building until someone migrates it deliberately.
                     self.ensure_makefile(mod)
-                    # nm cannot read wasm: ELF-side ABI introspection is
-                    # skipped for web builds rather than run to failure.
-                    web = self._is_web_build(extras)
+                # nm cannot read wasm: ELF-side ABI introspection is skipped for
+                # web builds rather than run to failure.
+                web = self._is_web_build(extras)
+                for mod in mods:
                     if web:
                         print(f"[*] {mod}: web build -- ABI introspection skipped.")
                     else:
                         print(f"[*] Current ABI interface for {mod} (pre-build):")
                         self.introspect_and_record(mod, announce=True)
-                    ok = self._run_root_make(f"module_{mod}", extra_args=extras)
+
+                results = self._build_modules_concurrently(mods, extras)
+
+                for mod, ok in results:
                     if not web:
-                        # Announced, not silent: the post-build pass is the
-                        # drift THIS build just produced, not stale news.
                         print(f"[*] ABI interface for {mod} (post-build):")
                         self.introspect_and_record(mod, announce=True)
                     # A named module is ALWAYS built -- asking for it by name
@@ -565,6 +724,11 @@ class BuildMixin:
 
             if args[0] in self.root_make_targets:
                 extras = self._validate_make_args(args[1:])
+                # The loader half of a batch gets the loader's own defines; the
+                # module half must NOT, since a module compiled with
+                # -DETCS_REPL_SHELL is a different fingerprint for no reason.
+                loader_extras = self._validate_make_args(
+                    self._loader_extras(args[1:]))
                 batch = args[0] in ("all", "modules")
 
                 # Regenerate BEFORE make is invoked, not during.
@@ -625,8 +789,23 @@ class BuildMixin:
                         print("[!] No modules found to build.")
                     print()
 
-                    for mod, _ in build:
-                        if self._run_root_make(f"module_{mod}", extra_args=extras):
+                    # ONE MODULE PER CORE, not one module at a time.
+                    #
+                    # A module is a single translation unit, so make's -j has
+                    # nothing to overlap INSIDE one; all of the concurrency this
+                    # tree has is BETWEEN modules, and this loop is where it was
+                    # being thrown away -- every module waited for the previous
+                    # module's link. The skip logic above is untouched: only the
+                    # modules that were already going to build are what run here.
+                    #
+                    # Each module's dependencies live under its own directory and
+                    # its artifacts are its own name, so the makes do not collide;
+                    # the one thing they SHARE is the generated hash headers, and
+                    # those are written once before this point (ACE_HASHES_READY).
+                    results = self._build_modules_concurrently(
+                        [mod for mod, _ in build], extras)
+                    for mod, ok in results:
+                        if ok:
                             self._record_module_fingerprint(mod, extras)
                         else:
                             # No record at all -- the next run rebuilds it, and
@@ -656,15 +835,11 @@ class BuildMixin:
                     # that every module is compared AGAINST at load time, so a
                     # stale loader does not merely miss a change -- it refuses
                     # every module built after it. It is also one link.
-                    if not self._run_root_make("loaders", extra_args=extras):
+                    if not self._run_root_make("loaders", extra_args=loader_extras):
                         failed.append("loaders")
-                        self._drop_stale_artifact("etcs", extras, "loader")
+                        self._drop_stale_artifact("etcs", loader_extras, "loader")
                     else:
-                        # This batch passes no -DETCS_REPL_SHELL, so `ace make
-                        # all` emits the DRAINING etcs. Said out loud because
-                        # the artifact cannot say it -- see
-                        # _announce_loader_variant.
-                        self._announce_loader_variant("etcs", extras)
+                        self._announce_loader_variant("etcs", loader_extras)
                 if failed:
                     return 1
                 return 0

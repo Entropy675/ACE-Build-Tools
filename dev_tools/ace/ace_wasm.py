@@ -283,7 +283,9 @@ class WasmMixin:
         modules that were never meant to cross. This selects instead of failing.
 
         Ordinary flags still pass through, so `ace wasm make loaders
-        -DETCS_REPL_SHELL` behaves exactly as the native spelling does.
+        -UETCS_REPL_SHELL` behaves exactly as the native spelling does -- including
+        the loader defines, which the build subsystem adds on either path
+        (BuildMixin.LOADER_DEFAULT_DEFINES).
         """
         if not args:
             print("    Usage: ace wasm make { all | modules | loaders | module <n> "
