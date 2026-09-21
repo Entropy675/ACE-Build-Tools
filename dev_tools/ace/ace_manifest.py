@@ -733,7 +733,8 @@ class ManifestMixin:
 
             sources = prov.get("sources")
             if sources:
-                globs = " ".join(f"$(wildcard $({v}_DIR)/{g})" for g in sources.get("include", []))
+                globs = " ".join(self._dep_source_expr(v, g)
+                                 for g in sources.get("include", []))
                 expr = globs
                 if sources.get("exclude"):
                     ex = " ".join(f"$({v}_DIR)/{e}" for e in sources["exclude"])
@@ -1264,6 +1265,29 @@ class ManifestMixin:
         lines.append("")
         return "\n".join(lines)
 
+    @staticmethod
+    def _dep_source_expr(v, pattern):
+        """One entry of a vendor dep's `provides.sources.include`, as make sees it.
+
+        A PATTERN GOES THROUGH $(wildcard); A NAME DOES NOT, and that is the
+        whole of this function. $(wildcard) answers with what is on disk AT
+        PARSE TIME, and a vendored build's own output is not there yet on the
+        run that produces it -- sqlite's `sqlite3.c` is written by the
+        amalgamation step this same Makefile runs. Wrapped in $(wildcard), the
+        object list comes out EMPTY on a fresh tree, so the dependency is never
+        compiled and never linked, and the build succeeds at doing nothing;
+        run it a second time and it works, which is the shape of the bug that
+        makes it so hard to see.
+
+        Named literally, the object exists in the list before its source does,
+        the order-only gate on the dep's build marker makes the source appear
+        first, and one run is enough. Anything containing a glob character is
+        genuinely a question about the tree and still gets asked that way.
+        """
+        return (f"$(wildcard $({v}_DIR)/{pattern})"
+                if any(c in pattern for c in "*?[")
+                else f"$({v}_DIR)/{pattern}")
+
     def _emit_obj_rule(self, v, dep, sources, gate=None):
         # Own flags, plus the ABI defines (these objects are linked INTO the
         # module, so they must agree with it) and the sanitizer -- these are
@@ -1277,11 +1301,27 @@ class ManifestMixin:
         for ext, comp in ((".c", "$(CC)"), (".cc", "$(CXX)")):
             # BUILD_STAMP real, gates order-only: the stamp must force a
             # recompile when flags change; the gates only have to exist first.
-            gates = (" | " + " ".join(gate)) if gate else ""
+            #
+            # .ace_obj IS ONE OF THOSE GATES, rather than an mkdir inside the
+            # recipe, and the difference shows up only under -j. A recipe that
+            # makes its own output directory is correct exactly once: every
+            # other job compiling into the same directory races it, and a
+            # compiler that has already opened its temp file there fails at the
+            # RENAME rather than at the open -- "unable to rename temporary
+            # ... No such file or directory", which reads like a missing source
+            # and is not one. As an order-only prerequisite the directory is
+            # make's problem: it is created once, before any recipe that needs
+            # it starts, and never again.
+            gates = " | " + " ".join(list(gate or []) + [".ace_obj"])
             lines.append(f".ace_obj/{v}_%.o: $({v}_DIR)/%{ext} $(BUILD_STAMP){gates}")
-            lines.append("\t@mkdir -p $(dir $@)")
             lines.append(f"\t{comp} {cflags} -c $< -o $@")
             lines.append("")
+        # Order-only prerequisites are not remade when they are out of date,
+        # only when they are ABSENT -- which is what a directory wants, since
+        # its mtime changes every time a file lands in it.
+        lines.append(".ace_obj:")
+        lines.append("\t@mkdir -p $@")
+        lines.append("")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
