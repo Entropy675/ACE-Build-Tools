@@ -30,7 +30,29 @@
           "probe": "binary:git"
         }
       ]
-    }
+    },
+    "vendor": [
+      {
+        "name": "stb",
+        "_comment": "stb_image (PNG/JPEG/BMP/GIF/TGA in) and stb_image_write (PNG out): two public-domain single headers, pinned. Header-only, so no build step; the implementation is compiled once, in PaintProvider.cc.",
+        "source": {
+          "type": "git",
+          "url": "https://github.com/nothings/stb.git",
+          "ref": "2c980bb59875b0d32144a71867fbdebb2f77cd20",
+          "shallow": true
+        },
+        "build": {
+          "system": "none"
+        },
+        "arch_sensitive": false,
+        "hash_scope": false,
+        "provides": {
+          "include": [
+            "."
+          ]
+        }
+      }
+    ]
   },
   "build": {
     "Linux": {
