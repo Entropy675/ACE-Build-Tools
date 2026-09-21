@@ -83,6 +83,22 @@ BASE_LOADER_CXXFLAGS = [
     "-DETCS_LOADER", r'-DETCS_MODULE_NAME=\"ROOT\"',
 ]
 
+# WHERE THE TREE IS, ANSWERED BY THE THING THAT KNOWS.
+#
+# ACE_ROOT is an ACE concept -- this tool is what locates the tree, and every
+# generated Makefile already sits inside it. So the runtime is TOLD, at build
+# time, rather than asking: core/CommandExecutor.h used to popen `ace root`
+# from inside the process to expand ACE_ROOT in a script statement, which put
+# a python CLI on the critical path of a running server and failed silently
+# wherever `ace` was not on that process's PATH -- a systemd unit, a stripped
+# shell, a container. Baked in, it also joins the build fingerprint, so a tree
+# that MOVED rebuilds instead of resolving to where it used to be.
+#
+# Absolute and computed here, not $(shell ace root) in the Makefile: a
+# subprocess per build is the same mistake one layer up, and the value is
+# already in hand.
+ACE_ROOT_DEFINE = r'-DETCS_ACE_ROOT=\"{root}\"'
+
 # The line every generated Makefile opens with, and the ONLY thing that
 # authorises this tool to delete one. A hand-written Makefile -- a module not
 # yet migrated, or one someone deliberately kept -- has no such line and is
@@ -777,6 +793,7 @@ class ManifestMixin:
         # ---- flags --------------------------------------------------------
         cxx = [f.format(std=std) for f in BASE_CXXFLAGS]
         cxx.append(r'-DETCS_MODULE_NAME=\"$(TARGET_BASE_NAME)\"')
+        cxx.append(ACE_ROOT_DEFINE.format(root=str(self.ace_root)))
         cxx += ["-I.", "-I../.."]
         # Vendored -I flags are emitted inside the platform blocks, not here:
         # CXXFLAGS is simply expanded at this point, so a global -I could
@@ -1635,6 +1652,9 @@ class ManifestMixin:
         w("")
         cxx = [f.format(std=default.get("loader", {}).get("std", "c++17"))
                for f in BASE_LOADER_CXXFLAGS]
+        # The loader needs it more than any module does: the executor that
+        # expands ACE_ROOT in a script statement lives in it. See ACE_ROOT_DEFINE.
+        cxx.append(ACE_ROOT_DEFINE.format(root=str(self.ace_root)))
         cxx += [f"-D{d}" for d in common.get("defines", [])]
         cxx += common.get("cxxflags", [])
         cxx += ["$(DEBUGFLAGS)", "$(SANITIZE)"]
