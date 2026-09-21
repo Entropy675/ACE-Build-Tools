@@ -346,9 +346,10 @@ class BuildMixin:
         """Remove what a FAILED build left behind in bin/.
 
         A build that fails leaves the PREVIOUS artifact sitting there, and
-        nothing downstream can tell the difference: copying bin/*.wasm into a
-        page, or serving it, then ships a binary that does not match the source
-        it was built from. That is the worst shape a build failure can take --
+        nothing downstream can tell the difference: serving bin/wasm/ then ships
+        a binary that does not match the source it was built from -- and now that
+        a page mounts that directory rather than holding its own copy, one stale
+        file reaches every page at once. That is the worst shape a build failure can take --
         it does not look like one. Staging a stale module beside fresh ones is
         also how a manifest-epoch mismatch appears at runtime instead of here.
 
@@ -356,10 +357,16 @@ class BuildMixin:
         loudly for a missing file, which every consumer already handles, rather
         than succeed against something older than the tree.
         """
-        bin_dir = self.ace_root / "bin"
+        web = self._is_web_build(extras)
+        # bin/wasm/ on the web path, bin/ otherwise -- the same split the copy
+        # targets make (ARTIFACT_DIR in loaders/Makefile, WASM_DIR in ETCS's
+        # Makefile). Looking in bin/ for a web artifact would find nothing and
+        # leave the stale one in bin/wasm/ exactly where a page mounts it, which
+        # is the failure this whole function exists to prevent.
+        bin_dir = self.ace_root / "bin" / "wasm" if web else self.ace_root / "bin"
         if not bin_dir.is_dir():
             return
-        web = self._is_web_build(extras)
+        rel = bin_dir.name if not web else "bin/wasm"
         if kind == "loader":
             names = [f"{name}.js", f"{name}.wasm"] if web else [name]
         else:
@@ -369,10 +376,10 @@ class BuildMixin:
             if art.exists():
                 try:
                     art.unlink()
-                    print(f"{YELLOW}[!] removed stale bin/{n} -- the build that "
+                    print(f"{YELLOW}[!] removed stale {rel}/{n} -- the build that "
                           f"should have replaced it failed.{RESET}")
                 except OSError as ex:
-                    print(f"{RED}[-] could not remove stale bin/{n}: {ex}{RESET}")
+                    print(f"{RED}[-] could not remove stale {rel}/{n}: {ex}{RESET}")
 
     # ================================================================
     # Parallelism

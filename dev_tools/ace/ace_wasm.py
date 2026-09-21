@@ -352,11 +352,31 @@ class WasmMixin:
     # ── link check ───────────────────────────────────────────────────────────
 
     def _web_artifacts(self):
-        """(main, [sides], glue) from bin/, which is where copy_loaders puts them."""
-        bin_dir = self.ace_root / "bin"
-        main = bin_dir / "etcs.wasm"
-        glue = bin_dir / "etcs.js"
-        sides = sorted(p for p in bin_dir.glob("*.wasm") if p != main)
+        """(main, [sides], glue) from bin/wasm/, which is where the web copy
+        targets put them -- ARTIFACT_DIR in loaders/Makefile and WASM_DIR in
+        ETCS's own Makefile, both bin/wasm.
+
+        SEPARATE FROM bin/ so a page can be pointed at one directory that holds
+        nothing but web artifacts, instead of each page keeping its own copy and
+        going stale. The glob below is the other half of why: in bin/ it had to
+        be read as "every .wasm here is a side module", which is only true as
+        long as nothing else ever writes a .wasm there.
+
+        bin/ is still checked as a fallback, so a tree built before the split
+        reports a real link check rather than "no artifacts". That fallback is
+        for one build's worth of overlap and nothing depends on it."""
+        wasm_dir = self.ace_root / "bin" / "wasm"
+        if not (wasm_dir / "etcs.wasm").exists():
+            legacy = self.ace_root / "bin"
+            if (legacy / "etcs.wasm").exists():
+                print(f"{YELLOW}[!] web artifacts found in bin/, not bin/wasm/ -- "
+                      f"that tree predates the split. `ace wasm make loader etcs` "
+                      f"puts them in bin/wasm/ now, which is the directory a serve "
+                      f"script mounts.{RESET}")
+                wasm_dir = legacy
+        main = wasm_dir / "etcs.wasm"
+        glue = wasm_dir / "etcs.js"
+        sides = sorted(p for p in wasm_dir.glob("*.wasm") if p != main)
         return main, sides, (glue if glue.exists() else None)
 
     def wasm_link(self, args, quiet_when_clean=False):
