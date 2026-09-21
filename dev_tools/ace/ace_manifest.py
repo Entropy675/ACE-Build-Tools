@@ -79,7 +79,7 @@ BASE_CXXFLAGS = [
 # arena's own translation unit, not a module.
 BASE_LOADER_CXXFLAGS = [
     "-std={std}", "-fvisibility=hidden", "-fpermissive", "-Wall",
-    "-Wextra", "-O2", "-I../..", "-pipe", "-fno-plt",
+    "-Wextra", "-O2", "-I../..", "-pipe", "$(PLT_FLAGS)",
     "-DETCS_LOADER", r'-DETCS_MODULE_NAME=\"ROOT\"',
 ]
 
@@ -653,8 +653,11 @@ class ManifestMixin:
         w("# otherwise share a stamp and switching between them would relink")
         w("# nothing.")
         w("PLATFORM_TAG :=")
+        w("PLT_FLAGS := -fno-plt")
         w("ifdef EMSCRIPTEN")
         w("  PLATFORM_TAG := _web")
+        w("  # wasm has no procedure linkage table -- see CXXFLAGS.")
+        w("  PLT_FLAGS :=")
         w("endif")
         w(f"BUILD_STAMP := .ace_build_$(ARCH)$(PLATFORM_TAG)$(DBG_SUFFIX)$(SAN_SUFFIX){abi_tag}")
         w("")
@@ -698,7 +701,13 @@ class ManifestMixin:
                 w(f"{v}_DIR := {dep['name']}")
             w("")
 
-            incs = [f"-I$({v}_DIR)/{inc}" if inc != "." else f"-I$({v}_DIR)"
+            # -isystem, NOT -I. A vendored dependency's headers are read, not
+            # maintained, here: stb_image_write alone accounts for eight
+            # -Wmissing-field-initializers in every build that includes it, and
+            # a warning nobody in this tree can act on is a warning that
+            # teaches people to scroll past the ones they can. -isystem keeps
+            # the header on the path and takes it off the report.
+            incs = [f"-isystem $({v}_DIR)/{inc}" if inc != "." else f"-isystem $({v}_DIR)"
                     for inc in prov.get("include", [])]
             dep_carriage.append((v, carried(dep["name"]), incs))
 
@@ -778,7 +787,11 @@ class ManifestMixin:
         cxx += [f"-D{d}" for d in abi_defines]
         cxx += [f"-D{d}" for d in common.get("defines", [])]
         cxx += common.get("cxxflags", [])
-        cxx += ["-pipe", "-fno-plt", "$(DEBUGFLAGS)", "$(SANITIZE)",
+        # -fno-plt ONLY WHERE THERE IS A PLT. It is about the ELF procedure
+        # linkage table; wasm has none, so emscripten's clang accepts the flag,
+        # ignores it, and says "argument unused during compilation" once per
+        # translation unit. Native builds still get it.
+        cxx += ["-pipe", "$(PLT_FLAGS)", "$(DEBUGFLAGS)", "$(SANITIZE)",
                 "$(CUSTOM_CXXFLAGS)"]
         w("CXXFLAGS := " + " \\\n            ".join(cxx))
         w("")
@@ -1053,7 +1066,26 @@ class ManifestMixin:
         L.extend(obj_rules)
 
         # ---- hashes -------------------------------------------------------
-        w("$(HASH_HEADER): $(MODULE_HEADERS)")
+        # Two kinds, in one generated header. The per-FILE digests below are
+        # the epoch check (compareManifests, core/Bundles.h): does this module
+        # agree with its loader about the contract headers. The per-REGION
+        # digests appended after them are what the ABI's <Tag>_<Action>_GetHash
+        # actually returns -- one SHA-256 per work/stream body, which is the
+        # only way those exports can say anything about the function they are
+        # named after (the macro cannot see its own body; ace_hash.py explains).
+        #
+        # SOURCES AS WELL AS HEADERS, because work functions live in both.
+        #
+        # A missing `ace` is a warning, not a build failure: the header stays
+        # valid, the digests are simply absent, and every GetHash says 0 and
+        # logs why (ETCS::etcs_region_hash) rather than quietly handing back
+        # something that is not a content hash.
+        w("ACE_HASH_REGIONS ?= ace hash regions")
+        w("")
+        # Makefile, for the same reason BUILD_STAMP lists it: when the RULE
+        # changes -- a new kind of digest appended here, say -- an existing
+        # header is newer than every source and make would keep it.
+        w("$(HASH_HEADER): $(MODULE_HEADERS) $(SRC_MODULE) Makefile")
         w('\t@echo "// Generated Registration - do not edit" > $@')
         w("\t@for f in $(MODULE_HEADERS); do \\")
         w("\t    HASH=$$(cat $$f | openssl dgst -sha256 | awk '{print $$NF}'); \\")
@@ -1064,6 +1096,10 @@ class ManifestMixin:
           "ETCS::Entity::getManifest()[\"%s\"] = \"%s\"; return true; }();\\n' "
           "\"$$VAR_NAME\" \"$$FULL_NAME\" \"$$HASH\" >> $@; \\")
         w("\tdone")
+        w("\t@$(ACE_HASH_REGIONS) --out $@ --append $(MODULE_HEADERS) $(SRC_MODULE) \\")
+        w("\t  || { echo \"[!] $(ACE_HASH_REGIONS) unavailable -- no work-region digests \\")
+        w("\t            (every <Tag>_<Action>_GetHash will report 0).\"; \\")
+        w("\t       echo \"// no work-region digests: ace was not on PATH at build time\" >> $@; }")
         w("")
 
         # ---- link ---------------------------------------------------------
@@ -1550,6 +1586,13 @@ class ManifestMixin:
         w("endif")
         w("")
 
+        # As in a module's Makefile: -fno-plt is an ELF flag, and emscripten's
+        # clang accepts it, drops it and says so once per translation unit.
+        w("PLT_FLAGS := -fno-plt")
+        w("ifdef EMSCRIPTEN")
+        w("  PLT_FLAGS :=")
+        w("endif")
+        w("")
         cxx = [f.format(std=default.get("loader", {}).get("std", "c++17"))
                for f in BASE_LOADER_CXXFLAGS]
         cxx += [f"-D{d}" for d in common.get("defines", [])]

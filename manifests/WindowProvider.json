@@ -306,9 +306,7 @@
     },
     "Web": {
       "compiler": "em++",
-      "cxxflags": [
-        "-sUSE_GLFW=3"
-      ],
+      "_comment": "USE_GLFW is a LINK setting; emscripten ignores it during compilation and says so once per translation unit, so it is not repeated in cxxflags.",
       "ldflags": [
         "-sUSE_GLFW=3"
       ]
