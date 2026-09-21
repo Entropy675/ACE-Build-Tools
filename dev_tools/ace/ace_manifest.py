@@ -850,6 +850,15 @@ class ManifestMixin:
                 # Vendored C compiles through $(CC); a native gcc object
                 # cannot link into a wasm side module.
                 w(f"    CC := {blk.get('cc', 'emcc')}")
+                # AND WITH THE MODULE'S TARGET FEATURES. A vendored object is
+                # compiled "with its own flags, not the module's" (see the obj
+                # rule), which is right for optimisation and defines and wrong
+                # for -pthread: a threaded module is linked --shared-memory, and
+                # wasm-ld refuses any object in it that was not compiled with
+                # atomics and bulk-memory -- which is what -pthread turns on.
+                # So the one flag that is a TARGET rather than a preference is
+                # carried to every vendored object here.
+                w("    DEP_TARGET_FLAGS := -pthread -fPIC")
                 # em++ is the Web default, like emcc above: manifests name a
                 # compiler only when it is NOT em++.
                 if not blk.get("compiler"):
@@ -1026,7 +1035,15 @@ class ManifestMixin:
             w("\t@:")
         w("")
 
-        w("$(BUILD_STAMP):")
+        # ON THE MAKEFILE, so a REGENERATED Makefile is a new build. The stamp
+        # is keyed by platform, debug and sanitizer -- the things a caller
+        # changes on the command line -- and had no way to notice the file it
+        # lives in changing under it: a vendored object compiled under the old
+        # rule stayed newer than its source and was linked, flags and all, into
+        # a module built under the new one. ace regenerates this file whenever
+        # the generator's output changes (ensure_makefile), and this is the other
+        # half of that: the regeneration reaches the objects.
+        w("$(BUILD_STAMP): Makefile")
         w("\t@rm -f .ace_build_*")
         w("\t@touch $@")
         w("")
@@ -1218,7 +1235,7 @@ class ManifestMixin:
         # module rather than DEP_SANITIZE.
         abi = " ".join(f"-D{d}" for d in dep.get("abi_defines", []))
         cflags = " ".join(x for x in (" ".join(sources.get("cflags", [])),
-                                      abi, "$(SANITIZE)") if x)
+                                      abi, "$(SANITIZE)", "$(DEP_TARGET_FLAGS)") if x)
         lines = []
         lines.append(f"# {dep['name']}: compiled with its own flags, not the module's")
         for ext, comp in ((".c", "$(CC)"), (".cc", "$(CXX)")):
@@ -1408,7 +1425,10 @@ class ManifestMixin:
     # imports for glfwCreateWindow and the rest, but -sSIDE_MODULE emits no
     # JavaScript at all, so library_glfw.js never arrives. Only the MAIN module
     # has glue, so only the main link can carry these.
-    _WEB_JSLIB_PREFIXES = ("-sUSE_",)
+    # -l<name>.js is the other spelling emscripten has for a JS library --
+    # IDBFS, NODEFS, WORKERFS and their kin ship as -lidbfs.js -- and it is a
+    # library the MAIN link owns for exactly the reason -sUSE_* is.
+    _WEB_JSLIB_PREFIXES = ("-sUSE_", "-l")
     _WEB_JSLIB_EXACT = (
         "-sFULL_ES2", "-sFULL_ES3", "-sLEGACY_GL_EMULATION",
         "-sGL_ENABLE_GET_PROC_ADDRESS", "-sOFFSCREEN_FRAMEBUFFER",
@@ -1465,6 +1485,8 @@ class ManifestMixin:
                 if not (f.startswith(self._WEB_JSLIB_PREFIXES)
                         or base in self._WEB_JSLIB_EXACT):
                     continue
+                if f.startswith("-l") and not f.endswith(".js"):
+                    continue                         # a native library, not glue
                 if f not in flags:
                     flags.append(f)
                     sources[f] = entry.name
