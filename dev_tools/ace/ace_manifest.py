@@ -1268,21 +1268,46 @@ class ManifestMixin:
         return True
 
     def ensure_makefile(self, module):
-        """Regenerate a missing Makefile. Called on the build path.
+        """Regenerate a missing OR STALE Makefile. Called on the build path.
 
         Generated Makefiles are gitignored, so a fresh clone has none. This is
-        what makes that a non-event rather than a build failure. An existing
-        Makefile is never overwritten here -- only `--force` does that, so a
-        module that predates its manifest keeps building until someone
-        deliberately migrates it.
+        what makes that a non-event rather than a build failure.
+
+        STALE MEANS: the generator, given this manifest, no longer produces the
+        text that is on disk. The file is by contract a pure function of the two
+        (its header says so, and generation is deterministic), so when the
+        function's output changes the file is simply wrong -- and "regenerate
+        only when missing" left it wrong silently. That is how a pull that
+        changed the emscripten link flags built every module with the OLD flags
+        and had the loader refuse all of them at registration, with nothing to
+        say that the Makefile on disk was the cause. Comparing costs one
+        generation per module per build, which is milliseconds.
+
+        A module with no manifest is untouched: there is nothing to compare
+        against, and such a module keeps building from whatever it has until
+        someone migrates it deliberately.
         """
         if not self.has_manifest(module):
             return False
         makefile = self._module_dir(module) / "Makefile"
-        if makefile.exists():
+        if not makefile.exists():
+            print(f"[*] {module}/Makefile is missing -- regenerating from manifest.")
+            return self.generate_makefile(module, quiet=False)
+        if self._makefile_is_current(module, makefile):
             return False
-        print(f"[*] {module}/Makefile is missing -- regenerating from manifest.")
-        return self.generate_makefile(module, quiet=False)
+        print(f"{YELLOW}[!] {module}/Makefile is STALE -- the generator's output has "
+              f"changed since it was written. Regenerating.{RESET}")
+        return self.generate_makefile(module, force=True, quiet=False)
+
+    def _makefile_is_current(self, module, makefile):
+        """Does the generator reproduce the file on disk, byte for byte?"""
+        try:
+            m = self.load_manifest(module, resolve_pins=True, silent=True)
+            return makefile.read_text() == self._emit_makefile(m)
+        except Exception:
+            # A manifest that will not load is generate_makefile's problem to
+            # report, not this check's to guess at: leave the file alone.
+            return True
 
     # ------------------------------------------------------------------
     # loaders
@@ -1836,14 +1861,27 @@ class ManifestMixin:
         return True
 
     def ensure_loaders_makefile(self):
-        """Regenerate loaders/Makefile when missing. Build-path hook."""
-        default, _ = self._loader_manifests()
+        """Regenerate loaders/Makefile when missing or stale. Build-path hook.
+
+        Same rule as ensure_makefile, and this is the file the rule was learned
+        on: the stack size and visibility flags live in its emscripten block.
+        """
+        default, overrides = self._loader_manifests()
         if default is None:
             return False
-        if (self.ace_root / "loaders" / "Makefile").exists():
+        makefile = self.ace_root / "loaders" / "Makefile"
+        if not makefile.exists():
+            print("[*] loaders/Makefile is missing -- regenerating from manifests.")
+            return self.generate_loaders_makefile()
+        try:
+            current = makefile.read_text() == self._emit_loaders_makefile(default, overrides)
+        except Exception:
+            current = True
+        if current:
             return False
-        print("[*] loaders/Makefile is missing -- regenerating from manifests.")
-        return self.generate_loaders_makefile()
+        print(f"{YELLOW}[!] loaders/Makefile is STALE -- the generator's output has "
+              f"changed since it was written. Regenerating.{RESET}")
+        return self.generate_loaders_makefile(force=True)
 
     # ------------------------------------------------------------------
     # system packages, folded into the existing deps surface
