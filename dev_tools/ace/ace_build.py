@@ -18,6 +18,31 @@ import re
 from .ace_common import (CYAN, YELLOW, GREEN, RED, RESET, DIM)
 
 
+# THE VARIABLES A CALLER MAY SET ON AN ace make LINE.
+#
+# An allowlist rather than a filter, because the failure it prevents is not a
+# typo -- every one of these becomes a make variable in a recipe, so an
+# unbounded set is an unbounded way to rewrite the build. Names only; the VALUES
+# are still checked for shell metacharacters above.
+#
+# THE ETCS_WEB_* KNOBS ARE HERE BECAUSE THE GENERATED MAKEFILE ADVERTISES THEM.
+# Each one is documented in loaders/Makefile as a `make FILE=etcs EMSCRIPTEN=1
+# ETCS_WEB_x=...` line -- the whole point of `?=` on those defaults is that a
+# developer can try a variant without regenerating anything. Refusing them here
+# made the documented command fail, which is worse than not documenting it: it
+# reads as the override not existing rather than as one layer not knowing about
+# it. If a new ETCS_WEB_* default is added to that Makefile, it belongs here in
+# the same change.
+ACE_MAKE_VARS = frozenset({
+    "ACE_ROOT", "VERBOSE", "DEBUG", "ASAN", "TSAN", "LOG_TO_FILE", "EMSCRIPTEN",
+    # Web link knobs -- see loaders/Makefile's own comments for each.
+    "ETCS_WEB_MEMORY", "ETCS_WEB_POOL", "ETCS_WEB_JSLIBS",
+    # Per-loader link additions, kept OUT of LDFLAGS on purpose (see the
+    # generated Makefile). This is how --profiling-funcs is passed to keep the
+    # name section, which is what makes a wasm trace address resolvable.
+    "EXTRA_LINK",
+})
+
 class BuildMixin:
 
 
@@ -249,9 +274,10 @@ class BuildMixin:
 
             if '=' in arg:
                 key, val = arg.split('=', 1)
-                if key not in ['ACE_ROOT', 'VERBOSE', 'DEBUG', 'ASAN', 'TSAN',
-                                   'LOG_TO_FILE', 'EMSCRIPTEN']:
-                    raise ValueError(f"Disallowed variable: {key}")
+                if key not in ACE_MAKE_VARS:
+                    raise ValueError(
+                        f"Disallowed variable: {key} "
+                        f"(allowed: {', '.join(sorted(ACE_MAKE_VARS))})")
                 if key == 'EMSCRIPTEN' and val != '1':
                     raise ValueError("EMSCRIPTEN=1 is the only supported form")
                 validated.append(arg)
@@ -365,23 +391,67 @@ class BuildMixin:
         except (AttributeError, OSError):
             return max(1, os.cpu_count() or 1)
 
+    # What one link of this tree actually costs, measured rather than guessed:
+    # peak RSS during a wasm side-module link was ~1.19 GB and the MAIN_MODULE
+    # loader link ~0.93 GB (sampled once a second across both). wasm-ld and
+    # wasm-opt are the whole of it -- the node the toolchain also runs peaked at
+    # 16 MB, so this is not a JS heap problem and raising node's would fix
+    # nothing. Rounded UP, because the number is a peak on one tree and the
+    # thing it is protecting against is the OOM killer.
+    _LINK_MEM_BUDGET_MB = 1400
+
+    def _host_avail_mb(self):
+        """MemAvailable, or None where it cannot be read.
+
+        MemAvailable and not MemTotal: what matters is what can be handed out
+        now without reclaim, and on a developer's machine the difference is an
+        editor, a browser and a language server.
+        """
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) // 1024
+        except (OSError, ValueError, IndexError):
+            pass
+        return None
+
     def _job_count(self):
         """How many things ace builds at once -- the one number, for both halves.
 
-        Every core by default, which is the whole point; ACE_JOBS overrides it,
-        and ACE_JOBS=1 is a serial build, which is how you read an error log that
-        several compilers would otherwise be interleaving.
+        BOUNDED BY MEMORY AS WELL AS BY CORES, and the memory bound is the one
+        that bites. A core count is how many compilers can make progress; it
+        says nothing about how many can fit. Eight cores against 8 GB of RAM and
+        a link that peaks over a gigabyte is not a fast build, it is a build that
+        ends as the OOM killer's problem -- and a link killed that way leaves the
+        PREVIOUS artifact in place, so the next run serves a stale binary and the
+        failure resurfaces as a runtime bug in a build that looked like it
+        worked. That is the expensive part: not the lost build, the lost
+        afternoon afterwards.
+
+        ACE_JOBS OVERRIDES BOTH, unchanged: an explicit number is somebody who
+        knows their machine, and inferring over a stated decision is the one
+        thing this must not do. ACE_JOBS=1 is still how you read an error log
+        that several compilers would otherwise be interleaving.
         """
         override = os.environ.get("ACE_JOBS", "").strip()
-        if not override:
-            return self._host_cores()
-        try:
-            n = int(override)
-        except ValueError:
-            print(f"{YELLOW}[!] ACE_JOBS={override!r} is not a number -- "
-                  f"using the core count.{RESET}")
-            return self._host_cores()
-        return max(1, n)
+        if override:
+            try:
+                return max(1, int(override))
+            except ValueError:
+                print(f"{YELLOW}[!] ACE_JOBS={override!r} is not a number -- "
+                      f"using the inferred count.{RESET}")
+
+        cores = self._host_cores()
+        avail = self._host_avail_mb()
+        if avail is None:
+            return cores
+        fits = max(1, avail // self._LINK_MEM_BUDGET_MB)
+        if fits < cores:
+            print(f"{DIM}    jobs: {fits} (memory-bound -- {avail} MB available, "
+                  f"~{self._LINK_MEM_BUDGET_MB} MB per link; {cores} cores. "
+                  f"ACE_JOBS overrides){RESET}")
+        return min(cores, fits)
 
     def _job_args(self, extra_args=()):
         """make's -j, or nothing when someone has already decided.
