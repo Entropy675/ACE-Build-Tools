@@ -1,13 +1,14 @@
 {
   "schema_version": 1,
   "module": {
-    "name": "ChessProvider",
+    "name": "PaintProvider",
     "std": "c++17",
     "platforms": [
       "Linux",
       "Win",
       "Web"
-    ]
+    ],
+    "impl_layout": "shared"
   },
   "requires": {
     "system": {
@@ -32,44 +33,32 @@
     },
     "vendor": [
       {
-        "name": "CChess",
+        "name": "stb",
+        "_comment": "stb_image (PNG/JPEG/BMP/GIF/TGA in) and stb_image_write (PNG out): two public-domain single headers, pinned. Header-only, so no build step; the implementation is compiled once, in PaintProvider.cc.",
         "source": {
-          "type": "vendored",
-          "path": "ChessProvider/CChess"
+          "type": "git",
+          "url": "https://github.com/nothings/stb.git",
+          "ref": "2c980bb59875b0d32144a71867fbdebb2f77cd20",
+          "shallow": true
         },
-        "hash_scope": false,
+        "build": {
+          "system": "none"
+        },
         "arch_sensitive": false,
+        "hash_scope": false,
         "provides": {
-          "sources": {
-            "include": [
-              "src/*.cc",
-              "src/piece_behav/*.cc"
-            ],
-            "exclude": [
-              "src/main.cc",
-              "src/ChessGame.cc",
-              "src/ChessGameLinux.cc",
-              "src/ChessGameWindows.cc",
-              "src/NcView.cc",
-              "src/WinView.cc"
-            ]
-          }
+          "include": [
+            "."
+          ]
         }
       }
     ]
   },
   "build": {
-    "common": {
-      "cxxflags": [
-        "-fpermissive"
-      ]
-    },
     "Linux": {
-      "ldflags": [
-        "-pthread"
-      ],
       "system_libs": [
-        "dl"
+        "dl",
+        "pthread"
       ]
     },
     "Win": {

@@ -10,7 +10,21 @@ Mixed into AceManager in ace_install.py.
 The model, per doc/etcs_ontology_constraint_sets.md:
 
   xxx.h      declares a constraint  (pure virtuals, an interface X_)
-  xxxBase.h  proves it              (ETCS_DISPATCH_METHOD, a CRTP proxy)
+  xxxBase.h  proves it              (dispatch or answer, a CRTP proxy)
+
+A dispatch pair is ETCS_DISPATCH_METHOD, or the two things it expands to --
+a pure virtual NameConcrete the leaf must write, plus a forwarder named for
+the family's verb -- spelled out by hand where the base has work to run around
+the forward and the macro's one-statement wrapper leaves no room for it. Both
+spellings oblige a leaf identically and are reported identically here.
+
+A pair is not the only way to keep a promise, so an owed verb has THREE states
+and the listing names each: dispatched, where a leaf writes the Concrete half;
+answered, where the family serves the verb out of state it keeps itself and a
+leaf writes nothing (Pixels_'s two accessors over its own buffer,
+PresentableBase's Fps over its own clock); and unproven, where it is declared
+and nobody serves it. Only the last is a fault, and reading the middle one as
+the last is how deliberate hoisting came to look like a missing method.
 
 Constraint sets are cumulative down a lineage (LocalDatabase_ : Database_
 owes Database_'s methods too) and exclusive across siblings. Two families
@@ -19,8 +33,8 @@ incidental exclusivity, discovered only when a leaf folds both.
 
 The work-function surface is a separate axis and a NARROWER one: it bounds
 what an .etcs trace may call, not what the type implements. Every constraint
-method exists on every leaf that claims the family (ETCS_DISPATCH_METHOD is a
-pure virtual); exporting one as a work function is the decision to let a
+method exists on every leaf that claims the family (a dispatch pair puts a
+pure virtual there); exporting one as a work function is the decision to let a
 script call it by name.
 """
 from pathlib import Path
@@ -34,6 +48,38 @@ class OntologyMixin:
     # ETCS_DISPATCH_METHOD(Ret, Name, (T, a)...) / ..._CONST
     _ONT_DISPATCH = re.compile(
         r'ETCS_DISPATCH_METHOD(?:_CONST)?\s*\(\s*[^,]+?,\s*([A-Za-z_]\w*)')
+    # THE MACRO IS NOT THE ONLY SPELLING OF A DISPATCH, and reading only it is
+    # what put Animated and Drawable on the "does not prove its lineage" list
+    # while both demonstrably prove it. The macro's wrapper is exactly one
+    # statement -- `return leaf->NameConcrete(args)` -- so a base that owns
+    # MECHANISM around the forward has nowhere to put it: AnimatedBase measures
+    # the interval and skips a settled leaf, DrawableBase drops a hidden one.
+    # Those bases write the macro's two halves out by hand, and what the leaf
+    # then owes is the same pure virtual under the same name.
+    #
+    # MATCHED AS A PAIR, never as either half, which is what keeps this from
+    # excusing families that prove nothing. A lone NameConcrete is a hook with
+    # no caller; a lone Name is the THIRD state below -- the family answering
+    # for itself, which is a different fact and reported as one.
+    _ONT_CONCRETE = re.compile(
+        r'virtual\s+([^;{}()]+?)\s+([A-Za-z_]\w*)Concrete\s*\([^;{}]*\)\s*'
+        r'(?:const\s*)?=\s*0\s*;')
+    # `RetType Name(args) [const] [override] [final] { ... }` -- a verb the
+    # family ANSWERS, out of state it keeps itself, with no Concrete half and
+    # so nothing for a leaf to write. Pixels_ serves PixelWidth from its own
+    # buffer; PresentableBase serves Fps from a clock it ticks on the way out
+    # of Present. Neither is a gap, and calling them one told a reader writing
+    # a new leaf that two methods were waiting for them when none were.
+    #
+    # THE BODY IS THE TEST, which is why the trailing brace is required rather
+    # than optional: `bool Released() const override = 0;` and a local
+    # `lock_guard<mutex> lock(m);` both read as `Type Name(...)` and neither
+    # answers anything. A definition has a body; nothing else in a header does.
+    _ONT_ANSWERED = re.compile(
+        r'(?:^|[;{}])\s*(?:(?:virtual|static|inline|const)\s+)*'
+        r'[A-Za-z_][\w:]*(?:\s*<[^<>;{}]*>)?[\s*&]+'
+        r'([A-Za-z_]\w*)\s*\([^;{}]*\)\s*'
+        r'(?:(?:const|override|final|noexcept)\s*)*\{', re.M)
     _ONT_SUPERTYPE = re.compile(r'ETCS_SUPERTYPE_BASE\s*\(\s*([A-Za-z_]\w*)\s*\)')
     # class X_ : public Y_ / virtual public ETCS::Entity
     _ONT_IFACE = re.compile(r'^class\s+([A-Za-z_]\w*)_\s*:\s*((?:[^{;]|\n)*?)\{', re.M)
@@ -66,11 +112,35 @@ class OntologyMixin:
 
     # ---------------------------------------------------------------- families
 
+    def _ont_handwritten_dispatch(self, text):
+        """The verbs one Base dispatches without the macro -- see _ONT_CONCRETE.
+
+        THE RETURN TYPE IS THE MATCH, not the parameter list, because the two
+        halves legitimately disagree about arguments and that disagreement is
+        the whole reason the pair was written out: AnimatedBase::Advance()
+        takes nothing and hands AdvanceConcrete the interval its own clock just
+        measured. What a forwarder cannot change is what it gives back, so that
+        is what is checked.
+        """
+        out = set()
+        for ret, name in self._ONT_CONCRETE.findall(text):
+            typ = r'\s*'.join(re.escape(t) for t in re.findall(r'\w+|\S', ret))
+            if re.search(rf'(?<![\w:]){typ}\s+{name}\s*\(', text):
+                out.add(name)
+        return out
+
     def _parse_ontology(self):
-        """{family: {'dispatch': [...], 'parent': family|None, 'owes': [...]}}
+        """{family: {'dispatch': [...], 'answered': {...}, 'parent': family|None,
+                     'owes': [...]}}
 
         `owes` is the accumulated pure-virtual set from the interface lineage --
         what this family's Base must prove. Cached for the process.
+
+        `dispatch` and `answered` are the two ways of proving one, and they are
+        kept apart because they say different things to a leaf: a dispatched
+        verb is work the leaf must do, an answered one is work already done for
+        it. Disjoint by construction -- a dispatch pair's forwarder is itself a
+        definition, so it is subtracted out below rather than counted twice.
         """
         if getattr(self, "_ont_cache", None) is not None:
             return self._ont_cache
@@ -87,8 +157,11 @@ class OntologyMixin:
             if f.name.endswith("Base.h"):
                 m = self._ONT_SUPERTYPE.search(text)
                 if m:
+                    dispatch = (set(self._ONT_DISPATCH.findall(text))
+                                | self._ont_handwritten_dispatch(text))
                     fams[m.group(1)] = {
-                        'dispatch': sorted(set(self._ONT_DISPATCH.findall(text))),
+                        'dispatch': sorted(dispatch),
+                        'answered': set(self._ONT_ANSWERED.findall(text)) - dispatch,
                         'parent': None, 'owes': [],
                     }
                 continue
@@ -99,12 +172,20 @@ class OntologyMixin:
                 ifaces[name] = {
                     'parents': [p[:-1] for p in parents if p.endswith("_")],
                     'virtuals': sorted(set(self._ONT_PUREVIRT.findall(text))),
+                    'answers': set(self._ONT_ANSWERED.findall(text)),
                 }
 
         for fam, info in fams.items():
             src = ifaces.get(fam)
             if not src:
                 continue
+            # BOTH OF THE FAMILY'S OWN HEADERS, because either may be where the
+            # answer sits: Pixels_ answers Raster_'s two accessors on the
+            # interface, PresentableBase answers Fps on the base. Ancestor
+            # headers are not searched and need not be -- `owes` collects only
+            # pure virtuals, so an ancestor's own concrete methods were never
+            # owed by anyone and there is nothing there to reclassify.
+            info['answered'] |= src['answers'] - set(info['dispatch'])
             owed, seen, cur = [], set(), fam
             while cur and cur in ifaces and cur not in seen:
                 seen.add(cur)
@@ -265,6 +346,28 @@ class OntologyMixin:
         cb = set(self._family_ancestors(b)) | {b}
         return bool(ca & cb)
 
+    def _family_proof(self, family):
+        """(dispatched, answered) for this family, its whole lineage included.
+
+        THE THIRD STATE IS THE POINT. A verb its interface owes is dispatched
+        (a pair exists and the leaf writes the Concrete half), answered (the
+        family serves it from state it keeps itself, so a leaf writes nothing),
+        or neither -- and only the last is a fault. Collapsing the middle one
+        into "no dispatch" is what put Pixels and Presentable on the fault list
+        for deliberate design.
+
+        Accumulated over the lineage exactly as the surface is: refinement
+        inherits a proof the same way it inherits the obligation, so a verb
+        answered by Surface is answered for Drawable too.
+        """
+        fams = self._parse_ontology()
+        dispatched, answered = set(), set()
+        for link in [family] + self._family_ancestors(family):
+            if link in fams:
+                dispatched |= set(fams[link]['dispatch'])
+                answered |= fams[link]['answered']
+        return dispatched, answered - dispatched
+
     def _family_surface(self, family):
         """Every method this family demands, its whole lineage included."""
         fams = self._parse_ontology()
@@ -319,15 +422,16 @@ class OntologyMixin:
 
     def _unproven_families(self):
         """Families whose Base does not cover what its interface lineage owes --
-        a §2 violation: refinement adds obligation, it never subtracts it."""
+        a §2 violation: refinement adds obligation, it never subtracts it.
+
+        Answered verbs are covered and are not listed. The obligation is that
+        the method EXISTS on every leaf of the family, not that a leaf is the
+        one who wrote it."""
         fams = self._parse_ontology()
         out = {}
         for fam, info in fams.items():
-            proven = set()
-            for link in [fam] + self._family_ancestors(fam):
-                if link in fams:
-                    proven |= set(fams[link]['dispatch'])
-            missing = sorted(set(info['owes']) - proven)
+            dispatched, answered = self._family_proof(fam)
+            missing = sorted(set(info['owes']) - dispatched - answered)
             if missing:
                 out[fam] = missing
         return out
@@ -493,16 +597,13 @@ class OntologyMixin:
         nor are refined, where there is no shape to draw and the whole surface
         is the increment.
 
-        A method is RED when the family's interface lineage owes it but no
-        Base in that lineage declares a dispatch for it -- ETCS_DISPATCH_METHOD
-        is what expands to the pure virtual, so an owed method with no dispatch
-        obliges the leaf to nothing.
+        A method is RED when the family's interface lineage owes it and
+        nothing in that lineage answers it, by either route -- no dispatch pair
+        to put it on a leaf and no definition on the family itself, so the
+        method is declared and nobody implements it. DIM-suffixed is the
+        middle case, which is not a fault: see _family_proof.
         """
-        fams = self._parse_ontology()
-        proven = set()
-        for link in [family] + self._family_ancestors(family):
-            if link in fams:
-                proven |= set(fams[link]['dispatch'])
+        dispatched, answered = self._family_proof(family)
 
         lines = [f"  {ORANGE}{family}{RESET}"]
         chain = self._family_chain(family)
@@ -514,8 +615,10 @@ class OntologyMixin:
             lines.append(f"    {DIM}(no methods){RESET}")
             return lines
         for meth in surface:
-            if meth in proven:
+            if meth in dispatched:
                 lines.append(f"    {meth}")
+            elif meth in answered:
+                lines.append(f"    {meth}  {DIM}(family answers){RESET}")
             else:
                 lines.append(f"    {RED}{meth}  (no dispatch){RESET}")
         return lines
@@ -538,10 +641,7 @@ class OntologyMixin:
         two families rather than one with two obligations.
         """
         fams = self._parse_ontology()
-        proven = set()
-        for link in [family] + self._family_ancestors(family):
-            if link in fams:
-                proven |= set(fams[link]['dispatch'])
+        dispatched, answered = self._family_proof(family)
         # An interface with no Base of its own obliges nobody directly -- each
         # child's Base proves the inherited set, and whether one of them fails
         # to is a fact about that child. Flagging it here would red-flag four
@@ -580,8 +680,12 @@ class OntologyMixin:
         if own:
             rail = "\u2502  " if my_kids else "   "
             for meth in own:
-                token = (meth if (interface_only or meth in proven)
-                         else f"{RED}{meth}  (no dispatch){RESET}")
+                if interface_only or meth in dispatched:
+                    token = meth
+                elif meth in answered:
+                    token = f"{meth}  {DIM}(family answers){RESET}"
+                else:
+                    token = f"{RED}{meth}  (no dispatch){RESET}"
                 lines.append(f"  {child_prefix}{rail}{token}")
         elif not my_kids:
             lines.append(f"  {child_prefix}   {DIM}(no methods of its own){RESET}")
@@ -636,6 +740,12 @@ class OntologyMixin:
               f"{'' if len(roots) == 1 else 's'}, "
               f"{len(standalone)} standalone) ---\n")
 
+        # Stated once, above both sections, because the markers appear in both.
+        print(f"  {DIM}A verb its interface owes is in one of three states: "
+              f"bare, so a leaf writes its Concrete half; (family answers), so "
+              f"the family serves it itself and a leaf writes nothing; or "
+              f"(no dispatch), so nobody serves it at all.{RESET}\n")
+
         if roots:
             print(f"  {DIM}Refinement is cumulative downward and exclusive "
                   f"across siblings. Every root sits directly under Entity; "
@@ -681,6 +791,12 @@ class OntologyMixin:
                 print(f"    {ORANGE}{fam}{RESET}: no dispatch for "
                       f"{', '.join(missing)}")
             print()
+        else:
+            # Said out loud, the way the exclusivity check says it above: this
+            # list emptied because two families were being misread, so a
+            # section that simply vanishes is the one outcome a reader cannot
+            # tell apart from a check that stopped running.
+            print(f"  {GREEN}Every family proves its lineage.{RESET}\n")
 
         # Incidental exclusivity: unrelated families sharing a name. Siblings
         # sharing one is inherited obligation, not a collision, so relatedness

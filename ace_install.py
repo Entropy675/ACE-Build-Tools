@@ -19,6 +19,7 @@ Layout (all under dev_tools/):
     ace_lifecycle.py <- install/uninstall/setup/remove/stage/scaffold
     ace_script.py    <- proxy for etcs_viewer.py script editor
     ace_manifest.py  <- module manifests -> generated Makefiles
+    ace_wasm.py      <- what a -sMAIN_MODULE link did not report
 
     manifests/       <- one <Module>.json per module, read by ace_manifest
 """
@@ -35,11 +36,13 @@ from dev_tools.ace import (
     BuildMixin,
     LifecycleMixin,
     ScriptMixin,
-    ManifestMixin
+    ManifestMixin,
+    WasmMixin,
+    HashMixin
 )
 
 class AceManager(RegistryMixin, DepsMixin, AbiMixin, OntologyMixin, BuildMixin,
-                 LifecycleMixin, ScriptMixin, ManifestMixin):
+                 LifecycleMixin, ScriptMixin, ManifestMixin, WasmMixin, HashMixin):
     """Assembled from the subsystem mixins. Method resolution runs left to
     right across the bases; none of them define colliding names (verified at
     split time), so the order is for readability, not disambiguation."""
@@ -230,6 +233,8 @@ if __name__ == "__main__":
         print("           | manifest { list | check [mod...] | show <mod> | generate [mod...|loaders] [--force] | clean [mod...|loaders] }")
         print("           | abi [module]")
         print("           | ontology")
+        print("           | wasm { link [main.wasm side.wasm ...] [--got] | addr <file.wasm> <offset> }")
+        print("           | hash regions --out <header.h> [--append] <sources...>")
         print("           | script [name]")
         sys.exit(0)
 
@@ -241,13 +246,15 @@ if __name__ == "__main__":
         elif cmd == "list":                             ace.list_modules()
         elif cmd == "setup" and len(args) > 1:          ace.setup(args[1], args[2] if len(args) > 2 else "default")
         elif cmd == "remove" and len(args) > 1:         ace.remove(args[1])
-        elif cmd == "make":                             ace.make(args[1:])
+        elif cmd == "make":                             sys.exit(ace.make(args[1:]) or 0)
         elif cmd == "stage" and len(args) > 2:          ace.stage(args[1], args[2])
         elif cmd == "registry" and args[1:] == ["verify"]: ace.registry_verify()
         elif cmd == "deps":                             ace.deps(args[1:])
         elif cmd == "manifest":                         ace.manifest(args[1:])
         elif cmd == "abi":                              ace.abi(args[1:])
         elif cmd == "ontology":                         ace.ontology(args[1:])
+        elif cmd == "wasm":                             sys.exit(ace.wasm(args[1:]) or 0)
+        elif cmd == "hash":                             sys.exit(ace.hash(args[1:]) or 0)
         elif cmd == "script":                           ace.create_script(args[1:])
         else:
             print(f"[-] Unknown or incomplete command: '{cmd}'")

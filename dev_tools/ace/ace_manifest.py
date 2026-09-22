@@ -79,9 +79,25 @@ BASE_CXXFLAGS = [
 # arena's own translation unit, not a module.
 BASE_LOADER_CXXFLAGS = [
     "-std={std}", "-fvisibility=hidden", "-fpermissive", "-Wall",
-    "-Wextra", "-O2", "-I../..", "-pipe", "-fno-plt",
+    "-Wextra", "-O2", "-I../..", "-pipe", "$(PLT_FLAGS)",
     "-DETCS_LOADER", r'-DETCS_MODULE_NAME=\"ROOT\"',
 ]
+
+# WHERE THE TREE IS, ANSWERED BY THE THING THAT KNOWS.
+#
+# ACE_ROOT is an ACE concept -- this tool is what locates the tree, and every
+# generated Makefile already sits inside it. So the runtime is TOLD, at build
+# time, rather than asking: core/CommandExecutor.h used to popen `ace root`
+# from inside the process to expand ACE_ROOT in a script statement, which put
+# a python CLI on the critical path of a running server and failed silently
+# wherever `ace` was not on that process's PATH -- a systemd unit, a stripped
+# shell, a container. Baked in, it also joins the build fingerprint, so a tree
+# that MOVED rebuilds instead of resolving to where it used to be.
+#
+# Absolute and computed here, not $(shell ace root) in the Makefile: a
+# subprocess per build is the same mistake one layer up, and the value is
+# already in hand.
+ACE_ROOT_DEFINE = r'-DETCS_ACE_ROOT=\"{root}\"'
 
 # The line every generated Makefile opens with, and the ONLY thing that
 # authorises this tool to delete one. A hand-written Makefile -- a module not
@@ -653,8 +669,11 @@ class ManifestMixin:
         w("# otherwise share a stamp and switching between them would relink")
         w("# nothing.")
         w("PLATFORM_TAG :=")
+        w("PLT_FLAGS := -fno-plt")
         w("ifdef EMSCRIPTEN")
         w("  PLATFORM_TAG := _web")
+        w("  # wasm has no procedure linkage table -- see CXXFLAGS.")
+        w("  PLT_FLAGS :=")
         w("endif")
         w(f"BUILD_STAMP := .ace_build_$(ARCH)$(PLATFORM_TAG)$(DBG_SUFFIX)$(SAN_SUFFIX){abi_tag}")
         w("")
@@ -698,7 +717,13 @@ class ManifestMixin:
                 w(f"{v}_DIR := {dep['name']}")
             w("")
 
-            incs = [f"-I$({v}_DIR)/{inc}" if inc != "." else f"-I$({v}_DIR)"
+            # -isystem, NOT -I. A vendored dependency's headers are read, not
+            # maintained, here: stb_image_write alone accounts for eight
+            # -Wmissing-field-initializers in every build that includes it, and
+            # a warning nobody in this tree can act on is a warning that
+            # teaches people to scroll past the ones they can. -isystem keeps
+            # the header on the path and takes it off the report.
+            incs = [f"-isystem $({v}_DIR)/{inc}" if inc != "." else f"-isystem $({v}_DIR)"
                     for inc in prov.get("include", [])]
             dep_carriage.append((v, carried(dep["name"]), incs))
 
@@ -724,7 +749,8 @@ class ManifestMixin:
 
             sources = prov.get("sources")
             if sources:
-                globs = " ".join(f"$(wildcard $({v}_DIR)/{g})" for g in sources.get("include", []))
+                globs = " ".join(self._dep_source_expr(v, g)
+                                 for g in sources.get("include", []))
                 expr = globs
                 if sources.get("exclude"):
                     ex = " ".join(f"$({v}_DIR)/{e}" for e in sources["exclude"])
@@ -767,6 +793,7 @@ class ManifestMixin:
         # ---- flags --------------------------------------------------------
         cxx = [f.format(std=std) for f in BASE_CXXFLAGS]
         cxx.append(r'-DETCS_MODULE_NAME=\"$(TARGET_BASE_NAME)\"')
+        cxx.append(ACE_ROOT_DEFINE.format(root=str(self.ace_root)))
         cxx += ["-I.", "-I../.."]
         # Vendored -I flags are emitted inside the platform blocks, not here:
         # CXXFLAGS is simply expanded at this point, so a global -I could
@@ -778,7 +805,11 @@ class ManifestMixin:
         cxx += [f"-D{d}" for d in abi_defines]
         cxx += [f"-D{d}" for d in common.get("defines", [])]
         cxx += common.get("cxxflags", [])
-        cxx += ["-pipe", "-fno-plt", "$(DEBUGFLAGS)", "$(SANITIZE)",
+        # -fno-plt ONLY WHERE THERE IS A PLT. It is about the ELF procedure
+        # linkage table; wasm has none, so emscripten's clang accepts the flag,
+        # ignores it, and says "argument unused during compilation" once per
+        # translation unit. Native builds still get it.
+        cxx += ["-pipe", "$(PLT_FLAGS)", "$(DEBUGFLAGS)", "$(SANITIZE)",
                 "$(CUSTOM_CXXFLAGS)"]
         w("CXXFLAGS := " + " \\\n            ".join(cxx))
         w("")
@@ -834,13 +865,31 @@ class ManifestMixin:
                 # must match the loader's MAIN module exactly or the browser
                 # refuses instantiation; wasm exceptions because the JS
                 # default does not survive dylink (work functions throw).
-                # -fvisibility=default overrides BASE's hidden (last flag
-                # wins) so the @@ETCS_ABI trampolines reach the dylink export
-                # table.
-                w("    CXXFLAGS += -pthread -fwasm-exceptions -fvisibility=default")
+                #
+                # BASE's -fvisibility=hidden STAYS, and not for tidiness: it
+                # is what makes each header-inline static (EventNode,
+                # ThreadPool, MemoryArena, the RID seed) this module's OWN,
+                # as on native. A default-visibility definition is not
+                # dso_local under -fPIC, so wasm codegen reaches even the
+                # module's own copy through the GOT, and dylink resolves that
+                # import to the loader's -- one shared singleton of
+                # everything core/ documents as per-DSO. Exports do not need
+                # default: wasm-ld has no version script, and a side module
+                # exports exactly what is marked visibility("default"), which
+                # ETCS_API puts on every symbol the loader dlsym()s.
+                w("    CXXFLAGS += -pthread -fwasm-exceptions")
                 # Vendored C compiles through $(CC); a native gcc object
                 # cannot link into a wasm side module.
                 w(f"    CC := {blk.get('cc', 'emcc')}")
+                # AND WITH THE MODULE'S TARGET FEATURES. A vendored object is
+                # compiled "with its own flags, not the module's" (see the obj
+                # rule), which is right for optimisation and defines and wrong
+                # for -pthread: a threaded module is linked --shared-memory, and
+                # wasm-ld refuses any object in it that was not compiled with
+                # atomics and bulk-memory -- which is what -pthread turns on.
+                # So the one flag that is a TARGET rather than a preference is
+                # carried to every vendored object here.
+                w("    DEP_TARGET_FLAGS := -pthread -fPIC")
                 # em++ is the Web default, like emcc above: manifests name a
                 # compiler only when it is NOT em++.
                 if not blk.get("compiler"):
@@ -1017,7 +1066,15 @@ class ManifestMixin:
             w("\t@:")
         w("")
 
-        w("$(BUILD_STAMP):")
+        # ON THE MAKEFILE, so a REGENERATED Makefile is a new build. The stamp
+        # is keyed by platform, debug and sanitizer -- the things a caller
+        # changes on the command line -- and had no way to notice the file it
+        # lives in changing under it: a vendored object compiled under the old
+        # rule stayed newer than its source and was linked, flags and all, into
+        # a module built under the new one. ace regenerates this file whenever
+        # the generator's output changes (ensure_makefile), and this is the other
+        # half of that: the regeneration reaches the objects.
+        w("$(BUILD_STAMP): Makefile")
         w("\t@rm -f .ace_build_*")
         w("\t@touch $@")
         w("")
@@ -1027,7 +1084,26 @@ class ManifestMixin:
         L.extend(obj_rules)
 
         # ---- hashes -------------------------------------------------------
-        w("$(HASH_HEADER): $(MODULE_HEADERS)")
+        # Two kinds, in one generated header. The per-FILE digests below are
+        # the epoch check (compareManifests, core/Bundles.h): does this module
+        # agree with its loader about the contract headers. The per-REGION
+        # digests appended after them are what the ABI's <Tag>_<Action>_GetHash
+        # actually returns -- one SHA-256 per work/stream body, which is the
+        # only way those exports can say anything about the function they are
+        # named after (the macro cannot see its own body; ace_hash.py explains).
+        #
+        # SOURCES AS WELL AS HEADERS, because work functions live in both.
+        #
+        # A missing `ace` is a warning, not a build failure: the header stays
+        # valid, the digests are simply absent, and every GetHash says 0 and
+        # logs why (ETCS::etcs_region_hash) rather than quietly handing back
+        # something that is not a content hash.
+        w("ACE_HASH_REGIONS ?= ace hash regions")
+        w("")
+        # Makefile, for the same reason BUILD_STAMP lists it: when the RULE
+        # changes -- a new kind of digest appended here, say -- an existing
+        # header is newer than every source and make would keep it.
+        w("$(HASH_HEADER): $(MODULE_HEADERS) $(SRC_MODULE) Makefile")
         w('\t@echo "// Generated Registration - do not edit" > $@')
         w("\t@for f in $(MODULE_HEADERS); do \\")
         w("\t    HASH=$$(cat $$f | openssl dgst -sha256 | awk '{print $$NF}'); \\")
@@ -1038,6 +1114,10 @@ class ManifestMixin:
           "ETCS::Entity::getManifest()[\"%s\"] = \"%s\"; return true; }();\\n' "
           "\"$$VAR_NAME\" \"$$FULL_NAME\" \"$$HASH\" >> $@; \\")
         w("\tdone")
+        w("\t@$(ACE_HASH_REGIONS) --out $@ --append $(MODULE_HEADERS) $(SRC_MODULE) \\")
+        w("\t  || { echo \"[!] $(ACE_HASH_REGIONS) unavailable -- no work-region digests \\")
+        w("\t            (every <Tag>_<Action>_GetHash will report 0).\"; \\")
+        w("\t       echo \"// no work-region digests: ace was not on PATH at build time\" >> $@; }")
         w("")
 
         # ---- link ---------------------------------------------------------
@@ -1202,6 +1282,29 @@ class ManifestMixin:
         lines.append("")
         return "\n".join(lines)
 
+    @staticmethod
+    def _dep_source_expr(v, pattern):
+        """One entry of a vendor dep's `provides.sources.include`, as make sees it.
+
+        A PATTERN GOES THROUGH $(wildcard); A NAME DOES NOT, and that is the
+        whole of this function. $(wildcard) answers with what is on disk AT
+        PARSE TIME, and a vendored build's own output is not there yet on the
+        run that produces it -- sqlite's `sqlite3.c` is written by the
+        amalgamation step this same Makefile runs. Wrapped in $(wildcard), the
+        object list comes out EMPTY on a fresh tree, so the dependency is never
+        compiled and never linked, and the build succeeds at doing nothing;
+        run it a second time and it works, which is the shape of the bug that
+        makes it so hard to see.
+
+        Named literally, the object exists in the list before its source does,
+        the order-only gate on the dep's build marker makes the source appear
+        first, and one run is enough. Anything containing a glob character is
+        genuinely a question about the tree and still gets asked that way.
+        """
+        return (f"$(wildcard $({v}_DIR)/{pattern})"
+                if any(c in pattern for c in "*?[")
+                else f"$({v}_DIR)/{pattern}")
+
     def _emit_obj_rule(self, v, dep, sources, gate=None):
         # Own flags, plus the ABI defines (these objects are linked INTO the
         # module, so they must agree with it) and the sanitizer -- these are
@@ -1209,17 +1312,33 @@ class ManifestMixin:
         # module rather than DEP_SANITIZE.
         abi = " ".join(f"-D{d}" for d in dep.get("abi_defines", []))
         cflags = " ".join(x for x in (" ".join(sources.get("cflags", [])),
-                                      abi, "$(SANITIZE)") if x)
+                                      abi, "$(SANITIZE)", "$(DEP_TARGET_FLAGS)") if x)
         lines = []
         lines.append(f"# {dep['name']}: compiled with its own flags, not the module's")
         for ext, comp in ((".c", "$(CC)"), (".cc", "$(CXX)")):
             # BUILD_STAMP real, gates order-only: the stamp must force a
             # recompile when flags change; the gates only have to exist first.
-            gates = (" | " + " ".join(gate)) if gate else ""
+            #
+            # .ace_obj IS ONE OF THOSE GATES, rather than an mkdir inside the
+            # recipe, and the difference shows up only under -j. A recipe that
+            # makes its own output directory is correct exactly once: every
+            # other job compiling into the same directory races it, and a
+            # compiler that has already opened its temp file there fails at the
+            # RENAME rather than at the open -- "unable to rename temporary
+            # ... No such file or directory", which reads like a missing source
+            # and is not one. As an order-only prerequisite the directory is
+            # make's problem: it is created once, before any recipe that needs
+            # it starts, and never again.
+            gates = " | " + " ".join(list(gate or []) + [".ace_obj"])
             lines.append(f".ace_obj/{v}_%.o: $({v}_DIR)/%{ext} $(BUILD_STAMP){gates}")
-            lines.append("\t@mkdir -p $(dir $@)")
             lines.append(f"\t{comp} {cflags} -c $< -o $@")
             lines.append("")
+        # Order-only prerequisites are not remade when they are out of date,
+        # only when they are ABSENT -- which is what a directory wants, since
+        # its mtime changes every time a file lands in it.
+        lines.append(".ace_obj:")
+        lines.append("\t@mkdir -p $@")
+        lines.append("")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -1259,21 +1378,46 @@ class ManifestMixin:
         return True
 
     def ensure_makefile(self, module):
-        """Regenerate a missing Makefile. Called on the build path.
+        """Regenerate a missing OR STALE Makefile. Called on the build path.
 
         Generated Makefiles are gitignored, so a fresh clone has none. This is
-        what makes that a non-event rather than a build failure. An existing
-        Makefile is never overwritten here -- only `--force` does that, so a
-        module that predates its manifest keeps building until someone
-        deliberately migrates it.
+        what makes that a non-event rather than a build failure.
+
+        STALE MEANS: the generator, given this manifest, no longer produces the
+        text that is on disk. The file is by contract a pure function of the two
+        (its header says so, and generation is deterministic), so when the
+        function's output changes the file is simply wrong -- and "regenerate
+        only when missing" left it wrong silently. That is how a pull that
+        changed the emscripten link flags built every module with the OLD flags
+        and had the loader refuse all of them at registration, with nothing to
+        say that the Makefile on disk was the cause. Comparing costs one
+        generation per module per build, which is milliseconds.
+
+        A module with no manifest is untouched: there is nothing to compare
+        against, and such a module keeps building from whatever it has until
+        someone migrates it deliberately.
         """
         if not self.has_manifest(module):
             return False
         makefile = self._module_dir(module) / "Makefile"
-        if makefile.exists():
+        if not makefile.exists():
+            print(f"[*] {module}/Makefile is missing -- regenerating from manifest.")
+            return self.generate_makefile(module, quiet=False)
+        if self._makefile_is_current(module, makefile):
             return False
-        print(f"[*] {module}/Makefile is missing -- regenerating from manifest.")
-        return self.generate_makefile(module, quiet=False)
+        print(f"{YELLOW}[!] {module}/Makefile is STALE -- the generator's output has "
+              f"changed since it was written. Regenerating.{RESET}")
+        return self.generate_makefile(module, force=True, quiet=False)
+
+    def _makefile_is_current(self, module, makefile):
+        """Does the generator reproduce the file on disk, byte for byte?"""
+        try:
+            m = self.load_manifest(module, resolve_pins=True, silent=True)
+            return makefile.read_text() == self._emit_makefile(m)
+        except Exception:
+            # A manifest that will not load is generate_makefile's problem to
+            # report, not this check's to guess at: leave the file alone.
+            return True
 
     # ------------------------------------------------------------------
     # loaders
@@ -1374,7 +1518,10 @@ class ManifestMixin:
     # imports for glfwCreateWindow and the rest, but -sSIDE_MODULE emits no
     # JavaScript at all, so library_glfw.js never arrives. Only the MAIN module
     # has glue, so only the main link can carry these.
-    _WEB_JSLIB_PREFIXES = ("-sUSE_",)
+    # -l<name>.js is the other spelling emscripten has for a JS library --
+    # IDBFS, NODEFS, WORKERFS and their kin ship as -lidbfs.js -- and it is a
+    # library the MAIN link owns for exactly the reason -sUSE_* is.
+    _WEB_JSLIB_PREFIXES = ("-sUSE_", "-l")
     _WEB_JSLIB_EXACT = (
         "-sFULL_ES2", "-sFULL_ES3", "-sLEGACY_GL_EMULATION",
         "-sGL_ENABLE_GET_PROC_ADDRESS", "-sOFFSCREEN_FRAMEBUFFER",
@@ -1431,6 +1578,8 @@ class ManifestMixin:
                 if not (f.startswith(self._WEB_JSLIB_PREFIXES)
                         or base in self._WEB_JSLIB_EXACT):
                     continue
+                if f.startswith("-l") and not f.endswith(".js"):
+                    continue                         # a native library, not glue
                 if f not in flags:
                     flags.append(f)
                     sources[f] = entry.name
@@ -1494,8 +1643,18 @@ class ManifestMixin:
         w("endif")
         w("")
 
+        # As in a module's Makefile: -fno-plt is an ELF flag, and emscripten's
+        # clang accepts it, drops it and says so once per translation unit.
+        w("PLT_FLAGS := -fno-plt")
+        w("ifdef EMSCRIPTEN")
+        w("  PLT_FLAGS :=")
+        w("endif")
+        w("")
         cxx = [f.format(std=default.get("loader", {}).get("std", "c++17"))
                for f in BASE_LOADER_CXXFLAGS]
+        # The loader needs it more than any module does: the executor that
+        # expands ACE_ROOT in a script statement lives in it. See ACE_ROOT_DEFINE.
+        cxx.append(ACE_ROOT_DEFINE.format(root=str(self.ace_root)))
         cxx += [f"-D{d}" for d in common.get("defines", [])]
         cxx += common.get("cxxflags", [])
         cxx += ["$(DEBUGFLAGS)", "$(SANITIZE)"]
@@ -1510,9 +1669,17 @@ class ManifestMixin:
         w("    # Loader = MAIN module. Side modules load at runtime via dylink.")
         w("    # MAIN_MODULE=1 + EXPORT_ALL so side-module GOT imports resolve.")
         w("    # -pthread / -fwasm-exceptions MUST match every side module.")
+        w("    #")
+        w("    # -fvisibility=hidden stays in force here too. A side module imports")
+        w("    # libc/libc++ and the JS libraries from the MAIN module, which this")
+        w("    # flag does not touch. What it removes from the export table is the")
+        w("    # loader's own header-inline statics -- EventNode, ThreadPool,")
+        w("    # MemoryArena -- so a module can only ever bind to its own copy, the")
+        w("    # per-DSO grain core/ is written to. The one symbol a module dlsym()s")
+        w("    # out of the loader, ETCS_GetLoaderManifest, marks itself default.")
         w("    CXX := em++")
         w("    CC  := emcc")
-        w("    CXXFLAGS += -pthread -fwasm-exceptions -fvisibility=default")
+        w("    CXXFLAGS += -pthread -fwasm-exceptions")
         w("")
         w("    # ── MEMORY: FIXED, NOT GROWABLE, and this is the throw site ──────")
         w("    #")
@@ -1542,16 +1709,71 @@ class ManifestMixin:
         w("    # nothing more has to be said. Bump INITIAL_MEMORY if a bigger world")
         w("    # needs it -- there is no growth to fall back on now, so exhaustion is")
         w("    # an abort rather than a stall.")
-        w("    ETCS_WEB_MEMORY ?= -sINITIAL_MEMORY=268435456")
+        w("    #")
+        w("    # 2 GB MINUS ONE PAGE, which is the documented ceiling: emscripten caps")
+        w("    # a heap at 2048MB-WASM_PAGE_SIZE unless pointers are widened")
+        w("    # (libcore.js says so in emscripten_resize_heap's own rules). The link")
+        w("    # accepts larger values without complaint -- 4 GB-64 KB links fine -- so")
+        w("    # the link is not the constraint and a bigger number is not evidence of")
+        w("    # anything. 2147418112 is the largest that was actually BOOTED and")
+        w("    # exercised: 13.1s to a drawn paint page against 13.2s at 1 GB, so the")
+        w("    # ceiling costs nothing in startup. Above it is the caller's experiment,")
+        w("    # and ETCS_WEB_MEMORY is passable to ace for exactly that.")
+        w("    #")
+        w("    # BY WAY OF 1 GB, 512 MB AND 256 MB. The runtime's arenas alone stood at")
+        w("    # ~230 MB after a paint page booted (measured with malloc_footprint from")
+        w("    # the console), which left a two-layer 1216x960 canvas -- 9 MB of raster")
+        w("    # -- to be the allocation that aborted at 256. The number is not about")
+        w("    # that one canvas: every scope keeps its own arena and each one holds its")
+        w("    # high-water mark rather than returning pages, so the figure that has to")
+        w("    # fit is the sum of the peaks, not the sum of what is live. Add ~184 MB of")
+        w("    # pthread stacks (see the pool below) and ~424 MB is spoken for before a")
+        w("    # raster exists.")
+        w("    #")
+        w("    # PAGES ARE COMMITTED BY THE BROWSER AS THEY ARE TOUCHED, which is what")
+        w("    # makes the ceiling nearly free: an untouched tab pays for none of it, so")
+        w("    # the cost of asking for the maximum is address space rather than RAM.")
+        w("    # That is also why raising this is the CHEAPEST of the three levers and")
+        w("    # the weakest -- it does not reduce demand, it only defers the wall.")
+        w("    ETCS_WEB_MEMORY ?= -sINITIAL_MEMORY=2147418112")
         w("")
-        w("    # To go back to growth for a comparison, in one command and without")
-        w("    # regenerating anything -- MAXIMUM_MEMORY is not optional in that")
-        w("    # variant, because shared memory must be created with a maximum:")
+        w("    # ── WHEN GROWTH BECOMES AVAILABLE AGAIN, AND WHY NOT YET ─────────")
+        w("    #")
+        w("    # The COST of growth is not the problem, and it is worth saying so")
+        w("    # because the arithmetic looks inviting: every arena holds its")
+        w("    # high-water mark, so a session grows a bounded number of times and")
+        w("    # then stops -- geometrically, +20% a step, overreserving at most 96 MB")
+        w("    # (libcore.js) -- and shared memory grows IN PLACE, so not one of those")
+        w("    # steps copies the heap. On that reasoning growth should simply be on.")
+        w("    #")
+        w("    # THE BLOCKER IS THE THROW SITE ABOVE, which is a startup race and not")
+        w("    # a cost. growMemViews() is emitted at the head of every heap-touching")
+        w("    # library function in every thread, so a worker that reaches one before")
+        w("    # it has been handed its wasmMemory evaluates undefined.buffer.")
+        w("    #")
+        w("    # GROWABLE_ARRAYBUFFERS=2 REMOVES IT BY CONSTRUCTION -- the function is")
+        w("    # not generated at all (runtime_common.js guards it on `!= 2`), which is")
+        w("    # the same property growth-off has and the same standard this file holds")
+        w("    # itself to. It needs WebAssembly.Memory.prototype.toResizableBuffer,")
+        w("    # which it calls unconditionally. Probed 2026-09: absent in Chrome 141")
+        w("    # and in node 22, so that build does not run yet. THAT is the condition")
+        w("    # to re-test on -- not a browser version, the presence of that method.")
+        w("    #")
+        w("    # =1 IS WORSE THAN EITHER, and is the tempting middle: the function IS")
+        w("    # still generated, and only reassigned to a no-op inside")
+        w("    # getMemoryBuffer() once the feature is detected -- so the throw site")
+        w("    # survives, in exactly the window it fires in. It also carries an")
+        w("    # explicit carve-out declining the fast path below Firefox 154, so on")
+        w("    # Firefox you keep the throw and lose the optimisation.")
+        w("    #")
+        w("    # To measure the growth variant anyway, in one command and without")
+        w("    # regenerating anything -- MAXIMUM_MEMORY is not optional there, because")
+        w("    # shared memory must be created with a maximum. Expect the worker throw:")
         w("    #")
         w("    #   make FILE=etcs EMSCRIPTEN=1 \\")
         w("    #     ETCS_WEB_MEMORY='-sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=1073741824'")
         w("")
-        w("    # ── THE POOL: PREWARMED, AND IT DOES NOT UNDO THE DEFERRAL ───────")
+        w("    # ── THE POOL: NOT PREWARMED, AND THE COST IS PER WORKER ──────────")
         w("    #")
         w("    # PTHREAD_POOL_SIZE creates its workers during MODULE STARTUP -- before")
         w("    # main(), so before preload_web_modules opens the first side module. The")
@@ -1562,15 +1784,39 @@ class ManifestMixin:
         w("    # its wasmMemory as part of that startup, when nothing else is in")
         w("    # flight.")
         w("    #")
-        w("    # WHAT IT COSTS, because it is a trade and not a free win: every later")
-        w("    # dlopen now has to be replicated into workers that already exist, which")
-        w("    # is the direction emscripten's own advice warns about. With 0 it was the")
-        w("    # mirror problem -- no worker to replicate into, and every worker created")
-        w("    # later had to replay the whole library list by itself. Overridable for")
-        w("    # exactly that reason, and worth testing SEPARATELY from the memory")
-        w("    # change so a fix cannot be credited to the wrong one:")
+        w("    # WHAT PREWARMING COSTS, because it is a trade and not a free win: every")
+        w("    # later dlopen has to be replicated into workers that already exist,")
+        w("    # which is the direction emscripten's own advice warns about. With 0 it")
+        w("    # is the mirror problem instead -- no worker to replicate into, and every")
+        w("    # worker created later replays the whole library list by itself.")
         w("    #")
-        w("    #   make FILE=etcs EMSCRIPTEN=1 ETCS_WEB_POOL='-sPTHREAD_POOL_SIZE=0'")
+        w("    # THE DEFAULT IS 0, WHICH IS THE MIRROR PROBLEM, and the heading used to")
+        w("    # claim otherwise -- worth stating plainly because the number it applies")
+        w("    # to is large. A paint page creates 46 Workers (counted, Chrome 141):")
+        w("    # DEFAULT_THREAD_POOL_THREADS is 4 PER IMAGE and there are six images")
+        w("    # here, so 24 pool workers plus an ordering thread each, plus the stream")
+        w("    # and script threads. Every one of the 46 is created after all five side")
+        w("    # modules are open, so every one instantiates all five for itself.")
+        w("    #")
+        w("    # AND EACH ONE TAKES A STACK OUT OF THE SHARED HEAP: 46 x 4 MB is 184 MB,")
+        w("    # against ~240 MB of arenas, so ~424 MB is spoken for before a single")
+        w("    # raster exists -- a fifth of the ceiling above, and none of it optional.")
+        w("    #")
+        w("    # THE COST IS WORKERS x MODULES, WHICH IS WHY ONE PAGE FAILS AND ANOTHER")
+        w("    # DOES NOT. Both numbers grow with the module list: another image is four")
+        w("    # more pool workers AND one more thing every existing worker has to")
+        w("    # instantiate. The paint page carries five side modules to the window")
+        w("    # page's four -- 46x5 against ~38x4, about 1.5x the instantiation work --")
+        w("    # and the one it adds is DatabaseProvider, 1.5 MB of sqlite, the largest")
+        w("    # in the tree. A page that adds a provider is not paying for one module.")
+        w("    #")
+        w("    # So the numbers to reach for when a worker reports out-of-memory are the")
+        w("    # POOL SIZE and DEFAULT_THREAD_POOL_THREADS (core/ETCS_API.h, 4 per image)")
+        w("    # -- not INITIAL_MEMORY, which does not change how many workers there are:")
+        w("    #")
+        w("    #   make FILE=etcs EMSCRIPTEN=1 ETCS_WEB_POOL='-sPTHREAD_POOL_SIZE=48'")
+        w("    #   make FILE=etcs EMSCRIPTEN=1 \\")
+        w("    #     ETCS_WEB_POOL='-sPTHREAD_POOL_SIZE=0 -sDEFAULT_PTHREAD_STACK_SIZE=1MB'")
         w("    ETCS_WEB_POOL ?= -sPTHREAD_POOL_SIZE=0")
         w("")
         jslibs, jslib_src = self._web_jslib_flags(silent=silent)
@@ -1614,15 +1860,31 @@ class ManifestMixin:
         w("    # browser's main thread instead of unwinding, and the REPL's line wait runs")
         w("    # on a Worker. dlopen remains async, driven from the page's promise chain")
         w("    # at startup rather than from inside a wasm call.")
+        w("    #")
+        w("    # ── STACK: 4 MiB, MAIN THREAD AND EVERY PTHREAD ───────────────────")
+        w("    #")
+        w("    # emscripten's default is 64 KiB, and one stream call needs well over")
+        w("    # that: Entity::call keeps two MirrorBuffers (~13.8 KB each) and two")
+        w("    # 4 KB transport MBuffers on ONE frame, ~36 KB before anything it")
+        w("    # calls gets a byte. Exhaustion is silent in wasm -- no guard page,")
+        w("    # the stack pointer walks into whatever sits below it -- and it")
+        w("    # surfaced as the 'unresolved tag' and 'signature mismatch' boots that")
+        w("    # only ever happened in the browser. STACK_SIZE is the main thread's;")
+        w("    # DEFAULT_PTHREAD_STACK_SIZE is what pool workers and the ordering")
+        w("    # threads get, and stream calls run on those. Side modules take no")
+        w("    # stack flag: emcc passes -z stack-size only to a MAIN link, and a")
+        w("    # side module runs on whichever thread's stack calls into it.")
+        w("    #")
+        w("    # This makes the stacks safe for those frames. It is NOT a fix for the")
+        w("    # frame sizes, which are a defect in core/ on their own.")
         w("    LDFLAGS := -sMAIN_MODULE=1 -sEXPORT_ALL=1 -pthread -fwasm-exceptions \\")
         w("               $(ETCS_WEB_MEMORY) $(ETCS_WEB_POOL) $(ETCS_WEB_JSLIBS) \\")
-        w("               -sERROR_ON_UNDEFINED_SYMBOLS=0")
-        w("    # THE OUTPUT NAME, and it is not cosmetic. `-o etcs` on the web path")
-        w("    # writes JAVASCRIPT to the name the NATIVE loader binary has, and")
-        w("    # copy_loaders then moves it over bin/etcs -- one web build and the")
-        w("    # native runtime is gone, replaced by a file the kernel cannot exec.")
-        w("    # It is also what a browser is served as application/octet-stream and")
-        w("    # refuses as a script, and what made every page probe two names.")
+        w("               -sERROR_ON_UNDEFINED_SYMBOLS=0 \\")
+        w("               -sSTACK_SIZE=4MB -sDEFAULT_PTHREAD_STACK_SIZE=4MB")
+        w("    # THE OUTPUT NAME HAS AN EXTENSION, and it is not cosmetic: an")
+        w("    # extensionless `etcs` is JavaScript served as application/octet-stream,")
+        w("    # which a browser warns is not a script, and every page would have to")
+        w("    # probe two names to find it. `etcs.js` is what modules.json names.")
         w("    #")
         w("    # A SUFFIX, NOT AN ALIAS TARGET. The recipes below still have `etcs`")
         w("    # and `%Loader` as their targets and simply link to $@$(WEB_SUFFIX):")
@@ -1660,6 +1922,21 @@ class ManifestMixin:
         w("    LOADER_ARTIFACTS := Run_*Loader.js Run_*Loader.wasm etcs.js etcs.wasm")
         w("else")
         w("    LOADER_ARTIFACTS := Run_*Loader etcs")
+        w("endif")
+        w("")
+        w("# WHERE WEB ARTIFACTS LAND: bin/wasm/, one directory a serve script can")
+        w("# mount whole at /wasm/, and `ace wasm make ...` is the only thing that")
+        w("# writes to it. Not bin/, which also holds the native runtime, the .so")
+        w("# modules, run_all_tests.sh and the shader assets -- serving it to reach")
+        w("# etcs.wasm publishes all of them. Not a copy beside each page either:")
+        w("# ETCS's Makefile (WASM_DIR) has the argument, this is the loader half.")
+        w("#")
+        w("# Derived from BIN_DIR rather than spelled out, so relocating bin/")
+        w("# still moves both.")
+        w("ifdef EMSCRIPTEN")
+        w("    ARTIFACT_DIR := $(BIN_DIR)/wasm")
+        w("else")
+        w("    ARTIFACT_DIR := $(BIN_DIR)")
         w("endif")
         w("")
 
@@ -1719,13 +1996,28 @@ class ManifestMixin:
         w("LOADER_BINS := $(LOADER_SRCS:.cc=)")
         w("")
         w(".PHONY: all clean copy_loaders")
-        w("all: $(LOADER_BINS) etcs copy_loaders")
+        w("# copy_loaders IS A PHASE, NOT A SIBLING. Listed beside the links it")
+        w("# was free to run before them under -j, moving nothing and leaving")
+        w("# every binary in this directory -- a build that reports success and")
+        w("# populates no bin/. The links stay prerequisites, so they still")
+        w("# parallelise against each other; the move waits for all of them.")
+        w("all: $(LOADER_BINS) etcs")
+        w("\t$(MAKE) copy_loaders")
+        w("")
+        w("# DECLARED PHONY ON THE WEB PATH, and it is not a tidiness thing. The")
+        w("# recipe writes $@$(WEB_SUFFIX), so on the web path the target name and")
+        w("# the file it produces differ -- and a NATIVE `etcs` left in this")
+        w("# directory by an earlier native build is then a file make sees as the")
+        w("# target, newer than etcs.cc, and it reports nothing to do. The web link")
+        w("# is silently skipped and the page keeps loading the previous etcs.wasm,")
+        w("# which reads as a code change that did not take effect.")
+        w("ifdef EMSCRIPTEN")
+        w(".PHONY: etcs $(LOADER_BINS)")
+        w("endif")
         w("")
         w("# Both recipes link to $@$(WEB_SUFFIX). On a native build WEB_SUFFIX is")
         w("# empty, so the target and the file are the same name and make's own")
-        w("# up-to-date check still works. On the web path they differ, so the target")
-        w("# is effectively phony and relinks every time -- which is correct for a")
-        w("# single link step, and is the price of not emitting a file named `etcs`.")
+        w("# up-to-date check still works.")
         w("%Loader: %Loader.cc")
         w("\t$(CXX) $(CXXFLAGS) $(EXTRA_CXXFLAGS) $(EXTRADEFINES) -o Run_$@$(WEB_SUFFIX) $< "
           "$(EXTRA_LINK) $(LDFLAGS)")
@@ -1735,21 +2027,26 @@ class ManifestMixin:
           "$(EXTRA_LINK) $(LDFLAGS)")
         w("")
         w("copy_loaders:")
-        w("\t@mkdir -p $(BIN_DIR)")
-        w('\t@echo "--- Moving Loaders to $(BIN_DIR)/ ---"')
+        w("\t@mkdir -p $(ARTIFACT_DIR)")
+        w('\t@echo "--- Moving Loaders to $(ARTIFACT_DIR)/ ---"')
         w("\t@found=0; \\")
         w("\tfor f in $(LOADER_ARTIFACTS); do \\")
         w('\t    if [ -f "$$f" ]; then \\')
-        w('\t        mv -f "$$f" $(BIN_DIR)/; \\')
-        w('\t        echo " [✓] Moved: $$f -> $(BIN_DIR)/"; \\')
+        w('\t        mv -f "$$f" $(ARTIFACT_DIR)/; \\')
+        w('\t        echo " [✓] Moved: $$f -> $(ARTIFACT_DIR)/"; \\')
         w("\t        found=1; \\")
         w("\t    fi; \\")
         w("\tdone; \\")
         w("\tif [ $$found -eq 0 ]; then echo \" [!] No binaries found to move\"; fi")
         w("")
+        # ARTIFACT_DIR, not BIN_DIR, and the LOADER_ARTIFACTS split above is
+        # what makes that safe: a web clean names only .js/.wasm and looks only
+        # in bin/wasm/, so it cannot reach bin/etcs -- the native binary a web
+        # build never produced. That was already the reason for the split; this
+        # just stops the second line from undoing it.
         w("clean:")
         w("\trm -f *.o $(LOADER_ARTIFACTS)")
-        w("\t@for f in $(LOADER_ARTIFACTS); do rm -f $(BIN_DIR)/$$f; done")
+        w("\t@for f in $(LOADER_ARTIFACTS); do rm -f $(ARTIFACT_DIR)/$$f; done")
         w("")
         return "\n".join(L)
 
@@ -1786,14 +2083,27 @@ class ManifestMixin:
         return True
 
     def ensure_loaders_makefile(self):
-        """Regenerate loaders/Makefile when missing. Build-path hook."""
-        default, _ = self._loader_manifests()
+        """Regenerate loaders/Makefile when missing or stale. Build-path hook.
+
+        Same rule as ensure_makefile, and this is the file the rule was learned
+        on: the stack size and visibility flags live in its emscripten block.
+        """
+        default, overrides = self._loader_manifests()
         if default is None:
             return False
-        if (self.ace_root / "loaders" / "Makefile").exists():
+        makefile = self.ace_root / "loaders" / "Makefile"
+        if not makefile.exists():
+            print("[*] loaders/Makefile is missing -- regenerating from manifests.")
+            return self.generate_loaders_makefile()
+        try:
+            current = makefile.read_text() == self._emit_loaders_makefile(default, overrides)
+        except Exception:
+            current = True
+        if current:
             return False
-        print("[*] loaders/Makefile is missing -- regenerating from manifests.")
-        return self.generate_loaders_makefile()
+        print(f"{YELLOW}[!] loaders/Makefile is STALE -- the generator's output has "
+              f"changed since it was written. Regenerating.{RESET}")
+        return self.generate_loaders_makefile(force=True)
 
     # ------------------------------------------------------------------
     # system packages, folded into the existing deps surface

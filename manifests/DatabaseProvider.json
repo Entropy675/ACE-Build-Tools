@@ -5,7 +5,8 @@
     "std": "c++17",
     "platforms": [
       "Linux",
-      "Win"
+      "Win",
+      "Web"
     ],
     "impl_layout": "shared"
   },
@@ -61,7 +62,8 @@
               "-fPIC",
               "-DSQLITE_ENABLE_COLUMN_METADATA",
               "-DSQLITE_ENABLE_RTREE",
-              "-DSQLITE_THREADSAFE=1"
+              "-DSQLITE_THREADSAFE=1",
+              "-DSQLITE_OMIT_LOAD_EXTENSION"
             ]
           }
         }
@@ -80,6 +82,13 @@
     "Win": {
       "system_libs": [
         "ws2_32"
+      ]
+    },
+    "Web": {
+      "compiler": "em++",
+      "_comment": "IDBFS is how a database at a path outlives the tab: the page mounts /persist on it and syncs to IndexedDB. The loader links the library; this is where it is asked for, beside the module that needs it.",
+      "ldflags": [
+        "-lidbfs.js"
       ]
     }
   },
