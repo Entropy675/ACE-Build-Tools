@@ -6,7 +6,8 @@
     "std": "c++17",
     "platforms": [
       "Linux",
-      "Win"
+      "Win",
+      "Web"
     ],
     "impl_layout": "shared"
   },
@@ -55,6 +56,9 @@
       "system_libs": [
         "ws2_32"
       ]
+    },
+    "Web": {
+      "compiler": "em++"
     }
   },
 
