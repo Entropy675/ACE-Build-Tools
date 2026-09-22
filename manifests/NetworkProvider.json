@@ -5,7 +5,8 @@
     "std": "c++17",
     "platforms": [
       "Linux",
-      "Win"
+      "Win",
+      "Web"
     ]
   },
   "requires": {
@@ -162,6 +163,9 @@
       "system_libs": [
         "ws2_32"
       ]
+    },
+    "Web": {
+      "compiler": "em++"
     }
   },
   "produces": {

@@ -657,6 +657,15 @@ class ManifestMixin:
         w("    DEP_SAN_SUFFIX := _tsan")
         w("endif")
         w("")
+        # A FILE, not a word: emsdk puts <emscripten>/ on PATH and that directory
+        # holds a cmake/ subdirectory, which make's direct exec of a simple recipe
+        # line takes for the binary (cmake: Permission denied). command -v answers
+        # only with an executable regular file.
+        w("CMAKE := $(or $(shell command -v cmake 2>/dev/null),cmake)")
+        # Configure only. The toolchain is baked into the configured tree, so the
+        # build half stays $(CMAKE) everywhere; the Web block swaps in emcmake.
+        w("CMAKE_CONFIGURE ?= $(CMAKE)")
+        w("")
         w("# Symbols are not optional under a sanitizer -- see the DEBUG note.")
         w("ifneq ($(SANITIZE),)")
         w("    DEBUGFLAGS := -g")
@@ -737,7 +746,12 @@ class ManifestMixin:
             # build
             if dep.get("build"):
                 bd = dep["build"].get("build_dir", "build")
-                marker = (f"$({v}_DIR)/{bd}/.ace_built_$(ARCH)$(DEP_SAN_SUFFIX)"
+                # PLATFORM_TAG for the reason BUILD_STAMP carries it: a Web build
+                # leaves wasm objects in the same build/ a native link reads, and
+                # the host ARCH is the same either way -- without it the native
+                # link finds wasm members (plugin failed to claim member) while
+                # the marker says nothing needs rebuilding.
+                marker = (f"$({v}_DIR)/{bd}/.ace_built_$(ARCH)$(PLATFORM_TAG)$(DEP_SAN_SUFFIX)"
                           + _abi_tag(dep.get("abi_defines", [])))
                 w(f"{v}_BUILDMK := {marker}")
                 build_markers.append(f"$({v}_BUILDMK)")
@@ -890,6 +904,10 @@ class ManifestMixin:
                 # So the one flag that is a TARGET rather than a preference is
                 # carried to every vendored object here.
                 w("    DEP_TARGET_FLAGS := -pthread -fPIC")
+                # A cmake dependency is configured through emcmake so its static
+                # libraries are wasm; DEP_TARGET_FLAGS reaches them via the cmake
+                # rule's CMAKE_C_FLAGS, same rule as the inline vendored objects.
+                w("    CMAKE_CONFIGURE := emcmake $(CMAKE)")
                 # em++ is the Web default, like emcc above: manifests name a
                 # compiler only when it is NOT em++.
                 if not blk.get("compiler"):
@@ -1238,7 +1256,10 @@ class ManifestMixin:
         # the library and its consumer disagree about member offsets --
         # which links, loads, and corrupts memory rather than failing.
         abi = " ".join(f"-D{d}" for d in dep.get("abi_defines", []))
-        cflags = (abi + " $(DEP_SANITIZE)").strip()
+        # DEP_TARGET_FLAGS is empty natively and -pthread -fPIC under Web, where a
+        # library linked into a shared-memory side module must carry atomics and
+        # bulk-memory -- the rule _emit_obj_rule already follows.
+        cflags = (abi + " $(DEP_SANITIZE) $(DEP_TARGET_FLAGS)").strip()
 
         lines = []
         lines.append(f"# {dep['name']}: {system}")
@@ -1262,8 +1283,8 @@ class ManifestMixin:
             defines = " ".join(f'-D{d}' if "=" not in d or " " not in d
                                else f'-D"{d}"' for d in merged)
             lines.append(f"\t@rm -rf $({v}_DIR)/{bd}")
-            lines.append(f"\t@cmake -S $({v}_DIR) -B $({v}_DIR)/{bd} {defines}".rstrip())
-            lines.append(f"\t@cmake --build $({v}_DIR)/{bd} {par}".rstrip())
+            lines.append(f"\t@$(CMAKE_CONFIGURE) -S $({v}_DIR) -B $({v}_DIR)/{bd} {defines}".rstrip())
+            lines.append(f"\t@$(CMAKE) --build $({v}_DIR)/{bd} {par}".rstrip())
         elif system == "autotools":
             args = " ".join(b.get("configure_args", []))
             targets = " ".join(b.get("targets", []))
