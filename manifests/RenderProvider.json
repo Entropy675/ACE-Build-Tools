@@ -143,7 +143,8 @@
     },
     "Win": {
       "system_libs": [
-        "vulkan-1"
+        "vulkan-1",
+        "gdi32"
       ]
     },
     "Web": {
