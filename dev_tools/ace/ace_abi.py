@@ -686,7 +686,9 @@ Within a work function:\n
 DEFINE_WORK_FUNC(SomeType, SomeAction)
 {
     (void)ctx;
-    data.writeString((self.SomeOtherUnexposedAction().toString() + "\\n" + self.SomeAction(data.restAsString()).toString()).c_str());
+    data.writeString(self.SomeAction(data.restAsString()).c_str());   // reads the argument, then resets
+    data.write("\\n");
+    data.write(self.SomeOtherUnexposedAction().c_str());
 }
 
 Where:
