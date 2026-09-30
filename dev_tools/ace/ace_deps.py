@@ -107,6 +107,22 @@ class DepsMixin:
                         search.append(str(sub))
             return any((Path(d) / arg).exists() for d in search)
 
+        if kind == "python":
+            if not arg or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", arg):
+                print(f"  [!] python probe needs a simple module name, got {arg!r}")
+                return None
+            py = shutil.which("python3") or shutil.which("python")
+            if not py:
+                return None
+            try:
+                r = subprocess.run(
+                    [py, "-c", f"import {arg}"],
+                    capture_output=True,
+                )
+                return r.returncode == 0
+            except Exception:
+                return None
+
         print(f"  [!] Unknown probe kind '{kind}' -- treating as unprobeable.")
         return None
 
