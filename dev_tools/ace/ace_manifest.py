@@ -186,6 +186,48 @@ def _vendor_profiles(m, module_name):
     return out
 
 
+def _assets(m, module_platforms):
+    """produces.assets, checked, as [{i, src_dir, globs, dest, compile, suffix, platforms}].
+
+    An asset is files the module needs at runtime beside its binary:
+      "from":      a glob or list of globs, all in one directory
+      "to":        directory under bin/ ("" is bin/ itself)
+      "compile":   optional; the command that makes one output from one
+                   source, in make's terms ($< the source, $@ the output).
+                   Without it the source is copied.
+      "suffix":    appended to the source's name to name the output
+      "platforms": the builds that carry it (default: every platform)
+    Each output is its own make target with its source as prerequisite, so
+    the tree holds sources only and a build makes exactly what is stale.
+    """
+    raw = m.get("produces", {}).get("assets", [])
+    out = []
+    for i, a in enumerate(raw):
+        globs = a.get("from", [])
+        globs = globs.split() if isinstance(globs, str) else list(globs)
+        if not globs:
+            raise ManifestError(f"produces.assets[{i}] has no 'from'")
+        dirs = {g.rsplit("/", 1)[0] if "/" in g else "." for g in globs}
+        if len(dirs) != 1:
+            # One stem pattern per asset (the static pattern rule below);
+            # two source directories are two assets.
+            raise ManifestError(
+                f"produces.assets[{i}] 'from' spans {sorted(dirs)} -- one directory per asset")
+        plats = a.get("platforms", module_platforms)
+        stray = [p for p in plats if p not in module_platforms]
+        if stray:
+            raise ManifestError(
+                f"produces.assets[{i}] names platforms {stray} this module does not build")
+        dst = a.get("to", "")
+        out.append({
+            "i": i, "src_dir": dirs.pop(), "globs": globs,
+            "dest": "$(BIN_DIR)/" + dst if dst else "$(BIN_DIR)",
+            "compile": a.get("compile", ""), "suffix": a.get("suffix", ""),
+            "platforms": plats,
+        })
+    return out
+
+
 def _vendor_union(profiles):
     """Every profile's dependencies, deduplicated by name, in order.
 
@@ -559,6 +601,9 @@ class ManifestMixin:
         vendor = _vendor_union(profiles)
         build = m.get("build", {})
         common = build.get("common", {})
+        # Parsed here because the platform chain below says which of them
+        # each build carries.
+        assets = _assets(m, platforms)
 
         # Collected up front because the build stamp's NAME depends on them,
         # and the stamp is emitted above the dependency loop that declares
@@ -868,6 +913,9 @@ class ManifestMixin:
                     w(f"    {v_}_LINK :=")
                     w(f"    {v_}_FETCHMK :=")
                     w(f"    {v_}_BUILDMK :=")
+            for a in assets:
+                if plat in a["platforms"]:
+                    w(f"    ASSETS += $(ASSET{a['i']}_OUTS)")
             inc_here = [i for _v, plats_, incs in dep_carriage
                         if plat in plats_ for i in incs]
             if inc_here:
@@ -1055,33 +1103,36 @@ class ManifestMixin:
         # script worked from the repo root and produced a window that never
         # painted from anywhere else. An asset that ships with the module
         # should be installed with the module.
-        assets = produces.get("assets", [])
-        asset_rules = []
-        if assets:
-            for a in assets:
-                src = a.get("from", "")
-                dst = a.get("to", "")
-                if not src:
-                    continue
-                dest_dir = "$(BIN_DIR)/" + dst if dst else "$(BIN_DIR)"
-                asset_rules.append((src, dest_dir))
-
+        #
+        # A compiled asset (SPIR-V from GLSL) is built from its source here
+        # and never committed: each output is a target of its source and of
+        # this Makefile, so an edited shader or a changed command rebuilds
+        # that output alone. A static pattern rule, so two assets landing in
+        # one directory cannot claim each other's files.
         w(".PHONY: all clean install_assets")
-        if asset_rules:
+        stems = {}
+        if assets:
             w("BIN_DIR := ../../bin")
+            for a in assets:
+                i, sd, dest, sfx = a["i"], a["src_dir"], a["dest"], a["suffix"]
+                stems[i] = "%" if sd == "." else f"{sd}/%"   # $(wildcard) drops a leading ./
+                w(f"ASSET{i}_SRCS := $(wildcard {' '.join(a['globs'])})")
+                w(f"ASSET{i}_OUTS := $(patsubst {stems[i]},{dest}/%{sfx},$(ASSET{i}_SRCS))")
             w("all: $(FINAL_TARGET) install_assets")
         else:
             w("all: $(FINAL_TARGET)")
         w('\t@echo "✓ Built $(FINAL_TARGET) for $(UNAME_S)$(PLATFORM_TAG) ($(ARCH))"')
         w("")
-        w("install_assets:")
-        if asset_rules:
-            for src, dest_dir in asset_rules:
-                w(f"\t@mkdir -p {dest_dir}")
-                w(f"\t@cp -f {src} {dest_dir}/ 2>/dev/null || true")
-                w(f'\t@echo "  [assets] {src} -> {dest_dir}/"')
-        else:
-            w("\t@:")
+        # ASSETS is what this platform carries (the chain above adds to it).
+        # The rules come after `all`: the first target in the file is make's
+        # default goal.
+        w("install_assets: $(ASSETS)")
+        for a in assets:
+            i, dest, sfx = a["i"], a["dest"], a["suffix"]
+            w(f"$(ASSET{i}_OUTS): {dest}/%{sfx}: {stems[i]} Makefile")
+            w("\t@mkdir -p $(@D)")
+            w(f"\t@{a['compile'] or 'cp -f $< $@'}")
+            w(f'\t@echo "  [assets] $< -> $@"')
         w("")
 
         # ON THE MAKEFILE, so a REGENERATED Makefile is a new build. The stamp
@@ -1201,9 +1252,8 @@ class ManifestMixin:
         # Only the files this module declared, never the directory: two
         # modules may install into the same place, and one being cleaned is
         # not the other being uninstalled.
-        for src, dest_dir in asset_rules:
-            base = src.rsplit("/", 1)[-1]
-            w(f"\trm -f {dest_dir}/{base}")
+        for a in assets:
+            w(f"\trm -f $(ASSET{a['i']}_OUTS)")
         w("\t@echo \"✓ Cleaned $(TARGET_BASE_NAME) (vendored sources preserved)\"")
         w("")
 
