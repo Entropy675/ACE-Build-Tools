@@ -1,181 +1,184 @@
 #!/usr/bin/env python3
 """
-ETCS Script Viewer - Interactive TUI
+ETCS script editor -- `ace script`. A curses TUI with three views:
 
-Features:
-- File browser mode when called without arguments
-- Hybrid navigation: jumps between .etcs refs, but free-scrolls at the ends
-- Shebang line is initially highlighted (represents root script)
-- Enter to open in editor (respects $EDITOR/$VISUAL, defaults to nano)
-- Auto-reload expanded content after editing
-- Page Up/Down, Home/End for faster navigation
-- Left arrow/Backspace to back out of scripts or folders
-- Opening a file carrying the '#EXPORT' marker defaults to the interactive 
-  export STACK builder. Opening a file without it defaults to the inline 
-  .etcs viewer.
-- Tab toggles between the Stack Builder and the inline .etcs viewer, BUT 
-  ONLY if the file has the '#EXPORT' marker. Files without it cannot access 
-  the Stack view. Unsaved stack state survives the toggle.
-- 'e' or Tab in browser mode opens the interactive export.etcs stack builder
-  from the current stack state (resumes if you already started building).
-- q or Escape to quit
+  browser   the folder's .etcs files, roots first (nothing in the folder runs
+            them); Enter opens, e/Tab the export builder, n a new script
+  viewer    a script with every run/detach expanded inline, cursor jumping
+            between references; Enter edits in $EDITOR, r runs it
+  builder   composes an export: a stack of scripts, each run or detached, and
+            the names the export hands them
 
-Annotation convention for casual name declarations: NONE. Sockets are
-found by actually reading the file's context/tag-declare lines
-(scan_sockets) -- specifically the ones the real engine treats as an
-UNRESOLVED pending-name binding, not by a special comment format.
-Explicit 'spawn <name>' and 'as <name>' lines are deliberately NOT
-treated as sockets: both unconditionally overwrite any existing binding
-for that name at runtime (CmdSpawn's overwrite=true, CmdBind's unchecked
-ctx.bind()), so an external run/detach binding injected under either
-name would just get clobbered the moment the line executes -- exposing
-them as bindable in the export builder would be misleading. See
-scan_sockets' docstring for exactly what it does and does not handle
-correctly.
+THE BUILDER FOLLOWS THE ENGINE'S OWN SCOPING (preflight, core/CommandExecutor.h).
+An export is a root script, so every name it introduces is a global of the whole
+tree; a layer never sees another layer's names. A layer's inputs are its
+`requires <name> [Tags]` lines, and each is met by the export in one of the four
+ways the language has:
 
-Second-line file directives: '#EXPORT' and '#IMPORT <path>' are mutually
-exclusive by construction, not by any validation this tool performs --
-both are defined to occupy the exact same second line (right after the
-shebang), so a single line of text can only ever be one or the other, or
-neither. '#IMPORT <path>' declares the one folder (beyond the local
-directory) this file's own run/detach references may additionally
-resolve against, matching the real engine's script-path resolution. See
-get_import_target's and resolve_script_path's docstrings for the exact
-single-hop semantics.
+  requires   pass it up: the export requires it too, with every tag any layer
+             bound to it asked for -- the caller supplies it
+  attach     the export binds an existing one, or refuses
+  ensure     binds an existing one, or creates it
+  spawn      always creates it
+
+The bracket is access control -- bare tags (Window, PaintInput) say what the
+thing is, Module::Tag ones where it came from -- so the tighter the bracket the
+fewer entities qualify. The types a created one can be are read from the built
+binaries' export horizon (ace abi) and their families from the ontology: only
+types carrying every bare tag are offered. An origin tag cannot hold for a fresh
+spawn; it is checked when the export runs.
+
+Second-line directives: '#EXPORT [dir]' marks an export (builder view), '#IMPORT
+<dir>' a leaf; both name the one extra folder this file's own run/detach lines
+resolve against, exactly as the engine reads them (peek_import_directive).
 """
 
 import sys
 import os
 import re
+import shutil
 import subprocess
 import hashlib
 from pathlib import Path
 import curses
 
-# --- Session ---------------------------------------------------------------
-# The supervisor lives in the ace manager. `ace` is already the process that
-# owns the tree, the registry and every subprocess this system spawns, so the
-# thing that owns the terminal belongs with it rather than beside this file.
-# Found by tree layout first (this file sits at <ace_root>/scripts/), then via
-# `ace root`, so the editor still works when ace is not on PATH.
-_ace_module = None
-_ace_module_tried = False
+# --- the ace tool ----------------------------------------------------------
+# This file sits at <tool root>/dev_tools/, beside ace_install.py's own tree.
+# Imported for the type catalogue, which ace already reads out of the binaries.
+_ace_manager = None
+_ace_manager_tried = False
 
 
-def get_ace_module():
-    """Import ace_install.py for its session API. None if unavailable."""
-    global _ace_module, _ace_module_tried
-    if _ace_module_tried:
-        return _ace_module
-    _ace_module_tried = True
+def get_ace_manager():
+    """An AceManager from this tool's own ace_install.py. None if unavailable."""
+    global _ace_manager, _ace_manager_tried
+    if _ace_manager_tried:
+        return _ace_manager
+    _ace_manager_tried = True
     import importlib.util
-    candidates = [Path(__file__).resolve().parent.parent / "ace_install.py"]
-    root = get_ace_root()
-    if root:
-        candidates.append(Path(root) / "ace_install.py")
-    for cand in candidates:
-        try:
-            if not cand.exists():
+    tool_root = Path(__file__).resolve().parent.parent
+    cand = tool_root / "ace_install.py"
+    try:
+        if str(tool_root) not in sys.path:
+            sys.path.insert(0, str(tool_root))
+        spec = importlib.util.spec_from_file_location("ace_install", cand)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _ace_manager = mod.AceManager()
+    except Exception:
+        _ace_manager = None
+    return _ace_manager
+
+
+_type_catalogue = None
+
+
+def type_catalogue():
+    """{(Module, Tag): frozenset(tags)} for every type the built modules export.
+
+    The tag-types are the binaries' ABI symbols (AbiMixin._reconstruct_interface);
+    each one's tags are its own name plus the families its leaf composes
+    (OntologyMixin._parse_module_leaves) -- the set a `requires` bracket is
+    checked against. Empty when ace or bin/ is unavailable; a type can then
+    still be typed in by hand.
+    """
+    global _type_catalogue
+    if _type_catalogue is not None:
+        return _type_catalogue
+    _type_catalogue = {}
+    mgr = get_ace_manager()
+    if mgr is None:
+        return _type_catalogue
+    try:
+        for mod, so in mgr._all_module_sos():
+            iface = mgr._reconstruct_interface(so)
+            if not iface:
                 continue
-            spec = importlib.util.spec_from_file_location("ace_install", cand)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            if hasattr(mod, "AceSession"):
-                _ace_module = mod
-                break
-        except Exception:
-            continue
-    return _ace_module
+            try:
+                fams = mgr._parse_module_leaves(mod)
+            except Exception:
+                fams = {}
+            for tag in iface['types']:
+                _type_catalogue[(mod, tag)] = frozenset([tag, *fams.get(tag, [])])
+    except Exception:
+        pass
+    return _type_catalogue
 
-ETCS_REF_PATTERN = re.compile(
-    r'(run|detach)\s+(\S+\.etcs)',
-    re.IGNORECASE
-)
 
-SELECTABLE_KINDS = ('layer_header', 'socket', 'available')
+def bare_tags(tags):
+    return [t for t in tags if '::' not in t]
+
+
+def origin_tags(tags):
+    return [t for t in tags if '::' in t]
+
+
+def type_candidates(tags):
+    """Types a fresh one could be: every bare tag present. Sorted."""
+    need = set(bare_tags(tags))
+    return sorted(k for k, have in type_catalogue().items() if need <= have)
+
+
+def type_covers(mt, tags):
+    """(ok, missing bare tags) for a Module::Tag against a bracket. A type the
+    catalogue does not know is taken on trust -- the engine checks at run."""
+    have = type_catalogue().get(tuple(mt))
+    if have is None:
+        return True, []
+    missing = [t for t in bare_tags(tags) if t not in have]
+    return not missing, missing
+
+
+# A reference is a STATEMENT: run/detach at the start of a live line. The
+# engine never reads comments, and this tree's comments are full of examples.
+_RUN_DETACH_LINE_RE = re.compile(r'^(run|detach)\s+(\S+\.etcs)(.*)$')
+_REQUIRES_RE = re.compile(r'^requires\s+([A-Za-z0-9_]+)\s*(?:\[(.*)\])?\s*$')
+_ACQUIRE_RE = re.compile(r'^(spawn|attach|ensure)\s+([A-Za-z0-9_]+)::([A-Za-z0-9_]+)\s+([A-Za-z0-9_]+)\s*$')
+
+VERBS = ('requires', 'ensure', 'attach', 'spawn')
+
+
+def statement_ref(line):
+    """(verb, script, rest) if this line runs or detaches a script, else None."""
+    m = _RUN_DETACH_LINE_RE.match(line.strip())
+    return (m.group(1), m.group(2), m.group(3)) if m else None
+
 
 EXPORT_MARKER = "#EXPORT"
 IMPORT_MARKER_PREFIX = "#IMPORT"
 SWITCH_TO_VIEWER = "SWITCH_TO_VIEWER"
 
-_CONTEXT_LINE_RE = re.compile(r'^context\s+(\S+)::(\S+)\s+(\S+)\s*$')
-_RUN_DETACH_LINE_RE = re.compile(r'^(run|detach)\s+(\S+\.etcs)(.*)$', re.IGNORECASE)
+NEW_SCRIPT_TEMPLATE = "#!/usr/bin/env etcs\n#IMPORT ACE_ROOT/modules\n\n"
 
-# --- Session state for mode-switching ---
-# Keyed by resolved dirpath (for browser 'e' key) or resolved filepath 
-# (for toggling views on a specific export file).
+# Builder state per session key: resolved dirpath (browser 'e') or the export's
+# own path (toggling views on it), so an unsaved stack survives the toggle.
 _builder_sessions = {}
 
-# --- Live runtime ----------------------------------------------------------
-# The editor and the runtime are peers, not parent and child: both are held by
-# one Session that owns the terminal, and a swap is only a question of which
-# one is currently attached to it. That is what lets the runtime keep its REPL
-# state across edits -- re-running feeds the newly composed script into the
-# process that is already up rather than restarting it.
 TEMP_RUN_SUFFIX = "_temporary_edit"
-ETCS_RUNTIME_ARGV = None        # None -> [<ace root>/bin/etcs] or ['etcs']
-
-_runtime_session = None
 
 
-def get_session():
-    """This process's own AceSession, created on first relevance. Only used
-    when the editor is NOT running under `ace session` -- in that case it
-    hosts the handover itself."""
-    global _runtime_session
-    mod = get_ace_module()
-    if _runtime_session is None and mod is not None:
-        _runtime_session = mod.AceSession()
-    return _runtime_session
-
-
-def _runtime_argv():
-    if ETCS_RUNTIME_ARGV:
-        return list(ETCS_RUNTIME_ARGV)
-    return [get_ace_shebang() or "etcs"]
+def etcs_binary():
+    """The runtime: the tree's own bin/etcs, else whatever `etcs` is on PATH."""
+    root = get_ace_root()
+    if root and (Path(root) / "bin" / "etcs").exists():
+        return str(Path(root) / "bin" / "etcs")
+    return shutil.which("etcs") or "etcs"
 
 
 def run_script_now(stdscr, script_path, cwd=None):
-    """Run a script, preferring an already-live runtime over starting one.
+    """Run a script in a fresh runtime in the foreground, then come back.
 
-    Three tiers, in order of how much state they preserve:
-
-      1. An `ace session` is running -- feed the script to the runtime it is
-         already supervising. Never starts a second one; that is the whole
-         point of the socket.
-      2. No session, but the ace module is importable -- host the handover in
-         this process. Ctrl+] comes back here, runtime keeps its REPL state.
-      3. Neither -- one-shot foreground run. The export carries its own
-         shebang and is chmod 755, so it can execute directly.
+    As `etcs <path>`, never the file itself: most scripts carry no execute
+    bit, and the engine resolves every path against the script, not the shell.
+    A second runtime is just a second run -- nothing here is kept alive.
     """
     script_path = Path(script_path)
     cwd = str(cwd) if cwd else str(script_path.parent)
-    mod = get_ace_module()
-
-    if mod is not None:
-        reply = mod.session_request(f"RUN {script_path.resolve()}")
-        if reply and reply.startswith("OK"):
-            return "sent to the ace session's runtime — swap to that terminal"
-        if reply:
-            return f"session refused it: {reply}"
-
-    if mod is not None:
-        swap = getattr(mod, "SWAP_KEY", 0x1D)
-        banner = (f"\r\n\033[36m[etcs]\033[0m {script_path.name} — "
-                  f"Ctrl+{chr(swap + 64)} returns to the editor, "
-                  f"runtime keeps running\r\n")
-        outcome = mod.run_from_curses(
-            stdscr, get_session(), 'runtime', _runtime_argv(), cwd=cwd,
-            feed=mod.ETCS_RUN_COMMAND.format(path=script_path), banner=banner)
-        return {'swap': "detached from the runtime — r reattaches",
-                'exit': "runtime exited",
-                'absent': "could not start the runtime"}.get(outcome, "")
-
     curses.def_prog_mode()
     curses.endwin()
     try:
         try:
-            subprocess.run([str(script_path)], cwd=cwd)
+            subprocess.run([etcs_binary(), str(script_path)], cwd=cwd)
         except (OSError, subprocess.SubprocessError) as e:
             print(f"\n Could not run {script_path}: {e}")
         input("\n [enter] to return to the editor ")
@@ -188,10 +191,10 @@ def run_script_now(stdscr, script_path, cwd=None):
 
 def run_stack_now(stdscr, dirpath, stack, name):
     """Write the stack to a scratch export and run it."""
-    export_path, conflicts = _write_export(dirpath, stack, name)
+    export_path, problems = _write_export(dirpath, stack, name)
     status = run_script_now(stdscr, export_path, cwd=dirpath)
-    if conflicts:
-        status = f"{len(conflicts)} name/type conflict(s) — see save output"
+    if problems:
+        status = f"{len(problems)} problem(s) in the export -- s shows them"
     return status
 
 
@@ -225,31 +228,32 @@ class FileEntry:
         self.is_etcs = is_etcs
 
 
+class Stack(list):
+    """The builder's layers, plus the domain folder a reopened export declared
+    (its '#EXPORT <dir>'), kept so a re-save resolves its references the same
+    way. None for a new stack: the export then names its own folder.
+    `extras` are a reopened export's hand-written lines, each after the layer
+    it followed (-1: before the first)."""
+    domain = None
+    extras = ()
+
+
 class StackLayer:
-    """One script pushed onto the export builder's stack."""
-    __slots__ = ['file', 'mode', 'sockets', 'bindings']
+    """One script pushed onto the export builder's stack.
 
-    def __init__(self, file, sockets):
+    Every input starts bound to its own name and passed up (`requires`), so a
+    fresh stack is already a valid statement: the export needs what its layers
+    need. The choice is kept per input and applied per export name (set_decl).
+    """
+    __slots__ = ['file', 'ref', 'mode', 'sockets', 'bindings', 'decls']
+
+    def __init__(self, file, sockets, ref=None):
         self.file = file           # Path
-        self.mode = 'detach'       # 'run' or 'detach' — defaults to detach
-        self.sockets = sockets     # list of dicts from scan_sockets()
-        self.bindings = {}         # local socket name -> canonical name (str)
-
-
-class UIRow:
-    """One renderable/selectable row in the export builder's flat list."""
-    __slots__ = ['kind', 'data', 'layer_idx']
-
-    def __init__(self, kind, data, layer_idx=None):
-        self.kind = kind
-        self.data = data
-        self.layer_idx = layer_idx
-
-
-def _is_dead_line(line):
-    """True if this line is inert as far as the real .etcs engine is
-    concerned — mirrors run_script's own '#' comment-skip rule exactly."""
-    return line.lstrip().startswith('#')
+        self.ref = ref or file.name   # as the run/detach line spells it
+        self.mode = 'detach'       # 'run' or 'detach'
+        self.sockets = sockets     # from scan_sockets()
+        self.bindings = {s['name']: s['name'] for s in sockets}   # input -> export name
+        self.decls = {s['name']: {'verb': 'requires', 'type': None} for s in sockets}
 
 
 def _parse_marker_line(path):
@@ -376,12 +380,10 @@ def compute_roots(dirpath):
         except IOError:
             continue
         for line in content.splitlines():
-            if _is_dead_line(line):
+            ref = statement_ref(line)
+            if not ref:
                 continue
-            match = ETCS_REF_PATTERN.search(line)
-            if not match:
-                continue
-            ref_name = match.group(2)
+            ref_name = ref[1]
             ref_path = resolve_script_path(f, ref_name)
             for ef in etcs_files:
                 if ef.resolve() == ref_path:
@@ -397,17 +399,16 @@ _ace_root_cache_computed = False
 
 
 def get_ace_root():
-    """Resolve the ace root directory via 'ace root'. Returns None if
-    unavailable.
-
-    Cached for this process's lifetime -- ACE_ROOT-relative directives
-    call this on every affected run/detach resolution, browser listing,
-    and export write, so re-spawning the subprocess each time would be
-    far too hot a path.
-    """
+    """The tree's root: $ACE_ROOT if set (the override the engine honours
+    first), else `ace root`. None if neither answers. Cached -- every
+    ACE_ROOT-relative resolution asks."""
     global _ace_root_cache, _ace_root_cache_computed
     if _ace_root_cache_computed:
         return _ace_root_cache
+    env = os.environ.get("ACE_ROOT")
+    if env:
+        _ace_root_cache, _ace_root_cache_computed = env, True
+        return env
     try:
         result = subprocess.run(
             ["ace", "root"],
@@ -421,12 +422,6 @@ def get_ace_root():
         _ace_root_cache = None
     _ace_root_cache_computed = True
     return _ace_root_cache
-
-
-def get_ace_shebang():
-    """Resolve the '#!' interpreter line for a generated export.etcs."""
-    root = get_ace_root()
-    return f"{root}/bin/etcs" if root else None
 
 
 ACE_ROOT_PLACEHOLDER = "ACE_ROOT"
@@ -483,158 +478,161 @@ def _resolve_directive_target(raw_target, from_file):
     return target_path
 
 
+def _parse_bracket(text):
+    return [t.strip() for t in (text or '').split(',') if t.strip()]
+
+
 def scan_sockets(filepath):
-    """Best-effort STATIC scan for a .etcs file's exposed local socket names."""
-    sockets = []
-    seen_names = set()
-    module_name = ""
-    tag_name = ""
-    started = False
+    """A script's inputs: its live `requires <name> [Tags]` lines, in order.
 
-    def add_socket(module, tag, name, line_no):
-        if not module or not tag or not name or name in seen_names:
-            return
-        seen_names.add(name)
-        sockets.append({'module': module, 'tag': tag, 'name': name, 'line': line_no})
-
-    def is_local_name(tok):
-        return bool(tok) and bool(re.match(r'^[A-Za-z0-9_]+$', tok)) and not tok.isdigit()
-
+    Exactly what the engine's pass 1 collects -- whole-file, before line one --
+    and nothing else: spawn/attach/ensure introduce a script's own names, which
+    a caller can never hand in.
+    """
+    sockets, seen = [], set()
     try:
         raw_lines = Path(filepath).read_text(errors='replace').splitlines()
     except IOError:
         return sockets
-
     for line_no, raw in enumerate(raw_lines, 1):
-        line = raw.strip()
-        if not line or line.startswith('#'):
+        m = _REQUIRES_RE.match(raw.strip())
+        if not m or m.group(1) in seen:
             continue
-
-        is_first_line = not started
-        started = True
-
-        sp = line.split(None, 1)
-        verb = sp[0]
-        rest = sp[1].strip() if len(sp) > 1 else ""
-
-        if verb == 'context':
-            if not rest:
-                continue
-            parts = rest.split(None, 1)
-            scope = parts[0]
-            name_tok = parts[1].strip() if len(parts) > 1 else ""
-            if '::' in scope:
-                mod, tg = scope.split('::', 1)
-                module_name, tag_name = mod, tg
-                if name_tok and is_local_name(name_tok):
-                    add_socket(mod, tg, name_tok, line_no)
-            elif scope[:1].isupper():
-                module_name, tag_name = scope, ""
-            continue
-
-        if verb == 'spawn':
-            if rest and '::' in rest:
-                parts = rest.split(None, 1)
-                mod, tg = parts[0].split('::', 1)
-                module_name, tag_name = mod, tg
-                if len(parts) > 1 and is_local_name(parts[1].strip()):
-                    seen_names.add(parts[1].strip())
-            elif rest and is_local_name(rest):
-                seen_names.add(rest)
-            continue
-
-        if verb == 'as':
-            # CmdBind (as name) calls ctx.bind(), which unconditionally
-            # overwrites names[name] -- there is no existing-binding check,
-            # exactly like explicit spawn's overwrite=true path above. That
-            # means a name declared here can never actually receive an
-            # external binding from a run/detach caller: injecting one
-            # would just get clobbered the instant this line executes.
-            # Record it so a later line can't mistakenly get treated as a
-            # real socket under the same name, but don't expose this one
-            # as bindable -- same treatment as spawn, for the same reason.
-            if rest and is_local_name(rest):
-                seen_names.add(rest)
-            continue
-
-        if verb.lower() in ('detach', 'run', 'signal', 'jobs', 'list', 'exit', 'quit'):
-            continue
-
-        if verb[:1].isupper() and '.' not in verb:
-            if is_first_line or not module_name:
-                module_name, tag_name = verb, ""
-            elif not tag_name:
-                tag_name = verb
-                if rest and is_local_name(rest):
-                    add_socket(module_name, tag_name, rest, line_no)
-            continue
-
+        seen.add(m.group(1))
+        sockets.append({'name': m.group(1), 'tags': _parse_bracket(m.group(2)),
+                        'line': line_no})
     return sockets
 
 
-def suggest_canonical(stack, layer_idx, sock):
-    """Look backward through already-stacked layers for a socket of the
-    exact same (module, tag) type that the user has ALREADY given an
-    explicit canonical binding to."""
-    for earlier in reversed(stack[:layer_idx]):
-        for esock in earlier.sockets:
-            if esock['module'] == sock['module'] and esock['tag'] == sock['tag']:
-                canon = earlier.bindings.get(esock['name'])
-                if canon:
-                    return canon
-    return None
+def export_names(stack):
+    """{export name: [(layer_idx, socket), ...]} in stack order."""
+    out = {}
+    for li, layer in enumerate(stack):
+        for sock in layer.sockets:
+            canon = layer.bindings.get(sock['name'])
+            if canon:
+                out.setdefault(canon, []).append((li, sock))
+    return out
+
+
+def name_tags(stack, canon):
+    """Every tag any input bound to `canon` asks for, first-seen order."""
+    tags = []
+    for li, sock in export_names(stack).get(canon, []):
+        for t in sock['tags']:
+            if t not in tags:
+                tags.append(t)
+    return tags
+
+
+def name_decl(stack, canon):
+    """The declaration of an export name: its first input's."""
+    for li, sock in export_names(stack).get(canon, []):
+        return stack[li].decls.get(sock['name'], {'verb': 'requires', 'type': None})
+    return {'verb': 'requires', 'type': None}
+
+
+def set_decl(stack, canon, verb=None, type_=False):
+    """Change how the export meets `canon`, on every input bound to it -- one
+    name, one declaration."""
+    for li, sock in export_names(stack).get(canon, []):
+        d = stack[li].decls.setdefault(sock['name'], {'verb': 'requires', 'type': None})
+        if verb is not None:
+            d['verb'] = verb
+        if type_ is not False:
+            d['type'] = type_
 
 
 def parse_export_stack(filepath):
-    """Parse an EXISTING #EXPORT file back into a (stack, referenced_files)
-    pair the builder can resume editing from."""
-    canonical_types = {}
-    stack = []
-    referenced = set()
+    """An existing export back into a stack.
 
+    Each run/detach line becomes a layer, its inputs rebound as the line binds
+    them. A binding to an input the script no longer states (or a script that
+    no longer resolves) is kept as an input with no tags, so a re-save does
+    not drop it. The declaration of every bound name is read back; any other
+    statement -- a hand-written action, a name the export uses for itself --
+    is kept verbatim, after the layer it followed (Stack.extras).
+    """
+    decls, stack, referenced = {}, Stack(), set()
     try:
         lines = Path(filepath).read_text(errors='replace').splitlines()
     except IOError:
         return stack, referenced
+    if len(lines) > 1 and lines[1].strip().startswith(EXPORT_MARKER):
+        stack.domain = lines[1].strip()[len(EXPORT_MARKER):].strip() or None
 
+    held = []            # (anchor layer index, line, name it declares or None)
     for raw in lines:
         line = raw.strip()
         if not line or line.startswith('#'):
             continue
-
-        m = _CONTEXT_LINE_RE.match(line)
+        ref = statement_ref(line)
+        if ref:
+            mode, script_name, rest = ref
+            script_path = resolve_script_path(filepath, script_name)
+            referenced.add(script_path)
+            sockets = scan_sockets(script_path) if script_path.exists() else []
+            given = dict(t.split('=', 1) for t in rest.split() if '=' in t)
+            known = {sk['name'] for sk in sockets}
+            sockets += [{'name': k, 'tags': [], 'line': -1, 'unread': True}
+                        for k in given if k not in known]
+            layer = StackLayer(script_path, sockets, ref=script_name)
+            layer.mode = mode.lower()
+            for sock in sockets:
+                # Bound on the line, or by name through a root global.
+                layer.bindings[sock['name']] = given.get(sock['name'], sock['name'])
+            stack.append(layer)
+            continue
+        m = _REQUIRES_RE.match(line)
         if m:
-            mod, tag, nm = m.group(1), m.group(2), m.group(3)
-            canonical_types.setdefault(nm, (mod, tag))
+            decls[m.group(1)] = {'verb': 'requires', 'type': None}
+            held.append((len(stack) - 1, raw, m.group(1)))
             continue
-
-        m = _RUN_DETACH_LINE_RE.match(line)
-        if not m:
+        m = _ACQUIRE_RE.match(line)
+        if m:
+            decls[m.group(4)] = {'verb': m.group(1), 'type': (m.group(2), m.group(3))}
+            held.append((len(stack) - 1, raw, m.group(4)))
             continue
-        mode, script_name, rest = m.group(1).lower(), m.group(2), m.group(3)
+        held.append((len(stack) - 1, raw, None))
 
+    bound = set(export_names(stack))
+    for layer in stack:
+        for sock in layer.sockets:
+            canon = layer.bindings.get(sock['name'])
+            layer.decls[sock['name']] = dict(decls.get(canon, {'verb': 'requires', 'type': None}))
+    # A bound name's declaration is the builder's to write; anything else stays.
+    stack.extras = [(anchor, raw) for anchor, raw, name in held if name not in bound]
+    return stack, referenced
+    if len(lines) > 1 and lines[1].strip().startswith(EXPORT_MARKER):
+        stack.domain = lines[1].strip()[len(EXPORT_MARKER):].strip() or None
+
+    for raw in lines:
+        line = raw.strip()
+        m = _REQUIRES_RE.match(line)
+        if m:
+            decls[m.group(1)] = {'verb': 'requires', 'type': None}
+            continue
+        m = _ACQUIRE_RE.match(line)
+        if m:
+            decls[m.group(4)] = {'verb': m.group(1), 'type': (m.group(2), m.group(3))}
+
+    for raw in lines:
+        ref = statement_ref(raw)
+        if not ref:
+            continue
+        mode, script_name, rest = ref
         script_path = resolve_script_path(filepath, script_name)
         referenced.add(script_path)
-
         sockets = scan_sockets(script_path) if script_path.exists() else []
-        socket_names = {s['name'] for s in sockets}
-
-        bindings = {}
-        for token in rest.split():
-            if '=' not in token:
-                continue
-            k, v = token.split('=', 1)
-            bindings[k] = v
-            if k not in socket_names:
-                mod, tag = canonical_types.get(v, ("?", "?"))
-                sockets.append({'module': mod, 'tag': tag, 'name': k, 'line': -1})
-                socket_names.add(k)
-
-        layer = StackLayer(script_path, sockets)
-        layer.mode = 'run' if mode == 'run' else 'detach'
-        layer.bindings = bindings
+        given = dict(t.split('=', 1) for t in rest.split() if '=' in t)
+        layer = StackLayer(script_path, sockets, ref=script_name)
+        layer.mode = mode.lower()
+        for sock in sockets:
+            # Bound on the line, or by name through a root global.
+            canon = given.get(sock['name'], sock['name'])
+            layer.bindings[sock['name']] = canon
+            layer.decls[sock['name']] = dict(decls.get(canon, {'verb': 'requires', 'type': None}))
         stack.append(layer)
-
     return stack, referenced
 
 
@@ -753,53 +751,10 @@ def prompt_export_name(stdscr, default="export"):
         default = name
 
 
-def build_rows(stack, available):
-    """Flatten current stack + available scripts into one selectable list."""
-    rows = []
-    rows.append(UIRow('section', 'AVAILABLE (Enter/Right adds to stack)'))
-    for p in available:
-        rows.append(UIRow('available', p))
-    rows.append(UIRow('section', 'STACK (execution order, top to bottom)'))
-    if not stack:
-        rows.append(UIRow('empty', '  (empty — add a script from AVAILABLE above)'))
-    for li, layer in enumerate(stack):
-        rows.append(UIRow('layer_header', layer, layer_idx=li))
-        for sock in layer.sockets:
-            rows.append(UIRow('socket', sock, layer_idx=li))
-    return rows
-
-
-def clamp_to_selectable(rows, idx):
-    """Return the nearest row index whose kind is in SELECTABLE_KINDS."""
-    if not rows:
-        return 0
-    idx = max(0, min(idx, len(rows) - 1))
-    if rows[idx].kind in SELECTABLE_KINDS:
-        return idx
-    for i in range(idx, len(rows)):
-        if rows[i].kind in SELECTABLE_KINDS:
-            return i
-    for i in range(idx, -1, -1):
-        if rows[i].kind in SELECTABLE_KINDS:
-            return i
-    return idx
-
-
-def move_selectable(rows, cursor, direction):
-    """Step cursor by one selectable row in the given direction (+1/-1)."""
-    idx = cursor
-    while True:
-        idx += direction
-        if idx < 0 or idx >= len(rows):
-            return cursor
-        if rows[idx].kind in SELECTABLE_KINDS:
-            return idx
-
-
 def pop_layer(stack, available, idx):
     """Remove the stack layer at idx (any position)."""
     if 0 <= idx < len(stack):
-        popped = stack.pop(idx)
+        stack.pop(idx)
 
 
 def _link_export_to_ace_root(export_path, name):
@@ -828,84 +783,77 @@ def _link_export_to_ace_root(export_path, name):
         print(f"\n Warning: could not create symlink at {link_path}: {e}")
 
 
-def _write_export(dirpath, stack, name):
-    """Write '<name>.etcs' from the stack. Returns (export_path, conflicts).
+def export_problems(stack):
+    """What the engine's preflight would refuse, or cannot know until run,
+    per export name. Empty when the export states everything it needs."""
+    problems = []
+    for canon, users in export_names(stack).items():
+        d = name_decl(stack, canon)
+        for li, sock in users[1:]:
+            other = stack[li].decls.get(sock['name'])
+            if other and other != d:
+                problems.append(f"'{canon}': [{li + 1}] {stack[li].file.name} asks "
+                                f"{other['verb']} but the name is already {d['verb']}")
+        if d['verb'] == 'requires':
+            continue
+        if not d['type']:
+            problems.append(f"'{canon}': {d['verb']} needs a type (t on the input)")
+            continue
+        ok, missing = type_covers(d['type'], name_tags(stack, canon))
+        if not ok:
+            problems.append(f"'{canon}': {d['type'][0]}::{d['type'][1]} does not "
+                            f"carry [{', '.join(missing)}]")
+    return problems
 
-    Writing the file and editing it used to be one function. They are two
-    different operations -- the run path needs the artifact on disk and must
-    NOT tear down curses or open an editor -- so they are separate now, and
-    _write_export_and_edit is the composition of the two.
+
+def _write_export(dirpath, stack, name):
+    """Write '<name>.etcs' from the stack. Returns (export_path, problems).
+
+    One declaration per export name, before the layers, in the order the
+    names are first needed: `requires` with every tag its inputs ask for, or
+    spawn/attach/ensure of the chosen type. Then each layer, binding each
+    input to its name -- the explicit form of what a root global would also
+    supply by name.
     """
     dirpath = Path(dirpath)
-    lines_out = []
-    declared = set()
-    name_types = {}
-    conflicts = []
-    declare_lines = []
+    # The domain a reopened export declared, else its own folder: run through
+    # the central exports/ symlink, its origin is the link's folder.
+    domain = getattr(stack, 'domain', None) or to_ace_root_relative(dirpath)
+    lines_out = ["#!/usr/bin/env etcs",
+                 f"{EXPORT_MARKER} {domain}",
+                 "# Auto-generated by etcs_viewer.py's export builder."]
 
-    ace_path = get_ace_shebang()
-    lines_out.append(f"#!{ace_path}" if ace_path else "#!/usr/bin/env etcs")
-    # Always carry this export's own real source folder as its domain path
-    # -- not just the bare marker. _link_export_to_ace_root below symlinks
-    # this file into a central exports/ directory; when the interpreter
-    # later runs it THROUGH that symlink, its origin path is the symlink's
-    # location, not this one. Without a declared domain folder, local-only
-    # resolution would look for every layer script next to the symlink and
-    # find nothing. Declaring the real folder here means resolve_script_path
-    # falls back to exactly the right place regardless of where this file
-    # ends up being invoked from.
-    lines_out.append(f"{EXPORT_MARKER} {to_ace_root_relative(dirpath)}")
-    lines_out.append("# Auto-generated by etcs_viewer.py's export builder.")
+    for canon in export_names(stack):
+        d = name_decl(stack, canon)
+        if d['verb'] == 'requires':
+            tags = name_tags(stack, canon)
+            lines_out.append(f"requires {canon}" + (f" [{', '.join(tags)}]" if tags else ""))
+        elif d['type']:
+            lines_out.append(f"{d['verb']} {d['type'][0]}::{d['type'][1]} {canon}")
 
-    for layer in stack:
-        for sock in layer.sockets:
-            canonical = layer.bindings.get(sock['name'])
-            if not canonical:
-                continue
-            typekey = (sock['module'], sock['tag'])
-            if canonical in name_types and name_types[canonical] != typekey:
-                prev_mod, prev_tag = name_types[canonical]
-                conflicts.append(
-                    f"'{canonical}' bound as {prev_mod}::{prev_tag} earlier, then "
-                    f"again as {typekey[0]}::{typekey[1]} in {layer.file.name} — "
-                    f"the second binding will NOT reach that entity at runtime."
-                )
-            else:
-                name_types.setdefault(canonical, typekey)
-
-            if canonical not in declared:
-                declare_lines.append(f"context {sock['module']}::{sock['tag']} {canonical}")
-                declare_lines.append(f"spawn {sock['module']}::{sock['tag']} {canonical}")
-                declared.add(canonical)
-
-    lines_out.extend(declare_lines)
-
-    for layer in stack:
-        binding_tokens = [
-            f"{sock['name']}={layer.bindings[sock['name']]}"
-            for sock in layer.sockets
-            if layer.bindings.get(sock['name'])
-        ]
-        line = f"{layer.mode} {layer.file.name}"
-        if binding_tokens:
-            line += " " + " ".join(binding_tokens)
-        lines_out.append(line)
+    extras = getattr(stack, 'extras', ())
+    lines_out += [raw for anchor, raw in extras if anchor < 0]
+    for li, layer in enumerate(stack):
+        tokens = [f"{s['name']}={layer.bindings[s['name']]}"
+                  for s in layer.sockets if layer.bindings.get(s['name'])]
+        lines_out.append(" ".join([layer.mode, layer.ref] + tokens))
+        lines_out += [raw for anchor, raw in extras if anchor == li]
 
     export_path = dirpath / f"{name}.etcs"
     export_path.write_text("\n".join(lines_out) + "\n", encoding='utf-8')
     os.chmod(export_path, 0o755)
-    return export_path, conflicts
+    return export_path, export_problems(stack)
 
 
 def _write_export_and_edit(dirpath, stack, name):
     """Write '<name>.etcs' from the finalized stack, then open $EDITOR."""
-    export_path, conflicts = _write_export(dirpath, stack, name)
+    export_path, problems = _write_export(dirpath, stack, name)
 
     curses.endwin()
     print(f"\n Wrote {export_path}\n")
-    if conflicts:
-        print(" Warning — name reused across different types:")
-        for c in conflicts:
+    if problems:
+        print(" The engine will refuse this as it stands:")
+        for c in problems:
             print(f"   - {c}")
     _link_export_to_ace_root(export_path, name)
     edit_file(export_path)
@@ -916,10 +864,14 @@ def switch_layer(stack, available, idx, new_file):
     """Replace the stack layer at idx with a freshly-scanned layer for new_file."""
     if not (0 <= idx < len(stack)):
         return
-    old_mode = stack[idx].mode
-    old_file = stack[idx].file
+    old = stack[idx]
     new_layer = StackLayer(new_file, scan_sockets(new_file))
-    new_layer.mode = old_mode
+    new_layer.mode = old.mode
+    # An input of the same name keeps its binding and its declaration.
+    for sock in new_layer.sockets:
+        if sock['name'] in old.bindings:
+            new_layer.bindings[sock['name']] = old.bindings[sock['name']]
+            new_layer.decls[sock['name']] = dict(old.decls.get(sock['name'], {}))
     stack[idx] = new_layer
 
 
@@ -942,7 +894,10 @@ def switch_layer(stack, available, idx, new_file):
 #                    fragment under the cursor; with a block active, cancel it
 #   Shift+Left       delete the next instance of the last-pushed fragment,
 #                    scanning from the bottom -- repeatable
-#   Enter/Right      push / toggle mode / edit a socket binding
+#   Enter            push / name the export name an input is bound to
+#   Right            push / toggle run-detach / cycle an input's verb
+#                    (requires -> ensure -> attach -> spawn)
+#   t                cycle an input's type among those carrying its tags
 #   d x s r q        duplicate, switch, save, run, quit
 #
 # Shift never touches the block. It is the pane key, so a block cannot survive
@@ -1164,9 +1119,10 @@ def _relocate(stack, lo, hi, insert_at):
 
 
 def _dup_layer(orig):
-    dup = StackLayer(orig.file, orig.sockets)
+    dup = StackLayer(orig.file, orig.sockets, ref=orig.ref)
     dup.mode = orig.mode
     dup.bindings = dict(orig.bindings)
+    dup.decls = {k: dict(v) for k, v in orig.decls.items()}
     return dup
 
 
@@ -1214,22 +1170,79 @@ def _confirm_bar(stdscr, message):
 
 
 def _edit_binding(stdscr, stack, unit, spans, cursor, scroll, pane_top):
+    """Rename the export name an input is bound to. Naming one that already
+    exists joins it, declaration and all; empty unbinds."""
     layer = stack[unit['layer_idx']]
     sock = layer.sockets[unit['sock_idx']]
-    current = layer.bindings.get(sock['name'], "")
-    if not current:
-        suggestion = suggest_canonical(stack, unit['layer_idx'], sock)
-        if suggestion:
-            current = suggestion
+    current = layer.bindings.get(sock['name'], sock['name'])
     y_abs = pane_top + (spans[cursor][0] - scroll)
     result = curses_text_prompt(stdscr, y_abs, 2, f"{sock['name']} = ", current)
     stdscr.touchwin()
     if result is None:
         return
-    if result.strip():
-        layer.bindings[sock['name']] = result.strip()
-    elif sock['name'] in layer.bindings:
-        del layer.bindings[sock['name']]
+    new = result.strip()
+    if not new:
+        layer.bindings.pop(sock['name'], None)
+        return
+    if not re.match(r'^[A-Za-z0-9_]+$', new):
+        return
+    joining = new in export_names(stack)
+    layer.bindings[sock['name']] = new
+    if joining:
+        layer.decls[sock['name']] = dict(name_decl(stack, new))
+
+
+def _cycle_verb(stack, unit):
+    layer = stack[unit['layer_idx']]
+    sock = layer.sockets[unit['sock_idx']]
+    canon = layer.bindings.get(sock['name'])
+    if not canon:
+        return "unbound -- Enter names it first"
+    d = name_decl(stack, canon)
+    verb = VERBS[(VERBS.index(d['verb']) + 1) % len(VERBS)]
+    typ = d['type']
+    if verb != 'requires' and not typ:
+        cands = type_candidates(name_tags(stack, canon))
+        typ = cands[0] if cands else None
+    set_decl(stack, canon, verb=verb, type_=typ)
+    return _decl_status(stack, canon)
+
+
+def _cycle_type(stdscr, stack, unit, spans, cursor, scroll, pane_top):
+    layer = stack[unit['layer_idx']]
+    sock = layer.sockets[unit['sock_idx']]
+    canon = layer.bindings.get(sock['name'])
+    if not canon:
+        return "unbound -- Enter names it first"
+    d = name_decl(stack, canon)
+    if d['verb'] == 'requires':
+        return "requires passes it up -- Right picks a verb that makes one"
+    cands = type_candidates(name_tags(stack, canon))
+    if not cands:
+        # Nothing built carries these tags (or ace is unavailable): by hand.
+        y_abs = pane_top + (spans[cursor][0] - scroll)
+        cur = f"{d['type'][0]}::{d['type'][1]}" if d['type'] else ""
+        res = curses_text_prompt(stdscr, y_abs, 2, f"{canon} type = ", cur)
+        stdscr.touchwin()
+        if res and re.match(r'^[A-Za-z0-9_]+::[A-Za-z0-9_]+$', res.strip()):
+            set_decl(stack, canon, type_=tuple(res.strip().split('::')))
+        return _decl_status(stack, canon)
+    i = cands.index(tuple(d['type'])) + 1 if d['type'] and tuple(d['type']) in cands else 0
+    set_decl(stack, canon, type_=cands[i % len(cands)])
+    return _decl_status(stack, canon)
+
+
+def _decl_status(stack, canon):
+    d = name_decl(stack, canon)
+    tags = name_tags(stack, canon)
+    if d['verb'] == 'requires':
+        return f"{canon}: passed up -- the caller supplies [{', '.join(tags)}]"
+    cands = type_candidates(tags)
+    typ = f"{d['type'][0]}::{d['type'][1]}" if d['type'] else "(no type)"
+    pos = (f" {cands.index(tuple(d['type'])) + 1}/{len(cands)}"
+           if d['type'] and tuple(d['type']) in cands else "")
+    note = " -- origin tags checked at run" if origin_tags(tags) else ""
+    return f"{canon}: {d['verb']} {typ}{pos}{note}"
 
 
 def run_export_builder(stdscr, dirpath, initial_stack=None,
@@ -1249,7 +1262,7 @@ def run_export_builder(stdscr, dirpath, initial_stack=None,
     else:
         stack = _builder_sessions.get(sess_key)
         if stack is None:
-            stack = []
+            stack = Stack()
             _builder_sessions[sess_key] = stack
 
     available = compute_roots(dirpath_resolved)
@@ -1358,8 +1371,8 @@ def run_export_builder(stdscr, dirpath, initial_stack=None,
             header = " SWITCH PENDING: pick in AVAILABLE + Enter | x/Esc=cancel "
         else:
             header = (" Tab=Viewer | Shift+Up/Down=pane | "
-                      "Ctrl+Up/Down (or K/J)=block | Enter=push/bind | "
-                      "Right=mode | d=dup x=switch s=save r=run ?=keys q=quit ")
+                      "Ctrl+Up/Down (or K/J)=block | Enter=push/name | "
+                      "Right=mode/verb t=type | d=dup x=switch s=save r=run ?=keys q=quit ")
         _put(stdscr, 0, 0, header[:w].ljust(w), curses.color_pair(8))
 
         s_title = f"─{'*' if focus == 'stack' else ' '} STACK ({n}) "
@@ -1375,6 +1388,12 @@ def run_export_builder(stdscr, dirpath, initial_stack=None,
             footer = f" KEY: {last_key_desc or '(none yet)'} | ? to stop "
         elif status:
             footer = f" {status} "
+        elif (focus == 'stack' and units and units[stack_cursor]['kind'] == 'socket'):
+            u_ = units[stack_cursor]
+            l_ = stack[u_['layer_idx']]
+            c_ = l_.bindings.get(l_.sockets[u_['sock_idx']]['name'])
+            footer = (f" {_decl_status(stack, c_)} | Enter=name Right=verb t=type "
+                      if c_ else " unbound | Enter names it ")
         elif drop_target is not None and stack:
             footer = (f" {n} in stack | Shift+Left drops next "
                       f"'{drop_target.name}' from the bottom ")
@@ -1441,8 +1460,17 @@ def run_export_builder(stdscr, dirpath, initial_stack=None,
                 layer = stack[row['layer_idx']]
                 sock = layer.sockets[row['sock_idx']]
                 mapped = layer.bindings.get(sock['name'])
+                bracket = (" (not stated by the script)" if sock.get('unread') else
+                           f" [{', '.join(sock['tags'])}]" if sock['tags'] else "")
                 if mapped:
-                    suffix = f" = {mapped}"
+                    d = name_decl(stack, mapped)
+                    how = (d['verb'] if d['verb'] == 'requires' else
+                           f"{d['verb']} {d['type'][0]}::{d['type'][1]}" if d['type']
+                           else f"{d['verb']} (no type)")
+                    if d['verb'] != 'requires' and d['type'] and \
+                            not type_covers(d['type'], name_tags(stack, mapped))[0]:
+                        how += "  !"
+                    suffix = f" = {mapped}   {how}"
                     color = color_for_name(mapped)
                 else:
                     suffix = "  (unbound)"
@@ -1452,7 +1480,7 @@ def run_export_builder(stdscr, dirpath, initial_stack=None,
                 elif is_ghost:
                     color = curses.color_pair(5)
                 marker = "> " if (is_sel or is_ghost) else "  "
-                lbl = f"  {sock['module']}::{sock['tag']} {sock['name']}{suffix}"
+                lbl = f"  {sock['name']}{bracket}{suffix}"
                 _put(stack_win, sy, 0, marker,
                      curses.color_pair(5) if is_ghost else curses.color_pair(2))
                 _put(stack_win, sy, 2, lbl, color)
@@ -1715,8 +1743,7 @@ def run_export_builder(stdscr, dirpath, initial_stack=None,
                     layer = stack[u['layer_idx']]
                     layer.mode = 'run' if layer.mode == 'detach' else 'detach'
                 elif u['kind'] == 'socket':
-                    _edit_binding(stdscr, stack, u, spans, stack_cursor,
-                                  stack_scroll, stack_top)
+                    status = _cycle_verb(stack, u)
             continue
  
         # ---- Enter ----
@@ -1744,7 +1771,13 @@ def run_export_builder(stdscr, dirpath, initial_stack=None,
  
         # ---- character commands ----
         if name == 'char':
-            if chc in 'dD':
+            if chc in 'tT':
+                if focus == 'stack' and units and units[stack_cursor]['kind'] == 'socket':
+                    status = _cycle_type(stdscr, stack, units[stack_cursor], spans,
+                                         stack_cursor, stack_scroll, stack_top)
+                else:
+                    status = "t picks the type of the input under the cursor"
+            elif chc in 'dD':
                 if focus == 'stack' and units:
                     u = units[stack_cursor]
                     if u['kind'] == 'block':
@@ -1838,11 +1871,11 @@ def expand_etcs_file(filepath, indent_level=0, visited=None):
  
     for i, raw_line in enumerate(raw_lines):
         line = raw_line.rstrip('\n\r')
-        match = ETCS_REF_PATTERN.search(line)
+        ref = statement_ref(line)
         is_shebang = (i == 0 and line.startswith('#!'))
  
-        if match:
-            ref_name = match.group(2)
+        if ref:
+            ref_name = ref[1]
             ref_path = resolve_script_path(filepath, ref_name)
  
             result.append(LineInfo(
@@ -2282,27 +2315,26 @@ def run_browser(stdscr, start_dir=None):
             scroll_offset = 0
             
         elif key == ord('n') or key == ord('N'):
-            curses.endwin()
-            try:
-                name = input("  New script name (no .etcs suffix, or leave empty to cancel): ").strip()
-                if name:
-                    if not name.lower().endswith('.etcs'):
-                        name += '.etcs'
-                    subprocess.run(["ace", "script", name])
-            except Exception as e:
-                print(f"  Error: {e}", file=sys.stderr)
-            
-            input("  Press Enter to continue...")
-            
-            stdscr = curses.initscr()
-            curses.curs_set(0)
-            stdscr.nodelay(False)
-            stdscr.keypad(True)
-            init_colors()
-            entries = get_directory_entries(current_dir)
-            if current_idx >= len(entries):
-                current_idx = max(0, len(entries) - 1)
-            scroll_offset = 0
+            # In the folder being browsed, from the template, then $EDITOR. An
+            # existing name is opened rather than overwritten.
+            name = curses_text_prompt(stdscr, height - 1, 0, " New script (no .etcs): ", "")
+            name = (name or "").strip()
+            if name and re.match(r'^[A-Za-z0-9_\-]+(\.etcs)?$', name):
+                if not name.lower().endswith('.etcs'):
+                    name += '.etcs'
+                target = current_dir / name
+                if not target.exists():
+                    target.write_text(NEW_SCRIPT_TEMPLATE, encoding='utf-8')
+                curses.def_prog_mode()
+                curses.endwin()
+                edit_file(target)
+                curses.reset_prog_mode()
+                stdscr.keypad(True)
+                curses.curs_set(0)
+                entries = get_directory_entries(current_dir)
+                current_idx = next((k for k, e in enumerate(entries)
+                                    if e.path.resolve() == target.resolve()), 0)
+                scroll_offset = 0
             
         elif key in (curses.KEY_BACKSPACE, 8, 127, curses.KEY_LEFT):
             parent = current_dir.parent
@@ -2415,6 +2447,7 @@ Navigation (Browser):
   Enter or Right    - Open folder or .etcs file
   Left or Backspace - Go up one directory
   Tab or e          - Open/Resume the interactive export stack builder
+  n                 - New script here, from the template, in $EDITOR
   q or Escape       - Quit
  
 Navigation (Viewer):
@@ -2422,11 +2455,12 @@ Navigation (Viewer):
   Page Up/Down      - Jump by page
   Home/End          - Jump to first/last reference or line
   Enter             - Edit selected script
+  r                 - Run it (etcs <path>)
   Left or Backspace - Return to browser (when launched from browser)
   Tab               - Toggle to Stack Builder (ONLY if file has #EXPORT)
   q or Escape       - Quit
  
-Export Builder:
+Export Builder (an input is a layer's `requires` line):
   Up/Down             Move selection
   Tab                 Toggle back to the raw .etcs Viewer
   Enter (available)   Push that script onto the stack
@@ -2438,7 +2472,12 @@ Export Builder:
     while switch pending  Complete the switch into the pending position
   x / Escape,
     while switch pending  Cancel the pending switch
-  Enter (socket)      Edit that layer's canonical binding in place
+  Enter (input)       Name the export name it is bound to (an existing
+                        name joins it)
+  Right (input)       How the export meets it: requires (pass it up),
+                        ensure, attach, spawn
+  t (input)           The type an ensure/attach/spawn makes, among the
+                        built types carrying every bare tag it requires
   s                   Save: name it, write it, symlink, then open $EDITOR
   q or Escape         Cancel (or cancel a pending switch first)
  

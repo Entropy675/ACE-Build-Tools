@@ -41,6 +41,10 @@
           "provides_link": [
             "uring"
           ]
+        },
+        {
+          "package": "glslang-tools",
+          "probe": "binary:glslangValidator"
         }
       ],
       "arch": [
@@ -72,6 +76,10 @@
           "provides_link": [
             "uring"
           ]
+        },
+        {
+          "package": "glslang",
+          "probe": "binary:glslangValidator"
         }
       ],
       "fedora": [
@@ -103,6 +111,10 @@
           "provides_link": [
             "uring"
           ]
+        },
+        {
+          "package": "glslang",
+          "probe": "binary:glslangValidator"
         }
       ]
     },
@@ -143,7 +155,8 @@
     },
     "Win": {
       "system_libs": [
-        "vulkan-1"
+        "vulkan-1",
+        "gdi32"
       ]
     },
     "Web": {
@@ -156,8 +169,17 @@
     "install": "bin/",
     "assets": [
       {
-        "from": "shaders/*.spv",
-        "to": "shaders"
+        "from": [
+          "shaders/*.vert",
+          "shaders/*.frag"
+        ],
+        "to": "shaders",
+        "compile": "glslangValidator -V -o $@ $<",
+        "suffix": ".spv",
+        "platforms": [
+          "Linux",
+          "Win"
+        ]
       }
     ]
   }

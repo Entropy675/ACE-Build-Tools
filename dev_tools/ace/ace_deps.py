@@ -89,14 +89,17 @@ class DepsMixin:
             return shutil.which(arg) is not None
 
         if kind == "pkgconfig":
+            # Without pkg-config the .pc file is unreadable, so the dependency
+            # is not known-usable. Return False (MISSING) not None (UNKNOWN):
+            # UNKNOWN is never installed, which forced a second `ace deps
+            # install` after pkg-config itself landed on the first pass.
             if not shutil.which("pkg-config"):
-                return None  # cannot probe without the prober
+                return False
             try:
                 r = subprocess.run(["pkg-config", "--exists", arg], capture_output=True)
                 return r.returncode == 0
             except Exception:
                 return None
-
         if kind == "header":
             search = ["/usr/include", "/usr/local/include"]
             # Multiarch: /usr/include/aarch64-linux-gnu, x86_64-linux-gnu, ...
@@ -106,6 +109,22 @@ class DepsMixin:
                     if sub.is_dir() and sub.name.endswith("-linux-gnu"):
                         search.append(str(sub))
             return any((Path(d) / arg).exists() for d in search)
+
+        if kind == "python":
+            if not arg or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", arg):
+                print(f"  [!] python probe needs a simple module name, got {arg!r}")
+                return None
+            py = shutil.which("python3") or shutil.which("python")
+            if not py:
+                return None
+            try:
+                r = subprocess.run(
+                    [py, "-c", f"import {arg}"],
+                    capture_output=True,
+                )
+                return r.returncode == 0
+            except Exception:
+                return None
 
         print(f"  [!] Unknown probe kind '{kind}' -- treating as unprobeable.")
         return None
@@ -214,8 +233,22 @@ class DepsMixin:
             print(f"  [-] Could not execute {mgr}.")
             return
 
+        # A probe can only become decisive after its prober is installed
+        # (pkg-config, python, ...). One follow-up pass closes that gap
+        # without requiring the user to run `ace deps install` twice.
         print(f"\n  [*] Re-probing...")
         still_missing = self.deps_check(quiet=True)
+        if still_missing:
+            print(f"  {YELLOW}Still missing after install: {' '.join(still_missing)}{RESET}")
+            print(f"  [*] Installing newly probeable packages...")
+            full2 = install_cmd + still_missing
+            try:
+                subprocess.run(full2, check=True)
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                print(f"  [-] Follow-up install failed: {e}")
+                return
+            still_missing = self.deps_check(quiet=True)
+
         if still_missing:
             print(f"  {YELLOW}Still missing after install: {' '.join(still_missing)}{RESET}")
             print(f"  {DIM}A package that installs but does not probe usually means the")

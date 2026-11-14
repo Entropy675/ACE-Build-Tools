@@ -1,47 +1,115 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<language id="etcs" _name="ETCS" version="2.0" _section="Sources">
+<!--
+  ETCS scripts for GtkSourceView (gedit, GNOME Builder, ...). The grammar is
+  core/Command.h's: every line is BARE (requires/spawn/attach/ensure/run/detach/
+  exit) or DOTTED (<name>.Action(...), <name>.spawn(...), a -> stream).
+-->
+<language id="etcs" name="ETCS" version="2.0" _section="Scripts">
   <metadata>
     <property name="globs">*.etcs</property>
+    <property name="line-comment-start">#</property>
   </metadata>
 
   <styles>
-    <style id="comment" _name="Comment" map-to="def:comment"/>
-    <style id="state-shift" _name="State Shift" map-to="def:preprocessor"/>
-    <style id="operator" _name="Operator" map-to="def:builtin"/>
-    <style id="base-input" _name="Base Input" map-to="def:special-char"/>
-    <style id="payload" _name="Payload" map-to="def:string"/>
+    <style id="comment"   name="Comment"         map-to="def:comment"/>
+    <style id="directive" name="Directive"       map-to="def:preprocessor"/>
+    <style id="keyword"   name="Keyword"         map-to="def:keyword"/>
+    <style id="type"      name="Module::Tag"     map-to="def:type"/>
+    <style id="tag"       name="Required tag"    map-to="def:type"/>
+    <style id="action"    name="Action"          map-to="def:function"/>
+    <style id="operator"  name="Operator"        map-to="def:operator"/>
+    <style id="reference" name="@name"           map-to="def:special-char"/>
+    <style id="root"      name="ACE_ROOT"        map-to="def:constant"/>
+    <style id="script"    name="Script path"     map-to="def:string"/>
   </styles>
 
   <definitions>
-    <context id="comment" style-ref="comment">
-      <match>#.*$</match>
+    <!-- #! and the second-line #IMPORT / #EXPORT directive. -->
+    <context id="directive" style-ref="directive">
+      <match>^(#!.*|#(IMPORT|EXPORT)\b.*)$</match>
     </context>
 
-    <context id="state-shift-sequence">
-      <match>^\s*(context|spawn)\s+([^\s]+)(?:\s+([^\s]+))?</match>
+    <context id="comment" style-ref="comment" end-at-line-end="true">
+      <start>#</start>
+    </context>
+
+    <!-- requires <name> [Tag, Module::Tag] -->
+    <context id="requires">
+      <match>^\s*(requires)\s+([A-Za-z0-9_]+)(\s*\[[^\]]*\])?</match>
       <include>
-        <context sub-pattern="1" style-ref="state-shift"/>   <context sub-pattern="2" style-ref="operator"/>      <context sub-pattern="3" style-ref="state-shift"/>   </include>
+        <context sub-pattern="1" style-ref="keyword"/>
+        <context sub-pattern="3" style-ref="tag"/>
+      </include>
     </context>
 
-    <context id="qualified-token" style-ref="operator">
-      <match>^[A-Za-z0-9_]+::[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)?</match>
+    <!-- spawn/attach/ensure Module::Tag <name> -->
+    <context id="acquire">
+      <match>^\s*(spawn|attach|ensure)\s+([A-Za-z0-9_]+::[A-Za-z0-9_]+)</match>
+      <include>
+        <context sub-pattern="1" style-ref="keyword"/>
+        <context sub-pattern="2" style-ref="type"/>
+      </include>
     </context>
 
-    <context id="base-input" style-ref="base-input">
-      <match>^[A-Z][a-zA-Z0-9_]*</match>
+    <!-- run/detach <script> [k=v ...] -->
+    <context id="launch">
+      <match>^\s*(run|detach)\s+(\S+)</match>
+      <include>
+        <context sub-pattern="1" style-ref="keyword"/>
+        <context sub-pattern="2" style-ref="script"/>
+      </include>
     </context>
 
-    <context id="payload" style-ref="payload">
-      <match>\s+.*$</match>
+    <context id="exit" style-ref="keyword">
+      <match>^\s*exit\s*$</match>
+    </context>
+
+    <!-- <name>.spawn(...) and the other lowercase runtime operations. -->
+    <context id="runtime-op">
+      <match>\.(spawn|attach|ensure|kill|unflag)(?=\()</match>
+      <include>
+        <context sub-pattern="1" style-ref="keyword"/>
+      </include>
+    </context>
+
+    <!-- <name>.Action( : a module action, TitleCase. -->
+    <context id="action">
+      <match>\.([A-Z][A-Za-z0-9_]*)(?=\()</match>
+      <include>
+        <context sub-pattern="1" style-ref="action"/>
+      </include>
+    </context>
+
+    <context id="qualified" style-ref="type">
+      <match>\b[A-Z][A-Za-z0-9_]*::[A-Z][A-Za-z0-9_]*\b</match>
+    </context>
+
+    <context id="stream" style-ref="operator">
+      <match>-&gt;</match>
+    </context>
+
+    <context id="reference" style-ref="reference">
+      <match>@[A-Za-z0-9_]+</match>
+    </context>
+
+    <context id="ace-root" style-ref="root">
+      <match>\bACE_ROOT\b</match>
     </context>
 
     <context id="etcs">
       <include>
+        <context ref="directive"/>
         <context ref="comment"/>
-        <context ref="state-shift-sequence"/>
-        <context ref="qualified-token"/>
-        <context ref="base-input"/>
-        <context ref="payload"/>
+        <context ref="requires"/>
+        <context ref="acquire"/>
+        <context ref="launch"/>
+        <context ref="exit"/>
+        <context ref="runtime-op"/>
+        <context ref="action"/>
+        <context ref="qualified"/>
+        <context ref="stream"/>
+        <context ref="reference"/>
+        <context ref="ace-root"/>
       </include>
     </context>
   </definitions>
