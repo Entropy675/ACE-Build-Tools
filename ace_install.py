@@ -52,6 +52,8 @@ class AceManager(RegistryMixin, DepsMixin, AbiMixin, OntologyMixin, BuildMixin,
         self.tool_root = self.script_path.parent   # where the ace tool itself lives
         self._ace_root = None                       # ETCS project root, discovered lazily on first use
 
+        self.assume_yes = False                     # -y / --yes: answer every _confirm with yes
+
         self.allowed_make_targets = {
             'build', 'clean', 'test', 'install', 'all', 'help'
         }
@@ -222,9 +224,10 @@ class AceManager(RegistryMixin, DepsMixin, AbiMixin, OntologyMixin, BuildMixin,
 
 if __name__ == "__main__":
     ace = AceManager()
-    args = sys.argv[1:]
+    args = [a for a in sys.argv[1:] if a not in ("-y", "--yes")]
+    ace.assume_yes = len(args) != len(sys.argv) - 1
     if not args:
-        print("Usage: ace { install | uninstall | list | setup <mod> [OS] | remove <mod> | stage <mod> <dest> }")
+        print("Usage: ace [-y] { install | uninstall | list | setup <mod> [OS] | remove <mod> | stage <mod> <dest> }")
         print("           | make { all | modules | loaders | clean | clean modules | clean loaders }")
         print("           | make { module <n> | clean module <n> }")
         print("           | make { loader <n> | clean loader <n> }")
@@ -236,6 +239,7 @@ if __name__ == "__main__":
         print("           | wasm { link [main.wasm side.wasm ...] [--got] | addr <file.wasm> <offset> }")
         print("           | hash regions --out <header.h> [--append] <sources...>")
         print("           | script [name]")
+        print("  -y / --yes answers every prompt with yes (dependency installs, hooks, removals).")
         sys.exit(0)
 
     cmd = args[0]

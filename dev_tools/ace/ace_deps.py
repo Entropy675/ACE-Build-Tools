@@ -62,7 +62,9 @@ class DepsMixin:
         return None, None
 
     def _parse_deps(self, path):
-        """Parse a manifest into a list of (package, probe) pairs."""
+        """Parse a manifest into (package, probe, optional) triples. A third
+        token `optional` marks a package whose absence is reported but never
+        counted as missing -- a debugger must not block a build."""
         entries = []
         for raw in path.read_text().splitlines():
             line = raw.split("#", 1)[0].strip()
@@ -71,7 +73,7 @@ class DepsMixin:
             parts = line.split()
             package = parts[0]
             probe = parts[1] if len(parts) > 1 else "none"
-            entries.append((package, probe))
+            entries.append((package, probe, "optional" in parts[2:]))
         return entries
 
     def _run_probe(self, probe):
@@ -130,14 +132,18 @@ class DepsMixin:
         return None
 
     def _package_manager(self):
-        """Return (install_command_prefix, manager_name), or (None, None)."""
+        """Return (install_command_prefix, manager_name), or (None, None).
+        sudo is prepended only for a non-root user; a root shell (container,
+        CI) often has no sudo at all."""
         for mgr, cmd in [
-            ("apt-get", ["sudo", "apt-get", "install", "-y"]),
-            ("dnf",     ["sudo", "dnf", "install", "-y"]),
-            ("pacman",  ["sudo", "pacman", "-S", "--needed"]),
-            ("zypper",  ["sudo", "zypper", "install", "-y"]),
+            ("apt-get", ["apt-get", "install", "-y"]),
+            ("dnf",     ["dnf", "install", "-y"]),
+            ("pacman",  ["pacman", "-S", "--needed"]),
+            ("zypper",  ["zypper", "install", "-y"]),
         ]:
             if shutil.which(mgr):
+                if getattr(os, "geteuid", lambda: 1)() != 0:
+                    cmd = ["sudo"] + cmd
                 return cmd, mgr
         return None, None
 
@@ -165,8 +171,8 @@ class DepsMixin:
         # machine manifest having to name every module's dependencies too.
         try:
             for pkg, probe in self.manifest_system_packages():
-                if not any(pkg == p for p, _ in entries):
-                    entries.append((pkg, probe))
+                if not any(pkg == p for p, _, _ in entries):
+                    entries.append((pkg, probe, False))
         except AttributeError:
             pass  # ManifestMixin not assembled (partial tool build)
 
@@ -176,10 +182,14 @@ class DepsMixin:
 
         missing = []
         unknown = []
-        for package, probe in entries:
+        absent = []
+        for package, probe, optional in entries:
             result = self._run_probe(probe)
             if result is True:
                 status = f"{GREEN}OK     {RESET}"
+            elif result is False and optional:
+                status = f"{DIM}ABSENT {RESET}"
+                absent.append(package)
             elif result is False:
                 status = f"{RED}MISSING{RESET}"
                 missing.append(package)
@@ -187,34 +197,37 @@ class DepsMixin:
                 status = f"{YELLOW}UNKNOWN{RESET}"
                 unknown.append(package)
             if not quiet:
-                print(f"  {status} {package:<20} {DIM}{probe}{RESET}")
+                note = " (optional)" if optional else ""
+                print(f"  {status} {package:<20} {DIM}{probe}{note}{RESET}")
 
         if not quiet:
             print()
             if missing:
                 print(f"  {RED}{len(missing)} missing.{RESET} Run: ace deps install")
-            elif unknown:
-                print(f"  {GREEN}All probeable dependencies present{RESET}"
-                      f" {DIM}({len(unknown)} unprobeable){RESET}")
             else:
-                print(f"  {GREEN}All dependencies present.{RESET}")
+                extra = [f"{len(unknown)} unprobeable"] if unknown else []
+                extra += [f"{len(absent)} optional absent"] if absent else []
+                tail = f" {DIM}({', '.join(extra)}){RESET}" if extra else ""
+                print(f"  {GREEN}All required dependencies present.{RESET}{tail}")
 
         return missing
 
-    def deps_install(self, silent=False):
-        """Install whatever deps_check reports as missing."""
-        missing = self.deps_check()
+    def deps_install(self, silent=False, missing=None):
+        """Install what is missing. `missing` is a list from a deps_check the
+        caller already printed; None runs the check here."""
         if missing is None:
-            return
+            missing = self.deps_check()
+        if missing is None:
+            return False
         if not missing:
             self._mark_deps_checked()
-            return
+            return True
 
         install_cmd, mgr = self._package_manager()
         if not install_cmd:
             print(f"\n  [!] No supported package manager found.")
             print(f"      Install manually: {' '.join(missing)}")
-            return
+            return False
 
         full = install_cmd + missing
         print(f"\n  Will run ({mgr}):")
@@ -222,16 +235,16 @@ class DepsMixin:
 
         if not self._confirm("  Proceed?", silent):
             print("  [*] Skipped.")
-            return
+            return False
 
         try:
             subprocess.run(full, check=True)
         except subprocess.CalledProcessError as e:
             print(f"  [-] Install failed: {e}")
-            return
+            return False
         except FileNotFoundError:
             print(f"  [-] Could not execute {mgr}.")
-            return
+            return False
 
         # A probe can only become decisive after its prober is installed
         # (pkg-config, python, ...). One follow-up pass closes that gap
@@ -246,7 +259,7 @@ class DepsMixin:
                 subprocess.run(full2, check=True)
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
                 print(f"  [-] Follow-up install failed: {e}")
-                return
+                return False
             still_missing = self.deps_check(quiet=True)
 
         if still_missing:
@@ -254,9 +267,10 @@ class DepsMixin:
             print(f"  {DIM}A package that installs but does not probe usually means the")
             print(f"  manifest names the wrong package for this distro -- fix the")
             print(f"  manifest, not the probe.{RESET}")
-        else:
-            print(f"  {GREEN}All dependencies present.{RESET}")
-            self._mark_deps_checked()
+            return False
+        print(f"  {GREEN}All dependencies present.{RESET}")
+        self._mark_deps_checked()
+        return True
 
     def deps_arch(self):
         """Report machine properties that affect whether this tree can build
@@ -342,10 +356,9 @@ class DepsMixin:
             self._mark_deps_checked()
             return
 
-        if self._confirm("\n  Install them now?", silent):
-            self.deps_install(silent=silent)
-        else:
-            print(f"  {DIM}Skipped. Run 'ace deps install' when ready; "
+        # One prompt, showing the command it would run (deps_install's own).
+        if not self.deps_install(silent=silent, missing=missing):
+            print(f"  {DIM}Run 'ace deps install' when ready; "
                   f"the build will likely fail until then.{RESET}\n")
 
     def deps(self, args):
