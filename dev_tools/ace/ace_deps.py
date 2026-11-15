@@ -221,7 +221,7 @@ class DepsMixin:
             return False
         if not missing:
             self._mark_deps_checked()
-            return True
+            return self.generate_all()
 
         install_cmd, mgr = self._package_manager()
         if not install_cmd:
@@ -270,7 +270,9 @@ class DepsMixin:
             return False
         print(f"  {GREEN}All dependencies present.{RESET}")
         self._mark_deps_checked()
-        return True
+        # Generated sources need git and a network the first time; both are
+        # dependencies, so this is the step that can produce them.
+        return self.generate_all()
 
     def deps_arch(self):
         """Report machine properties that affect whether this tree can build
@@ -367,6 +369,7 @@ class DepsMixin:
         if   sub == "check":   self.deps_check()
         elif sub == "install": self.deps_install()
         elif sub == "arch":    self.deps_arch()
+        elif sub == "generate": return 0 if self.generate_all() else 1
         else:
             print(f"[-] Unknown deps command: '{sub}'")
-            print(f"    Usage: ace deps {{ check | install | arch }}")
+            print(f"    Usage: ace deps {{ check | install | arch | generate }}")

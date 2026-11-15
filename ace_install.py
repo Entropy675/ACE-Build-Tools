@@ -20,6 +20,7 @@ Layout (all under dev_tools/):
     ace_script.py    <- proxy for etcs_viewer.py script editor
     ace_manifest.py  <- module manifests -> generated Makefiles
     ace_wasm.py      <- what a -sMAIN_MODULE link did not report
+    ace_generate.py  <- sources built from pins, not kept in git
 
     manifests/       <- one <Module>.json per module, read by ace_manifest
 """
@@ -38,11 +39,13 @@ from dev_tools.ace import (
     ScriptMixin,
     ManifestMixin,
     WasmMixin,
-    HashMixin
+    HashMixin,
+    GenerateMixin
 )
 
 class AceManager(RegistryMixin, DepsMixin, AbiMixin, OntologyMixin, BuildMixin,
-                 LifecycleMixin, ScriptMixin, ManifestMixin, WasmMixin, HashMixin):
+                 LifecycleMixin, ScriptMixin, ManifestMixin, WasmMixin, HashMixin,
+                 GenerateMixin):
     """Assembled from the subsystem mixins. Method resolution runs left to
     right across the bases; none of them define colliding names (verified at
     split time), so the order is for readability, not disambiguation."""
@@ -232,7 +235,7 @@ if __name__ == "__main__":
         print("           | make { module <n> | clean module <n> }")
         print("           | make { loader <n> | clean loader <n> }")
         print("           | registry verify")
-        print("           | deps { check | install | arch }")
+        print("           | deps { check | install | arch | generate }")
         print("           | manifest { list | check [mod...] | show <mod> | generate [mod...|loaders] [--force] | clean [mod...|loaders] }")
         print("           | abi [module]")
         print("           | ontology")
