@@ -6,6 +6,11 @@
                         loader: the binary the site serves for download
     ace publish [dir]   what the site serves at /dist: the current modules, the
                         last release, and the marketplace's signed list of them
+    ace pin <root.cert | hex | clear>
+                        the root every loader built here is compiled with
+    ace bundle <dir> [module...]
+                        bin/etcs and the modules a machine with nothing else on
+                        it needs to run the ceremony (or anything else)
 
 Runs by itself after every module and loader build; the command is for when
 the loader's key or registration changed under artifacts that did not.
@@ -46,7 +51,7 @@ from .ace_common import CYAN, YELLOW, GREEN, RED, RESET, DIM
 _EPOCH_PREFIXES = ("CORE:", "ONTOLOGY:", "LIB:", "HEADER:")
 _MANIFEST_LINE = re.compile(r'getManifest\(\)\["([^"]+)"\]\s*=\s*"([^"]*)"')
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
-_LINEAGE = re.compile(r"^etcs-lineage 1 ")
+_LINEAGE = re.compile(r"^etcs-lineage [12] ")
 
 _ELF_SECTION = ".etcs.sig"
 _WASM_SECTION = b"etcs.sig"
@@ -315,6 +320,10 @@ class SignMixin:
                         again, _ = self._sign_one(new, "etcs", new, epoch, verb="--succeed")
                         if again == "signed":
                             by = "the outgoing loader, then itself: the first signature did not attest it"
+                if result in ("signed", "unchanged"):
+                    rc, line, _ = self._ask_loader(new, "--attest", want=re.compile(r"^attested\s"))
+                    if rc != 0 and line:
+                        print(f"{YELLOW}[!] bin/etcs does not attest -- {line.split(':', 1)[-1].strip()}{RESET}")
                 if result == "signed":
                     print(f"{GREEN}[+] bin/etcs signed by {by}{RESET}")
                     if edge:
@@ -553,3 +562,78 @@ class SignMixin:
         print(f"{GREEN}[+] published {listed} binaries to {out} for epoch {self.epoch_id()[:12]}{RESET}")
         print(f"{DIM}    the site reads it at start (site_pki.etcs mounts it at /dist){RESET}")
         return 0 if p.returncode == 0 else 1
+
+
+    # ------------------------------------------------------------------
+    # The root, and a machine with nothing but etcs
+    # ------------------------------------------------------------------
+
+    def pin(self, args):
+        """ace pin <root.cert | 64 hex | clear>: write manifests/root.pub. The
+        next build is in that root's epoch -- the guild, once it is ACE's."""
+        from .ace_generate import ROOT_PIN_FILE
+        if len(args) != 1:
+            print("Usage: ace pin <root.cert | key hex | clear>")
+            return 1
+        f = self.tool_root / ROOT_PIN_FILE
+        if args[0] == "clear":
+            f.unlink(missing_ok=True)
+            print(f"{GREEN}[+] no root pinned: loaders built now are an experimental epoch's{RESET}")
+            return 0
+        text = args[0].strip().lower()
+        if not _HEX64.match(text):
+            try:
+                raw = Path(args[0]).read_text().strip()
+                b = bytes.fromhex(raw)
+            except (OSError, ValueError):
+                print(f"{RED}[-] {args[0]} is neither a key nor a certificate file{RESET}")
+                return 1
+            # "ETCSCRT1" | role u8 | subject[32] | issuer[32] ...; a root is role 1, its own issuer.
+            if len(b) < 73 or b[:8] != b"ETCSCRT1" or b[8] != 1 or b[9:41] != b[41:73]:
+                print(f"{RED}[-] {args[0]} is not a root certificate{RESET}")
+                return 1
+            text = b[9:41].hex()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text + "\n")
+        print(f"{GREEN}[+] pinned root {text}{RESET}")
+        print(f"{DIM}    the next build is that root's epoch: `ace make modules && ace make loader etcs`{RESET}")
+        return 0
+
+    def bundle(self, args):
+        """ace bundle <dir> [module...]: bin/etcs and the named modules (the
+        ceremony's by default) in <dir>/bin, with every module script beside
+        them, for a machine that has nothing else. bin/etcs carries its
+        builder's key, so it takes those modules with no keystore there."""
+        if not args:
+            print("Usage: ace bundle <dir> [module...]")
+            return 1
+        signer = self._signer()
+        if not signer:
+            print(f"{RED}[-] there is no bin/etcs to bundle. `ace make loader etcs` first.{RESET}")
+            return 1
+        p = subprocess.run([str(signer), "--attest"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=120)
+        builder = next((l.split()[1] for l in p.stdout.splitlines() if l.startswith("builder ")), None)
+        if not builder:
+            print(f"{RED}[-] bin/etcs was built with no builder key, so where nothing else is it would "
+                  f"take none of its modules. `ace make loader etcs` again.{RESET}")
+            return 1
+        out = Path(args[0]).expanduser().resolve()
+        mods = args[1:] or ["CryptProvider", "NetworkProvider", "ShellProvider"]
+        (out / "bin").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(signer, out / "bin" / signer.name)
+        for mod in mods:
+            art = self._bin_dir() / f"{mod}.{self._lib_ext()}"
+            if not art.is_file():
+                print(f"{RED}[-] no {art.name} in bin/{RESET}")
+                return 1
+            shutil.copy2(art, out / "bin" / art.name)
+        for scripts in sorted((self.ace_root / "modules").glob("*/scripts")):
+            if scripts.parent.name in mods:
+                dest = out / "modules" / scripts.parent.name / "scripts"
+                dest.mkdir(parents=True, exist_ok=True)
+                for f in scripts.glob("*.etcs"):
+                    shutil.copy2(f, dest / f.name)
+        print(f"{GREEN}[+] bundled bin/etcs and {', '.join(mods)} in {out}{RESET}")
+        print(f"{DIM}    builder {builder[:12]}; run there as: ACE_ROOT={out} {out}/bin/etcs <script>{RESET}")
+        return 0

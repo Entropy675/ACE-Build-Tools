@@ -390,19 +390,19 @@ class BuildMixin:
                 except OSError as ex:
                     print(f"{RED}[-] could not remove stale {rel}/{n}: {ex}{RESET}")
 
-    def _web_trust_defines(self, args):
-        """What a web loader built here is told at link time, because a browser
-        holds no key and reads no store: the native loader whose local half it
-        extends (ETCS_BUILDER_KEY). The root is the pin, in the loader already.
-        core/Trust.h."""
-        if not self._is_web_build(args):
-            return []
+    def _trust_defines(self, args):
+        """The key of the loader building this one, compiled into it
+        (ETCS_BUILDER_KEY): what a loader trusts is what was compiled into it,
+        and its builder's local half is the one it can take with no keystore --
+        a browser's, and a machine with nothing on it but etcs. The root is the
+        pin, in the loader already. core/Trust.h."""
         if any(a.startswith(("-DETCS_BUILDER_KEY", "-UETCS_BUILDER_KEY")) for a in args):
             return []
         key, why = self.builder_key()
         if not key:
-            print(f"{YELLOW}[!] this web loader is given no loader key ({why}) -- it will "
-                  f"refuse locally built modules. `ace make loader etcs` first.{RESET}")
+            if self._is_web_build(args):
+                print(f"{YELLOW}[!] this web loader is given no builder key ({why}) -- it will "
+                      f"refuse locally built modules. `ace make loader etcs` first.{RESET}")
             return []
         return [f"-DETCS_BUILDER_KEY={key}"]
 
@@ -665,7 +665,7 @@ class BuildMixin:
                 # see LOADER_DEFAULT_DEFINES for what that spelling used to mean
                 # and why -UETCS_REPL_SHELL replaced it.
                 extras = self._validate_make_args(
-                    self._loader_extras(user_args + self._web_trust_defines(user_args)))
+                    self._loader_extras(user_args + self._trust_defines(user_args)))
                 print("With extras: ")
                 for i in extras:
                     print(i)
@@ -854,7 +854,7 @@ class BuildMixin:
                 # module half must NOT, since a module compiled with
                 # -DETCS_REPL_SHELL is a different fingerprint for no reason.
                 loader_extras = self._validate_make_args(
-                    self._loader_extras(args[1:] + self._web_trust_defines(args[1:])))
+                    self._loader_extras(args[1:] + self._trust_defines(args[1:])))
                 batch = args[0] in ("all", "modules")
 
                 # Regenerate BEFORE make is invoked, not during.

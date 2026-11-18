@@ -55,15 +55,15 @@ MONOCYPHER_PURPOSE = ("Ed25519 (RFC 8032, SHA-512) for the loader's module "
 
 
 # ---------------------------------------------------------------- ACE's root
-# The super-root's public key, 64 hex digits, as `bin/etcs --root` prints it
-# for a loader registered under it. This is where it enters a build: compiled
-# into every loader as the one root a chain may end at (core/Trust.h), and,
-# being a core header, hashed into the epoch -- a build for another root is
-# another epoch.
+# The super-root's public key, 64 hex digits: manifests/root.pub, which `ace
+# pin` writes from the ceremony's root.cert. This is where it enters a build:
+# compiled into every loader as the one root a chain may end at (core/Trust.h),
+# and, being a core header, hashed into the epoch -- a build for another root is
+# another epoch, and a build with none is an experimental one.
 #
-# Empty while signing is being configured: a loader then works under whatever
-# root its own store was given.
+# ACE_ROOT_KEY is read only when there is no file.
 ACE_ROOT_KEY = ""
+ROOT_PIN_FILE = "manifests/root.pub"
 
 
 def _sha256(data):
@@ -156,7 +156,8 @@ class GenerateMixin:
     # ----------------------------------------------------------- ACE's root
     def root_pin(self):
         """The pinned root, lower-case hex, or "" while there is none."""
-        key = ACE_ROOT_KEY.strip().lower()
+        f = self.tool_root / ROOT_PIN_FILE
+        key = (f.read_text() if f.is_file() else ACE_ROOT_KEY).strip().lower()
         if key and not re.fullmatch(r"[0-9a-f]{64}", key):
             raise RuntimeError("ACE_ROOT_KEY is not 64 hex digits")
         return "" if key == "0" * 64 else key
@@ -164,10 +165,10 @@ class GenerateMixin:
     def _gen_ace_root(self):
         key = self.root_pin()
         head = _provenance(
-            "ACE-Build-Tools dev_tools/ace/ace_generate.py, ACE_ROOT_KEY",
+            "ACE-Build-Tools " + ROOT_PIN_FILE + " (ace pin)",
             "n/a -- a pure function of the pin",
             "The root every signature chain ends at (core/Trust.h).",
-            extra=["", "All zero: no root is pinned, and a loader works under its store's."])
+            extra=["", "All zero: no root is pinned, and a loader built so is an experimental epoch's."])
         return (head
                 + "#ifndef ETCS_CORE_ACEROOT_H__\n#define ETCS_CORE_ACEROOT_H__\n\n"
                 + '#define ETCS_ACE_ROOT_KEY "%s"\n\n' % (key or "0" * 64)

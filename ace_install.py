@@ -245,6 +245,8 @@ if __name__ == "__main__":
         print("           | sign")
         print("           | release [store]")
         print("           | publish [dir]")
+        print("           | pin <root.cert | key | clear>")
+        print("           | bundle <dir> [module...]")
         print("           | script [name]")
         print("  -y / --yes answers every prompt with yes (dependency installs, hooks, removals).")
         sys.exit(0)
@@ -269,6 +271,8 @@ if __name__ == "__main__":
         elif cmd == "sign":                             sys.exit(ace.sign(args[1:]) or 0)
         elif cmd == "release":                          sys.exit(ace.release(args[1:]) or 0)
         elif cmd == "publish":                          sys.exit(ace.publish(args[1:]) or 0)
+        elif cmd == "pin":                              sys.exit(ace.pin(args[1:]) or 0)
+        elif cmd == "bundle":                           sys.exit(ace.bundle(args[1:]) or 0)
         elif cmd == "script":                           ace.create_script(args[1:])
         else:
             print(f"[-] Unknown or incomplete command: '{cmd}'")
