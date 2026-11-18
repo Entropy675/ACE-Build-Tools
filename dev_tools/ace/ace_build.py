@@ -392,24 +392,19 @@ class BuildMixin:
 
     def _web_trust_defines(self, args):
         """What a web loader built here is told at link time, because a browser
-        holds no key and reads no store: the native loader whose modules it
-        takes (ETCS_BUILDER_KEY) and the root that loader's registration ends
-        at while ACE's is unset (ETCS_TEMP_ROOT_KEY) -- a pinned root is in the
-        loader already. core/Trust.h."""
+        holds no key and reads no store: the native loader whose local half it
+        extends (ETCS_BUILDER_KEY). The root is the pin, in the loader already.
+        core/Trust.h."""
         if not self._is_web_build(args):
             return []
         if any(a.startswith(("-DETCS_BUILDER_KEY", "-UETCS_BUILDER_KEY")) for a in args):
             return []
         key, why = self.builder_key()
-        if key and self.root_pin():
-            return [f"-DETCS_BUILDER_KEY={key}"]
-        root, why_root = self.root_key() if key else (None, why)
-        if not key or not root:
-            print(f"{YELLOW}[!] this web loader is given no loader key and no root "
-                  f"({why or why_root}) -- it will refuse locally built modules. "
-                  f"`ace make loader etcs` first.{RESET}")
+        if not key:
+            print(f"{YELLOW}[!] this web loader is given no loader key ({why}) -- it will "
+                  f"refuse locally built modules. `ace make loader etcs` first.{RESET}")
             return []
-        return [f"-DETCS_BUILDER_KEY={key}", f"-DETCS_TEMP_ROOT_KEY={root}"]
+        return [f"-DETCS_BUILDER_KEY={key}"]
 
     def _sign_after_loader(self, extras):
         """A loader build is where a first loader key appears, and where a new

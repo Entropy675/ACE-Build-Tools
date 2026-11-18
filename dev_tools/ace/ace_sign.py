@@ -2,6 +2,10 @@
 
     ace sign            sign every current module artifact in bin/ and bin/wasm/,
                         and the native loader binaries in bin/
+    ace release [store] sign bin/etcs as a release, with the release machine's
+                        loader: the binary the site serves for download
+    ace publish [dir]   what the site serves at /dist: the current modules, the
+                        last release, and the marketplace's signed list of them
 
 Runs by itself after every module and loader build; the command is for when
 the loader's key or registration changed under artifacts that did not.
@@ -134,7 +138,7 @@ class SignMixin:
         exe = self._bin_dir() / ("etcs.exe" if platform.system() == "Windows" else "etcs")
         return exe if exe.is_file() and os.access(exe, os.X_OK) else None
 
-    def _ask_loader(self, signer, *args, want=_HEX64):
+    def _ask_loader(self, signer, *args, want=_HEX64, env=None):
         """(returncode, the answer line or None, stderr). The loader logs to
         stdout as it starts and stops; the answer is the line that matches
         `want` -- by default, one that is nothing but a key or an epoch."""
@@ -142,7 +146,8 @@ class SignMixin:
         # "--sign" as a script it cannot open and falls into its REPL.
         try:
             p = subprocess.run([str(signer), *args], capture_output=True, text=True,
-                               stdin=subprocess.DEVNULL, timeout=120)
+                               stdin=subprocess.DEVNULL, timeout=120,
+                               env=None if env is None else {**os.environ, **env})
         except subprocess.TimeoutExpired:
             return 2, None, "bin/etcs did not answer -- it predates signing; `ace make loader etcs`"
         except OSError as e:
@@ -153,27 +158,20 @@ class SignMixin:
         return p.returncode, line, (p.stderr or "").strip()
 
     def builder_key(self):
-        """(key, why). The native loader's public key, made and registered on
-        first use -- the loader a web loader built here takes Loader-signed
-        modules from (ETCS_BUILDER_KEY)."""
+        """(key, why). The native loader's public key, made on first use -- the
+        loader whose local half a web loader built here extends
+        (ETCS_BUILDER_KEY)."""
         return self._loader_answer("--loader-key")
 
-    def root_key(self):
-        """(key, why). The root the native loader's registration ends at. While
-        ACE's own root is unset that is a temporary root in the loader's store,
-        which a browser cannot read, so a web loader is told it at link time
-        (ETCS_TEMP_ROOT_KEY)."""
-        return self._loader_answer("--root")
-
-    def _off_root(self, signer):
-        """Why `signer` cannot sign for this tree, or None. With a root pinned
-        (ace_generate.ACE_ROOT_KEY) the loaders built here take only chains
-        that end at it, so a signer whose chains end anywhere else signs
-        nothing a loader will load."""
+    def _off_root(self, signer, env=None):
+        """Why `signer` cannot sign a release for this tree, or None. A release
+        is ACE's half: a signer built for another root, or none, signs only its
+        local half, which no download takes. Modules and a developer's own
+        loaders need no root -- the local half runs on its own loader."""
         pin = self.root_pin()
         if not pin:
             return None
-        rc, root, err = self._ask_loader(signer, "--root")
+        rc, root, err = self._ask_loader(signer, "--root", env=env)
         if rc == 0 and root == pin:
             return None
         if rc != 0 or not root:
@@ -253,12 +251,12 @@ class SignMixin:
         os.replace(tmp, art)
         return None
 
-    def _sign_one(self, signer, mod, art, epoch, verb="--sign"):
+    def _sign_one(self, signer, mod, art, epoch, verb="--sign", env=None):
         """'signed', 'unchanged', or why not. With --succeed, also the lineage
         edge the signer recorded (or None): (result, edge)."""
         with tempfile.TemporaryDirectory(prefix="ace-sign-") as d:
             out = Path(d) / "chain"
-            rc, edge, err = self._ask_loader(signer, verb, mod, str(art), epoch, str(out), want=_LINEAGE)
+            rc, edge, err = self._ask_loader(signer, verb, mod, str(art), epoch, str(out), want=_LINEAGE, env=env)
             if rc == 3:
                 result = "unchanged"
             elif rc != 0 or not out.is_file():
@@ -304,12 +302,19 @@ class SignMixin:
                 for signer, who in ((outgoing, "the outgoing loader"), (new, "itself")):
                     if not signer:
                         continue
-                    result, edge, by = self._off_root(signer), None, who
-                    if result:
-                        continue
+                    by = who
                     result, edge = self._sign_one(signer, "etcs", new, epoch, verb="--succeed")
                     if result in ("signed", "unchanged"):
                         break
+                # A signature the new loader does not take -- the outgoing one signed
+                # under a half the new one has no root for -- is no attestation.
+                # The new loader may then sign itself where its own rule allows.
+                if result == "signed" and by == "the outgoing loader":
+                    rc, _, _ = self._ask_loader(new, "--attest", want=re.compile(r"^attested\s"))
+                    if rc != 0:
+                        again, _ = self._sign_one(new, "etcs", new, epoch, verb="--succeed")
+                        if again == "signed":
+                            by = "the outgoing loader, then itself: the first signature did not attest it"
                 if result == "signed":
                     print(f"{GREEN}[+] bin/etcs signed by {by}{RESET}")
                     if edge:
@@ -353,10 +358,6 @@ class SignMixin:
             print(f"{YELLOW}[!] {len(arts)} module artifact(s) left unsigned: there is no "
                   f"bin/etcs to sign with yet. `ace make loader <name>` signs them; "
                   f"a loader refuses them until then.{RESET}")
-            return len(arts)
-        off = self._off_root(signer)
-        if off:
-            print(f"{RED}[-] {len(arts)} module artifact(s) left unsigned: {off}{RESET}")
             return len(arts)
         epoch = self.epoch_id()
         signed, kept, stale, failed = [], [], [], []
@@ -408,3 +409,147 @@ class SignMixin:
                                     for p in self._bin_dir().glob("Run_*Loader" + suffix))
         left = self.sign_loaders(None, loaders)
         return 1 if (self.sign_modules() or left) else 0
+
+    # ------------------------------------------------------------------
+    # A release: the loader the site serves for download
+    # ------------------------------------------------------------------
+    #
+    # bin/etcs signed by the release machine's loader -- a store whose key the
+    # active key certified as a release key. A loader binary a release key
+    # signed attests on any machine that holds the same root, with an empty
+    # store; one signed by a loader's own key attests only on that loader.
+    #
+    # The signer is the last release this store made, kept beside it as
+    # <store>/etcs: it attests anywhere, so it may sign the next. The first
+    # release is bin/etcs signing itself -- the release lineage's genesis.
+
+    def _release_store(self, args):
+        if args:
+            return Path(args[0]).expanduser().resolve()
+        env = os.environ.get("ETCS_RELEASE_STORE")
+        return Path(env).expanduser().resolve() if env else Path.home() / ".local" / "share" / "etcs-release"
+
+    def release(self, args):
+        if len(args) > 1:
+            print("Usage: ace release [<store>]")
+            return 1
+        if not self.root_pin():
+            print(f"{RED}[-] a release is signed under ACE's root, and none is pinned (ACE_ROOT_KEY).{RESET}")
+            return 1
+        new = self._signer()
+        if not new:
+            print(f"{RED}[-] there is no bin/etcs to release. `ace make loader etcs` first.{RESET}")
+            return 1
+        if not self._ensure_generated():
+            return 1
+        if self._run_root_make("generate_hashes"):
+            os.environ["ACE_HASHES_READY"] = "1"
+        if not self.check_loader_epoch():
+            return 1
+        store = self._release_store(args)
+        env = {"ETCS_STORE": str(store)}
+        p = subprocess.run([str(new), "--attest"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                           timeout=120, env={**os.environ, **env})
+        if not re.search(r"^key\s+[0-9a-f]{64} \(release, proven\)$", p.stdout, re.M):
+            print(f"{RED}[-] {store} is not a release machine's loader: its key is not registered as a "
+                  f"release key, or the keystore does not hold it.{RESET}")
+            print(f"{DIM}    ETCS_STORE={store} bin/etcs --loader-key, have the active key certify it as "
+                  f"release, then --registration.{RESET}")
+            return 1
+        kept = store / new.name
+        epoch = self.epoch_id()
+        result, edge, by = "no signer", None, None
+        for signer, who in ((kept if kept.is_file() else None, "the last release"), (new, "itself")):
+            if not signer:
+                continue
+            result, edge, by = self._off_root(signer, env=env), None, who
+            if result:
+                continue
+            result, edge = self._sign_one(signer, "etcs", new, epoch, verb="--succeed", env=env)
+            if result in ("signed", "unchanged"):
+                break
+        if result not in ("signed", "unchanged"):
+            print(f"{RED}[-] bin/etcs is not released -- {result}{RESET}")
+            return 1
+        shutil.copy2(new, kept)
+        if result == "unchanged":
+            print(f"{DIM}[=] bin/etcs is already this release{RESET}")
+        else:
+            print(f"{GREEN}[+] bin/etcs released, signed by {by}{RESET}")
+        if edge:
+            f = dict(kv.split("=", 1) for kv in edge.split()[3:] if "=" in kv)
+            print(f"{DIM}    lineage: {f.get('parent', '?')[:12]} -> {f.get('child', '?')[:12]}"
+                  f"  epoch {f.get('from', '?')[:12]} -> {f.get('to', '?')[:12]}"
+                  f"  on {f.get('host', '?')}{RESET}")
+        return 0
+
+
+    # ------------------------------------------------------------------
+    # What the site serves at /dist
+    # ------------------------------------------------------------------
+    #
+    # The current module binaries, the last release (<release store>/etcs), and
+    # bin/etcs --manifest's list of them: the marketplace's signature over each
+    # one's digest and epochs, and over the epoch the site is in. A loader reads
+    # the list (CryptProvider::Upstream) and fetches what it is behind on. What
+    # a download would not take -- a module only this loader's own key signed --
+    # is left off by the loader, and said.
+
+    def publish(self, args):
+        if len(args) > 1:
+            print("Usage: ace publish [<dir>]")
+            return 1
+        if not self.root_pin():
+            print(f"{RED}[-] a site publishes under ACE's root, and none is pinned (ACE_ROOT_KEY).{RESET}")
+            return 1
+        signer = self._signer()
+        if not signer:
+            print(f"{RED}[-] there is no bin/etcs to sign the list. `ace make loader etcs` first.{RESET}")
+            return 1
+        if not self._ensure_generated():
+            return 1
+        if self._run_root_make("generate_hashes"):
+            os.environ["ACE_HASHES_READY"] = "1"
+        if not self.check_loader_epoch():
+            return 1
+        out = Path(args[0]).expanduser().resolve() if args else self.ace_root / "dist"
+        out.mkdir(parents=True, exist_ok=True)
+        for old in out.iterdir():
+            if old.is_file():
+                old.unlink()
+        mods = sorted(set(self._all_manifests()) | set(self._defaulted_modules()))
+        taken, stale = 0, []
+        for mod in mods:
+            art = self._bin_dir() / f"{mod}.{self._lib_ext()}"
+            if not art.is_file():
+                continue
+            if not self._module_current(mod, False):
+                stale.append(art.name)
+                continue
+            shutil.copy2(art, out / art.name)
+            taken += 1
+        release = self._release_store([]) / ("etcs.exe" if platform.system() == "Windows" else "etcs")
+        if release.is_file():
+            shutil.copy2(release, out / release.name)
+        else:
+            print(f"{YELLOW}[!] no release to publish ({release}); `ace release` first. "
+                  f"The list will name modules only.{RESET}")
+        if stale:
+            print(f"{YELLOW}[!] not published, older than the tree ({len(stale)}): {' '.join(stale)}{RESET}")
+        try:
+            p = subprocess.run([str(signer), "--manifest", str(out), str(out / "manifest")],
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"{RED}[-] bin/etcs --manifest: {e}{RESET}")
+            return 1
+        for line in (p.stderr or "").splitlines():
+            if line.startswith("etcs: "):
+                print(f"{YELLOW}[!] {line[6:]}{RESET}")
+        if p.returncode == 2 or not (out / "manifest").is_file():
+            print(f"{RED}[-] no list written.{RESET}")
+            return 1
+        listed = sum(1 for l in (out / "manifest").read_text().splitlines()
+                     if l and not l.startswith(("etcs-dist ", "etcs-dist-sig ")))
+        print(f"{GREEN}[+] published {listed} binaries to {out} for epoch {self.epoch_id()[:12]}{RESET}")
+        print(f"{DIM}    the site reads it at start (site_pki.etcs mounts it at /dist){RESET}")
+        return 0 if p.returncode == 0 else 1
