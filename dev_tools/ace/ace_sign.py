@@ -165,6 +165,22 @@ class SignMixin:
         (ETCS_TEMP_ROOT_KEY)."""
         return self._loader_answer("--root")
 
+    def _off_root(self, signer):
+        """Why `signer` cannot sign for this tree, or None. With a root pinned
+        (ace_generate.ACE_ROOT_KEY) the loaders built here take only chains
+        that end at it, so a signer whose chains end anywhere else signs
+        nothing a loader will load."""
+        pin = self.root_pin()
+        if not pin:
+            return None
+        rc, root, err = self._ask_loader(signer, "--root")
+        if rc == 0 and root == pin:
+            return None
+        if rc != 0 or not root:
+            return err.splitlines()[-1] if err else "bin/etcs gave no root"
+        return (f"it signs under root {root[:12]}, and this tree pins {pin[:12]}; "
+                f"register its key under the pinned root first (`bin/etcs --registration`)")
+
     def _loader_answer(self, verb):
         signer = self._signer()
         if not signer:
@@ -288,8 +304,10 @@ class SignMixin:
                 for signer, who in ((outgoing, "the outgoing loader"), (new, "itself")):
                     if not signer:
                         continue
+                    result, edge, by = self._off_root(signer), None, who
+                    if result:
+                        continue
                     result, edge = self._sign_one(signer, "etcs", new, epoch, verb="--succeed")
-                    by = who
                     if result in ("signed", "unchanged"):
                         break
                 if result == "signed":
@@ -336,6 +354,10 @@ class SignMixin:
                   f"bin/etcs to sign with yet. `ace make loader <name>` signs them; "
                   f"a loader refuses them until then.{RESET}")
             return len(arts)
+        off = self._off_root(signer)
+        if off:
+            print(f"{RED}[-] {len(arts)} module artifact(s) left unsigned: {off}{RESET}")
+            return len(arts)
         epoch = self.epoch_id()
         signed, kept, stale, failed = [], [], [], []
         for mod, art, is_web in arts:
@@ -374,7 +396,8 @@ class SignMixin:
         if args:
             print("Usage: ace sign")
             return 1
-        self._ensure_generated()
+        if not self._ensure_generated():
+            return 1
         if self._run_root_make("generate_hashes"):
             os.environ["ACE_HASHES_READY"] = "1"
         self.check_loader_epoch()
