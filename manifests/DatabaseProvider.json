@@ -42,7 +42,9 @@
         },
         "build": {
           "system": "autotools",
-          "configure_args": [],
+          "configure_args": [
+            "--disable-tcl"
+          ],
           "targets": [
             "sqlite3.c"
           ]

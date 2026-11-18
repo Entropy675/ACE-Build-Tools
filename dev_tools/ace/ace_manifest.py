@@ -50,6 +50,7 @@ escape hatch IS the thing this format exists to stop accepting.
 from pathlib import Path
 import hashlib
 import json
+import platform
 import re
 import subprocess
 
@@ -57,6 +58,19 @@ from .ace_common import (CYAN, YELLOW, GREEN, RED, RESET, DIM, ORANGE)
 
 
 SCHEMA_VERSION = 1
+
+# What the base system links without a package: libc's own pieces on Linux,
+# and on Windows the import libraries of the OS's own DLLs, which every MinGW
+# and Windows SDK carries. A Windows package has no manifest form yet
+# (ace_deps), so anything else a Win build links is the developer's to install.
+_BUILTIN_LIBS = {
+    "Linux": {"dl", "pthread", "m", "rt", "stdc++", "c"},
+    "Win":   {"advapi32", "bcrypt", "comdlg32", "crypt32", "dbghelp", "dwmapi", "gdi32", "imm32",
+              "iphlpapi", "kernel32", "ncrypt", "ntdll", "ole32", "oleaut32", "psapi", "secur32",
+              "setupapi", "shell32", "shlwapi", "user32", "userenv", "uuid", "version", "winmm",
+              "ws2_32"},
+}
+_HOST_PLATFORM = {"Linux": "Linux", "Windows": "Win"}.get(platform.system())
 
 # Build systems we know how to drive. Deliberately closed -- see module docstring.
 BUILD_SYSTEMS = {"none", "cmake", "autotools", "make"}
@@ -559,21 +573,27 @@ class ManifestMixin:
                         f"escape by design -- an arbitrary command is the raw Makefile this "
                         f"format exists to replace.")
 
-        # Every -l should have something that installs it. A warning rather
-        # than an error: a module may legitimately link something supplied by
-        # the base system, and failing the build over that would be worse
-        # than saying so.
+        # Every -l should have something that installs it -- on the platform
+        # being built here, which is the only one this machine can install
+        # for, said once a run however often the manifest is read. Web links
+        # no packages (its libraries are emscripten's ports and the loader's
+        # jslibs). A warning rather than an error: failing the build over a
+        # library the system supplies would be worse than saying so.
+        plat = _HOST_PLATFORM
+        if plat is None:
+            return
         claimed = set()
         for pkgs in m.get("requires", {}).get("system", {}).values():
             for p in pkgs:
                 claimed.update(p.get("provides_link", []))
-        builtin = {"dl", "pthread", "m", "rt", "stdc++", "c"}
-        for plat, blk in m.get("build", {}).items():
-            for lib in blk.get("system_libs", []):
-                if lib in claimed or lib in builtin or lib.endswith("32"):
-                    continue
-                print(f"  {YELLOW}[!]{RESET} {module} [{plat}] links -l{lib}, "
-                      f"but no declared package provides it.")
+        said = self.__dict__.setdefault("_unprovided_said", set())
+        for lib in m.get("build", {}).get(plat, {}).get("system_libs", []):
+            if lib in claimed or lib in _BUILTIN_LIBS[plat] or (module, lib) in said:
+                continue
+            said.add((module, lib))
+            hint = " (Windows packages have no manifest form yet)" if plat == "Win" else ""
+            print(f"  {YELLOW}[!]{RESET} {module} [{plat}] links -l{lib}, "
+                  f"but no declared package provides it{hint}.")
 
     # ------------------------------------------------------------------
     # emission
@@ -1942,7 +1962,11 @@ class ManifestMixin:
         w("    LDFLAGS := -sMAIN_MODULE=1 -sEXPORT_ALL=1 -pthread -fwasm-exceptions \\")
         w("               $(ETCS_WEB_MEMORY) $(ETCS_WEB_POOL) $(ETCS_WEB_JSLIBS) \\")
         w("               -sERROR_ON_UNDEFINED_SYMBOLS=0 \\")
-        w("               -sSTACK_SIZE=4MB -sDEFAULT_PTHREAD_STACK_SIZE=4MB")
+        w("               -sSTACK_SIZE=4MB -sDEFAULT_PTHREAD_STACK_SIZE=4MB \\")
+        w("               -Wno-experimental")
+        w("    # -Wno-experimental: side modules on pthreads is emscripten's")
+        w("    # experimental pairing and this loader's design -- modules run on")
+        w("    # the pool's threads. Said here, once, not by em++ on every link.")
         w("    # THE OUTPUT NAME HAS AN EXTENSION, and it is not cosmetic: an")
         w("    # extensionless `etcs` is JavaScript served as application/octet-stream,")
         w("    # which a browser warns is not a script, and every page would have to")
