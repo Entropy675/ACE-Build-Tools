@@ -40,12 +40,13 @@ from dev_tools.ace import (
     ManifestMixin,
     WasmMixin,
     HashMixin,
-    GenerateMixin
+    GenerateMixin,
+    SignMixin
 )
 
 class AceManager(RegistryMixin, DepsMixin, AbiMixin, OntologyMixin, BuildMixin,
                  LifecycleMixin, ScriptMixin, ManifestMixin, WasmMixin, HashMixin,
-                 GenerateMixin):
+                 GenerateMixin, SignMixin):
     """Assembled from the subsystem mixins. Method resolution runs left to
     right across the bases; none of them define colliding names (verified at
     split time), so the order is for readability, not disambiguation."""
@@ -241,6 +242,7 @@ if __name__ == "__main__":
         print("           | ontology")
         print("           | wasm { link [main.wasm side.wasm ...] [--got] | addr <file.wasm> <offset> }")
         print("           | hash regions --out <header.h> [--append] <sources...>")
+        print("           | sign")
         print("           | script [name]")
         print("  -y / --yes answers every prompt with yes (dependency installs, hooks, removals).")
         sys.exit(0)
@@ -262,6 +264,7 @@ if __name__ == "__main__":
         elif cmd == "ontology":                         ace.ontology(args[1:])
         elif cmd == "wasm":                             sys.exit(ace.wasm(args[1:]) or 0)
         elif cmd == "hash":                             sys.exit(ace.hash(args[1:]) or 0)
+        elif cmd == "sign":                             sys.exit(ace.sign(args[1:]) or 0)
         elif cmd == "script":                           ace.create_script(args[1:])
         else:
             print(f"[-] Unknown or incomplete command: '{cmd}'")
