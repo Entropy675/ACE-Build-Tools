@@ -243,6 +243,8 @@ if __name__ == "__main__":
         print("           | wasm { link [main.wasm side.wasm ...] [--got] | addr <file.wasm> <offset> }")
         print("           | hash regions --out <header.h> [--append] <sources...>")
         print("           | sign")
+        print("           | release [store]")
+        print("           | publish [dir]")
         print("           | script [name]")
         print("  -y / --yes answers every prompt with yes (dependency installs, hooks, removals).")
         sys.exit(0)
@@ -265,6 +267,8 @@ if __name__ == "__main__":
         elif cmd == "wasm":                             sys.exit(ace.wasm(args[1:]) or 0)
         elif cmd == "hash":                             sys.exit(ace.hash(args[1:]) or 0)
         elif cmd == "sign":                             sys.exit(ace.sign(args[1:]) or 0)
+        elif cmd == "release":                          sys.exit(ace.release(args[1:]) or 0)
+        elif cmd == "publish":                          sys.exit(ace.publish(args[1:]) or 0)
         elif cmd == "script":                           ace.create_script(args[1:])
         else:
             print(f"[-] Unknown or incomplete command: '{cmd}'")
