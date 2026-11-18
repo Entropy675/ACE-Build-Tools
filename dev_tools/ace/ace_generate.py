@@ -17,8 +17,9 @@ Targets:
     core/AirtyMacros_Generated.h  from dev_tools/generate_airty_macros.py
     libs/monocypher.h             from Monocypher at a pinned commit,
                                   amalgamated into one stb-style header
-    core/AceRoot.h                from ACE_ROOT_KEY below: the root every
-                                  signature chain ends at
+    core/AceIdentity.h            from the pin (manifests/root.pub): ACE's
+                                  identity at its shortest, the root every
+                                  chain ACE attests ends at
 """
 from pathlib import Path
 import hashlib
@@ -106,8 +107,12 @@ class GenerateMixin:
         return [
             ("core/AirtyMacros_Generated.h", self._gen_airty_macros),
             ("libs/monocypher.h",            self._gen_monocypher),
-            ("core/AceRoot.h",               self._gen_ace_root),
+            ("core/AceIdentity.h",           self._gen_ace_identity),
         ]
+
+    # Generated once, and named otherwise since: a core header is hashed into
+    # the epoch, so one left behind would put this tree in an epoch of its own.
+    _RETIRED_TARGETS = ("core/AceRoot.h",)
 
     def _write_if_changed(self, path, content):
         data = content.encode("utf-8")
@@ -126,6 +131,11 @@ class GenerateMixin:
         """Regenerate every target. True when all succeeded. Writes only on a
         byte change, so mtimes -- and therefore make -- stay quiet otherwise."""
         ok = True
+        for rel in self._RETIRED_TARGETS:
+            old = self.ace_root / rel
+            if old.is_file():
+                old.unlink()
+                print(f"  [*] {rel}: {YELLOW}removed{RESET}  {DIM}retired{RESET}")
         for rel, producer in self._generated_targets():
             out = self.ace_root / rel
             try:
@@ -162,17 +172,17 @@ class GenerateMixin:
             raise RuntimeError("ACE_ROOT_KEY is not 64 hex digits")
         return "" if key == "0" * 64 else key
 
-    def _gen_ace_root(self):
+    def _gen_ace_identity(self):
         key = self.root_pin()
         head = _provenance(
             "ACE-Build-Tools " + ROOT_PIN_FILE + " (ace pin)",
             "n/a -- a pure function of the pin",
-            "The root every signature chain ends at (core/Trust.h).",
+            "ACE's identity at its shortest: the root every chain ACE attests ends at (core/Trust.h).",
             extra=["", "All zero: no root is pinned, and a loader built so is an experimental epoch's."])
         return (head
-                + "#ifndef ETCS_CORE_ACEROOT_H__\n#define ETCS_CORE_ACEROOT_H__\n\n"
-                + '#define ETCS_ACE_ROOT_KEY "%s"\n\n' % (key or "0" * 64)
-                + "#endif // ETCS_CORE_ACEROOT_H__\n")
+                + "#ifndef ETCS_CORE_ACEIDENTITY_H__\n#define ETCS_CORE_ACEIDENTITY_H__\n\n"
+                + '#define ETCS_ACE_IDENTITY_ROOT "%s"\n\n' % (key or "0" * 64)
+                + "#endif // ETCS_CORE_ACEIDENTITY_H__\n")
 
     # ------------------------------------------------------- AirtyMacros
     def _gen_airty_macros(self):

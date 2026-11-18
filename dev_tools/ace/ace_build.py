@@ -635,7 +635,7 @@ class BuildMixin:
         self._deps_first_run()
 
         # Generated sources (core/AirtyMacros_Generated.h, libs/monocypher.h,
-        # core/AceRoot.h) come before the hash pass, which hashes them into the epoch. A
+        # core/AceIdentity.h) come before the hash pass, which hashes them into the epoch. A
         # no-op compare on an unchanged tree; see ace_generate.py.
         if not self._ensure_generated():
             return 1

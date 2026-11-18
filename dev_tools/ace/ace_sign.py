@@ -275,12 +275,14 @@ class SignMixin:
     # ------------------------------------------------------------------
     #
     # A loader is the one binary nothing else checks, so it attests itself
-    # (core/Trust.h), and the next etcs is signed by the one going out: ace
+    # (core/Trust.h), and the next etcs is passed off by the one going out: ace
     # keeps a copy of bin/etcs before a loader build replaces it, and that copy
-    # signs its successor. Where there is no outgoing loader, or it cannot sign
-    # (it predates this, or holds no key), the new one signs itself -- which is
-    # where a lineage starts, and what a canonical root will allow only once.
-    # Every other loader binary (the Run_* testers) is signed by the new etcs.
+    # signs its successor and the pass-off into it. Where there is no outgoing
+    # loader, or what it signs does not attest the new one, the new one passes
+    # itself off: a lineage beginning, which an experimental epoch takes and the
+    # guild does not -- there a lineage begins at a release (`ace release`),
+    # and the build after it is passed off by the release. Every other loader
+    # binary (the Run_* testers) is passed off by the new etcs.
 
     def keep_outgoing(self):
         """A copy of bin/etcs under its own name, or None. Its name matters:
@@ -324,6 +326,9 @@ class SignMixin:
                     rc, line, _ = self._ask_loader(new, "--attest", want=re.compile(r"^attested\s"))
                     if rc != 0 and line:
                         print(f"{YELLOW}[!] bin/etcs does not attest -- {line.split(':', 1)[-1].strip()}{RESET}")
+                        if self.root_pin():
+                            print(f"{DIM}    it runs with a warning, and signs its local half alone. In the guild a "
+                                  f"lineage begins at a release: `ace release`, then build again.{RESET}")
                 if result == "signed":
                     print(f"{GREEN}[+] bin/etcs signed by {by}{RESET}")
                     if edge:
@@ -338,7 +343,7 @@ class SignMixin:
                 art = self._bin_dir() / (name + suffix)
                 if name == "etcs" or not art.is_file():
                     continue
-                result = self._sign_one(new, name, art, epoch)
+                result, _ = self._sign_one(new, name, art, epoch, verb="--succeed")
                 if result not in ("signed", "unchanged"):
                     left += 1
                     print(f"{RED}[-] bin/{name} is not signed -- {result}{RESET}")
@@ -443,7 +448,7 @@ class SignMixin:
             print("Usage: ace release [<store>]")
             return 1
         if not self.root_pin():
-            print(f"{RED}[-] a release is signed under ACE's root, and none is pinned (ACE_ROOT_KEY).{RESET}")
+            print(f"{RED}[-] a release is signed under ACE's root, and none is pinned (`ace pin`).{RESET}")
             return 1
         new = self._signer()
         if not new:
@@ -509,7 +514,7 @@ class SignMixin:
             print("Usage: ace publish [<dir>]")
             return 1
         if not self.root_pin():
-            print(f"{RED}[-] a site publishes under ACE's root, and none is pinned (ACE_ROOT_KEY).{RESET}")
+            print(f"{RED}[-] a site publishes under ACE's root, and none is pinned (`ace pin`).{RESET}")
             return 1
         signer = self._signer()
         if not signer:
