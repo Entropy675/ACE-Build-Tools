@@ -42,7 +42,9 @@
         },
         "build": {
           "system": "autotools",
-          "configure_args": [],
+          "configure_args": [
+            "--disable-tcl"
+          ],
           "targets": [
             "sqlite3.c"
           ]
@@ -81,7 +83,8 @@
     },
     "Win": {
       "system_libs": [
-        "ws2_32"
+        "ws2_32",
+        "advapi32"
       ]
     },
     "Web": {
