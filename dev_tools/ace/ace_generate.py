@@ -17,6 +17,8 @@ Targets:
     core/AirtyMacros_Generated.h  from dev_tools/generate_airty_macros.py
     libs/monocypher.h             from Monocypher at a pinned commit,
                                   amalgamated into one stb-style header
+    core/AceRoot.h                from ACE_ROOT_KEY below: the root every
+                                  signature chain ends at
 """
 from pathlib import Path
 import hashlib
@@ -50,6 +52,18 @@ MONOCYPHER_FILES = {
 }
 MONOCYPHER_PURPOSE = ("Ed25519 (RFC 8032, SHA-512) for the loader's module "
                       "signature chain and CryptProvider.")
+
+
+# ---------------------------------------------------------------- ACE's root
+# The super-root's public key, 64 hex digits, as `bin/etcs --root` prints it
+# for a loader registered under it. This is where it enters a build: compiled
+# into every loader as the one root a chain may end at (core/Trust.h), and,
+# being a core header, hashed into the epoch -- a build for another root is
+# another epoch.
+#
+# Empty while signing is being configured: a loader then works under whatever
+# root its own store was given.
+ACE_ROOT_KEY = ""
 
 
 def _sha256(data):
@@ -92,6 +106,7 @@ class GenerateMixin:
         return [
             ("core/AirtyMacros_Generated.h", self._gen_airty_macros),
             ("libs/monocypher.h",            self._gen_monocypher),
+            ("core/AceRoot.h",               self._gen_ace_root),
         ]
 
     def _write_if_changed(self, path, content):
@@ -137,6 +152,26 @@ class GenerateMixin:
         print(f"{RED}[-] Generated sources incomplete; the epoch would differ from "
               f"every other build. Fix the error above, then 'ace deps generate'.{RESET}")
         return False
+
+    # ----------------------------------------------------------- ACE's root
+    def root_pin(self):
+        """The pinned root, lower-case hex, or "" while there is none."""
+        key = ACE_ROOT_KEY.strip().lower()
+        if key and not re.fullmatch(r"[0-9a-f]{64}", key):
+            raise RuntimeError("ACE_ROOT_KEY is not 64 hex digits")
+        return "" if key == "0" * 64 else key
+
+    def _gen_ace_root(self):
+        key = self.root_pin()
+        head = _provenance(
+            "ACE-Build-Tools dev_tools/ace/ace_generate.py, ACE_ROOT_KEY",
+            "n/a -- a pure function of the pin",
+            "The root every signature chain ends at (core/Trust.h).",
+            extra=["", "All zero: no root is pinned, and a loader works under its store's."])
+        return (head
+                + "#ifndef ETCS_CORE_ACEROOT_H__\n#define ETCS_CORE_ACEROOT_H__\n\n"
+                + '#define ETCS_ACE_ROOT_KEY "%s"\n\n' % (key or "0" * 64)
+                + "#endif // ETCS_CORE_ACEROOT_H__\n")
 
     # ------------------------------------------------------- AirtyMacros
     def _gen_airty_macros(self):
