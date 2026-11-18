@@ -10,3 +10,4 @@ from .ace_script import ScriptMixin
 from .ace_manifest import ManifestMixin, ManifestError
 from .ace_wasm import WasmMixin
 from .ace_hash import HashMixin
+from .ace_generate import GenerateMixin

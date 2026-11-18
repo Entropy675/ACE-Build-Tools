@@ -1,5 +1,4 @@
 MAX_ARITY = 64
-OUTPUT_FILE = "AirtyMacros_Generated.h"
 GUARD = "AIRTYMACROS_GENERATED_H__"
 
 def fe_block(prefix, n, comma=False, fixed=False):
@@ -100,8 +99,9 @@ def generate(n):
     out.append(f"#endif // {GUARD}")
     return "\n".join(out) + "\n"
 
+# Written into ETCS/core by `ace deps generate` (dev_tools/ace/ace_generate.py),
+# which adds the provenance header; the file is no longer kept in git. Run
+# directly, this prints the body only, for inspection.
 if __name__ == "__main__":
     content = generate(MAX_ARITY)
-    with open(OUTPUT_FILE, "w") as f:
-        f.write(content)
-    print(f"Wrote {OUTPUT_FILE} ({content.count(chr(10))} lines, MAX_ARITY={MAX_ARITY})")
+    print(content, end="")

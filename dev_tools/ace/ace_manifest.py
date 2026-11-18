@@ -422,17 +422,8 @@ class ManifestMixin:
     # ------------------------------------------------------------------
 
     def _ask(self, message, silent=False):
-        """_confirm, but survives a pipe. A non-interactive run has nobody to
-        answer, and input() there raises rather than returning a default --
-        which would turn 'unpinned dependency' into an opaque traceback in
-        CI."""
-        if silent:
-            return True
-        try:
-            return self._confirm(message, False)
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return False
+        """Kept for its callers; _confirm itself survives a pipe now."""
+        return self._confirm(message, silent)
 
     def _git(self, *args, cwd=None):
         """Run git, returning stripped stdout or None. Never raises."""

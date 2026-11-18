@@ -42,8 +42,19 @@ class LifecycleMixin:
         subprocess.Popen(cmd, shell=True)
 
     def _confirm(self, message, silent):
-        if silent: return True
-        return input(f"{message} [y/N]: ").lower() == 'y'
+        """Every yes/no question goes through here. `-y`/`--yes` on the
+        command line answers yes to all of them; a run with nobody at a
+        terminal (pipe, CI) answers no and says so, instead of dying on EOF."""
+        if silent or getattr(self, "assume_yes", False):
+            return True
+        if not sys.stdin.isatty():
+            print(f"{message} [y/N]: {DIM}no (not a terminal; pass -y to say yes){RESET}")
+            return False
+        try:
+            return input(f"{message} [y/N]: ").strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
 
     def print_root(self):
         print(self.ace_root)
