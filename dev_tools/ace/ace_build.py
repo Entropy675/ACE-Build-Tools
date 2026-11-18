@@ -182,7 +182,7 @@ class BuildMixin:
         The .so has to EXIST as well as match: a fingerprint describes what a
         build would produce, and a fingerprint with no artifact beside it is a
         record of a build somebody deleted."""
-        so = self._bin_dir() / f"{mod}.{self._artifact_ext(extras)}"
+        so = self._artifact_path(mod, extras)
         if not so.is_file():
             return "no built artifact in bin/"
 
@@ -219,7 +219,7 @@ class BuildMixin:
         So the caller passes make's own verdict, and a failure leaves no
         record at all: the module is rebuilt next time, which is the only safe
         default when the truth is unknown."""
-        so = self._bin_dir() / f"{mod}.{self._artifact_ext(extras)}"
+        so = self._artifact_path(mod, extras)
         if not so.is_file():
             return
         try:
@@ -244,6 +244,15 @@ class BuildMixin:
         build produces a .wasm side module, and every existence check and
         fingerprint record must ask for the file these flags produce."""
         return "wasm" if self._is_web_build(extras) else self._lib_ext()
+
+    def _artifact_path(self, mod, extras):
+        """Where this module's artifact lands under these flags: bin/wasm/ for
+        a web build (the master Makefile's WASM_DIR), bin/ otherwise. Asking
+        bin/ for a .wasm found nothing, so a web build never left a record and
+        was never current -- never skipped, and never signed."""
+        if self._is_web_build(extras):
+            return self._bin_dir() / "wasm" / f"{mod}.wasm"
+        return self._bin_dir() / f"{mod}.{self._lib_ext()}"
 
     def _validate_module_name(self, name):
         """Clean module name: keep alphanumerics and underscores for cross-platform safety."""
@@ -380,6 +389,32 @@ class BuildMixin:
                           f"should have replaced it failed.{RESET}")
                 except OSError as ex:
                     print(f"{RED}[-] could not remove stale {rel}/{n}: {ex}{RESET}")
+
+    def _web_trust_defines(self, args):
+        """What a web loader built here is told at link time, because a browser
+        holds no key and reads no store: the native loader whose modules it
+        takes (ETCS_BUILDER_KEY) and the root that loader's registration ends
+        at while ACE's is unset (ETCS_TEMP_ROOT_KEY). core/Trust.h."""
+        if not self._is_web_build(args):
+            return []
+        if any(a.startswith(("-DETCS_BUILDER_KEY", "-UETCS_BUILDER_KEY")) for a in args):
+            return []
+        key, why = self.builder_key()
+        root, why_root = self.root_key() if key else (None, why)
+        if not key or not root:
+            print(f"{YELLOW}[!] this web loader is given no loader key and no root "
+                  f"({why or why_root}) -- it will refuse locally built modules. "
+                  f"`ace make loader etcs` first.{RESET}")
+            return []
+        return [f"-DETCS_BUILDER_KEY={key}", f"-DETCS_TEMP_ROOT_KEY={root}"]
+
+    def _sign_after_loader(self, extras):
+        """A loader build is where a first loader key appears, and where a new
+        native loader's epoch can be checked against the one ace signs for."""
+        web = self._is_web_build(extras)
+        if not web:
+            self.check_loader_epoch()
+        self.sign_modules(quiet=True, web=web)
 
     # ================================================================
     # Parallelism
@@ -631,7 +666,8 @@ class BuildMixin:
                 # Unconditional now, including when 'etcs' is named explicitly:
                 # see LOADER_DEFAULT_DEFINES for what that spelling used to mean
                 # and why -UETCS_REPL_SHELL replaced it.
-                extras = self._validate_make_args(self._loader_extras(user_args))
+                extras = self._validate_make_args(
+                    self._loader_extras(user_args + self._web_trust_defines(user_args)))
                 print("With extras: ")
                 for i in extras:
                     print(i)
@@ -649,6 +685,8 @@ class BuildMixin:
                 # overwritten when present.
                 self.ensure_loaders_makefile()
                 print(f"[*] Building loader: {loader_name}")
+                web_loader = self._is_web_build(extras)
+                outgoing = None if web_loader else self.keep_outgoing()
                 # FILE= narrows the sources to one, but `all` still links that
                 # loader AND etcs, so -j has two things to overlap here.
                 make_cmd = [
@@ -662,7 +700,12 @@ class BuildMixin:
                 except subprocess.CalledProcessError as e:
                     print(f"[-] Loader build error: {e}")
                     self._drop_stale_artifact(loader_name, extras, "loader")
+                    if outgoing:
+                        shutil.rmtree(outgoing.parent, ignore_errors=True)
                     return 1
+                if not web_loader:
+                    built = ["etcs"] + ([] if loader_name == "etcs" else [f"Run_{loader_name}"])
+                    self.sign_loaders(outgoing, built)
                 if self._is_web_build(extras):
                     # THE MAIN LINK IS WHERE THIS CAN BE ANSWERED, which is why the
                     # check runs here and not after a module build. A side module
@@ -677,6 +720,7 @@ class BuildMixin:
                     # an unreached stub is a real (if fragile) state to ship.
                     self.wasm_link([], quiet_when_clean=True)
                 self._announce_loader_variant(loader_name, extras)
+                self._sign_after_loader(extras)
                 return 0
 
             if len(args) >= 2 and args[0] == "clean" and args[1] == "loader":
@@ -767,6 +811,7 @@ class BuildMixin:
                     else:
                         failed.append(mod)
                         self._drop_stale_artifact(mod, extras, "module")
+                self.sign_modules(only=[m for m, ok in results if ok], web=web)
                 if failed:
                     print(f"{RED}[-] {len(failed)} module(s) failed: "
                           f"{', '.join(failed)}{RESET}")
@@ -811,7 +856,7 @@ class BuildMixin:
                 # module half must NOT, since a module compiled with
                 # -DETCS_REPL_SHELL is a different fingerprint for no reason.
                 loader_extras = self._validate_make_args(
-                    self._loader_extras(args[1:]))
+                    self._loader_extras(args[1:] + self._web_trust_defines(args[1:])))
                 batch = args[0] in ("all", "modules")
 
                 # Regenerate BEFORE make is invoked, not during.
@@ -911,6 +956,8 @@ class BuildMixin:
                     self._run_root_make("copy_modules", extra_args=extras)
                     for module, so in self._all_module_sos():
                         self.introspect_and_record(module, so_path=so, announce=False)
+                    # After copy_modules: the artifacts signed are the ones in bin/.
+                    self.sign_modules(web=self._is_web_build(extras))
 
                 if args[0] in ("all", "loaders"):
                     # Loaders are NOT skipped. A loader carries the same
@@ -918,11 +965,21 @@ class BuildMixin:
                     # that every module is compared AGAINST at load time, so a
                     # stale loader does not merely miss a change -- it refuses
                     # every module built after it. It is also one link.
+                    web_loaders = self._is_web_build(loader_extras)
+                    outgoing = None if web_loaders else self.keep_outgoing()
                     if not self._run_root_make("loaders", extra_args=loader_extras):
                         failed.append("loaders")
                         self._drop_stale_artifact("etcs", loader_extras, "loader")
+                        if outgoing:
+                            shutil.rmtree(outgoing.parent, ignore_errors=True)
                     else:
+                        if not web_loaders:
+                            self.sign_loaders(outgoing, ["etcs"] + sorted(
+                                p.stem if p.suffix == ".exe" else p.name
+                                for p in self._bin_dir().glob("Run_*Loader*")
+                                if p.suffix in ("", ".exe")))
                         self._announce_loader_variant("etcs", loader_extras)
+                        self._sign_after_loader(loader_extras)
                 if failed:
                     return 1
                 return 0
