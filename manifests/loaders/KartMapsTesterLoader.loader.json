@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+
+  "loader": {
+    "name": "KartMapsTesterLoader",
+    "std": "c++17"
+  },
+
+  "inherits_modules": ["KartProvider"],
+
+  "build": {
+    "common": {
+      "cxxflags": [],
+      "defines": []
+    }
+  }
+}
