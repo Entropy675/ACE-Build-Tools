@@ -247,6 +247,9 @@ if __name__ == "__main__":
         print("           | publish [dir]")
         print("           | pin <root.cert | key | clear>")
         print("           | bundle <dir> [module...]")
+        print("           | root [<ETCS dir>]")
+        print("           | witness <out> [module...]")
+        print("           | source <dir>")
         print("           | script [name]")
         print("  -y / --yes answers every prompt with yes (dependency installs, hooks, removals).")
         sys.exit(0)
@@ -255,7 +258,7 @@ if __name__ == "__main__":
     try:
         if   cmd == "install":                          ace.install()
         elif cmd == "uninstall":                        ace.uninstall()
-        elif cmd == "root":                             ace.print_root()
+        elif cmd == "root":                             sys.exit(ace.root_cmd(args[1:]) or 0)
         elif cmd == "list":                             ace.list_modules()
         elif cmd == "setup" and len(args) > 1:          ace.setup(args[1], args[2] if len(args) > 2 else "default")
         elif cmd == "remove" and len(args) > 1:         ace.remove(args[1])
@@ -273,6 +276,8 @@ if __name__ == "__main__":
         elif cmd == "publish":                          sys.exit(ace.publish(args[1:]) or 0)
         elif cmd == "pin":                              sys.exit(ace.pin(args[1:]) or 0)
         elif cmd == "bundle":                           sys.exit(ace.bundle(args[1:]) or 0)
+        elif cmd == "witness":                          sys.exit(ace.witness(args[1:]) or 0)
+        elif cmd == "source":                           sys.exit(ace.source(args[1:]) or 0)
         elif cmd == "script":                           ace.create_script(args[1:])
         else:
             print(f"[-] Unknown or incomplete command: '{cmd}'")

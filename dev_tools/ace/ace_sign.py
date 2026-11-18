@@ -605,21 +605,34 @@ class SignMixin:
         return 0
 
     def bundle(self, args):
-        """ace bundle <dir> [module...]: bin/etcs and the named modules (the
-        ceremony's by default) in <dir>/bin, with every module script beside
-        them, for a machine that has nothing else. bin/etcs carries its
-        builder's key, so it takes those modules with no keystore there."""
+        """ace bundle <dir> [--from <built>] [module...]: bin/etcs and the named
+        modules (the ceremony's by default) in <dir>/bin, with every module
+        script beside them, for a machine that has nothing else. bin/etcs
+        carries its builder's key, so it takes those modules with no keystore
+        there. --from takes them from a witnessed build instead (ace witness
+        <out>: <out>/a), which carries no builder key: the machine then signs
+        its modules under a keystore of its own before it can load them."""
+        source = None
+        if "--from" in args:
+            i = args.index("--from")
+            if i + 1 >= len(args):
+                print("Usage: ace bundle <dir> [--from <built>] [module...]")
+                return 1
+            source = Path(args[i + 1]).expanduser().resolve()
+            args = args[:i] + args[i + 2:]
         if not args:
-            print("Usage: ace bundle <dir> [module...]")
+            print("Usage: ace bundle <dir> [--from <built>] [module...]")
             return 1
-        signer = self._signer()
-        if not signer:
-            print(f"{RED}[-] there is no bin/etcs to bundle. `ace make loader etcs` first.{RESET}")
+        suffix = ".exe" if platform.system() == "Windows" else ""
+        signer = (source / ("etcs" + suffix)) if source else self._signer()
+        if not signer or not signer.is_file():
+            print(f"{RED}[-] there is no etcs to bundle{' in ' + str(source) if source else ''}. "
+                  f"`ace make loader etcs` first.{RESET}")
             return 1
         p = subprocess.run([str(signer), "--attest"], capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, timeout=120)
         builder = next((l.split()[1] for l in p.stdout.splitlines() if l.startswith("builder ")), None)
-        if not builder:
+        if not builder and not source:
             print(f"{RED}[-] bin/etcs was built with no builder key, so where nothing else is it would "
                   f"take none of its modules. `ace make loader etcs` again.{RESET}")
             return 1
@@ -628,9 +641,9 @@ class SignMixin:
         (out / "bin").mkdir(parents=True, exist_ok=True)
         shutil.copy2(signer, out / "bin" / signer.name)
         for mod in mods:
-            art = self._bin_dir() / f"{mod}.{self._lib_ext()}"
+            art = (source or self._bin_dir()) / f"{mod}.{self._lib_ext()}"
             if not art.is_file():
-                print(f"{RED}[-] no {art.name} in bin/{RESET}")
+                print(f"{RED}[-] no {art.name} in {source or 'bin/'}{RESET}")
                 return 1
             shutil.copy2(art, out / "bin" / art.name)
         for scripts in sorted((self.ace_root / "modules").glob("*/scripts")):
@@ -640,5 +653,189 @@ class SignMixin:
                 for f in scripts.glob("*.etcs"):
                     shutil.copy2(f, dest / f.name)
         print(f"{GREEN}[+] bundled bin/etcs and {', '.join(mods)} in {out}{RESET}")
-        print(f"{DIM}    builder {builder[:12]}; run there as: ACE_ROOT={out} {out}/bin/etcs <script>{RESET}")
+        if builder:
+            print(f"{DIM}    builder {builder[:12]}; run there as: ACE_ROOT={out} {out}/bin/etcs <script>{RESET}")
+        else:
+            print(f"{YELLOW}[!] this etcs has no builder key: it takes these modules only once a key of the "
+                  f"machine's own has signed them, under a keystore session there.{RESET}")
+        return 0
+
+    # ------------------------------------------------------------------
+    # Witnesses: what this machine's builds of this tree come to
+    # ------------------------------------------------------------------
+    #
+    # Built twice from scratch, each binary compared by the digest a loader
+    # checks, and the agreement written as a statement by the loader that was
+    # built (core/Trust.h, --witness). Statements from several machines are
+    # agreed on with `bin/etcs --consensus`. The loader is built with no
+    # builder key -- that key is compiled in and is each machine's own -- so
+    # what one machine builds is what another can.
+
+    _WITNESS_MODULES = ("CryptProvider", "NetworkProvider", "ShellProvider")
+
+    @staticmethod
+    def _tree_word(repo):
+        """A tree's commit, and the hash of what differs from it, or None."""
+        g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
+        head = g("rev-parse", "HEAD")
+        if head.returncode != 0:
+            return None
+        word = head.stdout.strip()
+        diff = g("diff", "HEAD", "--binary", "--ignore-submodules=all").stdout
+        if diff:
+            word += "+" + hashlib.sha256(diff.encode()).hexdigest()[:12]
+        return word
+
+    def _build_account(self):
+        """What this tree was built from, as the statement's key=values: the
+        three commits, the path (it is compiled into the loader) and the
+        compiler. Compared by --consensus, which names the ones that differ."""
+        about = {"commit": self._tree_word(self.ace_root), "commons": self._tree_word(self.ace_root / "modules"),
+                 "tools": self._tree_word(self.tool_root), "path": str(self.ace_root)}
+        cc = subprocess.run(["g++", "--version"], capture_output=True, text=True)
+        about["cc"] = "_".join((cc.stdout.splitlines() or ["unknown"])[0].split())
+        return {k: v for k, v in about.items() if v}
+
+    def witness(self, args):
+        """ace witness <out> [module...]: build bin/etcs and the modules (the
+        ceremony's by default) twice from scratch into <out>/a and <out>/b,
+        and have the loader built write <out>/witness-<host>-<arch>.txt."""
+        if not args:
+            print("Usage: ace witness <out> [module...]")
+            return 1
+        out = Path(args[0]).expanduser().resolve()
+        mods = args[1:] or list(self._WITNESS_MODULES)
+        suffix = ".exe" if platform.system() == "Windows" else ""
+        ext = self._lib_ext()
+        for run in ("a", "b"):
+            print(f"{CYAN}[*] witness: build {run} of {', '.join(mods)} and etcs{RESET}")
+            for mod in mods:
+                if self.make(["module", mod, "--force"]):
+                    print(f"{RED}[-] {mod} did not build{RESET}")
+                    return 1
+            if self.make(["loader", "etcs", "--force", "-UETCS_BUILDER_KEY"]):
+                print(f"{RED}[-] etcs did not build{RESET}")
+                return 1
+            d = out / run
+            shutil.rmtree(d, ignore_errors=True)
+            d.mkdir(parents=True)
+            for name in [f"{m}.{ext}" for m in mods] + ["etcs" + suffix]:
+                art = self._bin_dir() / name
+                if not art.is_file():
+                    print(f"{RED}[-] no bin/{name} after build {run}{RESET}")
+                    return 1
+                shutil.copy2(art, d / name)
+        account = self._build_account()
+        host = re.sub(r"[^A-Za-z0-9._-]", "", platform.node()) or "unnamed"
+        arch = f"{platform.system().lower()}-{platform.machine().lower()}"
+        statement = out / f"witness-{host}-{arch}.txt"
+        loader = out / "a" / ("etcs" + suffix)
+        p = subprocess.run([str(loader), "--witness", str(out / "a"), str(out / "b"), str(statement),
+                            *[f"{k}={v}" for k, v in account.items()]],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300)
+        for line in p.stdout.splitlines():
+            if re.match(r"^(\S+ [0-9a-f]{64}|\S+ differs|\S+ is not|witness |witnessed )", line):
+                print(f"    {line}")
+        if p.returncode != 0:
+            print(f"{RED}[-] {(p.stderr or 'the loader wrote no statement').strip().splitlines()[-1]}{RESET}")
+            return 1
+        print(f"{GREEN}[+] {statement}{RESET}")
+        print(f"{DIM}    agree several: bin/etcs --consensus [quorum=N] [check=<dir>] <statement>...{RESET}")
+        return 0
+
+    # ------------------------------------------------------------------
+    # The source, for machines with no network
+    # ------------------------------------------------------------------
+    #
+    # This tree, Commons and ACE-Build-Tools, each with its .git (a vendored
+    # dependency is a submodule checkout the module Makefiles resolve by
+    # commit, locally), and the Monocypher pin's cache: one tar a machine with
+    # nothing on it builds from. The same inputs make the same bytes, so its
+    # SHA-256 is what every witness checks before unpacking.
+
+    def source(self, args):
+        """ace source <dir>: <dir>/etcs-source-<commit>.tar and its .sha256."""
+        import tarfile
+        from .ace_generate import MONOCYPHER_COMMIT
+        if len(args) != 1:
+            print("Usage: ace source <dir>")
+            return 1
+        out = Path(args[0]).expanduser().resolve()
+        out.mkdir(parents=True, exist_ok=True)
+        word = (self._tree_word(self.ace_root) or "unknown")[:20]
+        tar_path = out / f"etcs-source-{word}.tar"
+
+        def entries(repo, prefix):
+            """Every file each repository under `repo` tracks, and every .git,
+            as (path on disk, path in the tar), in order. Each nested checkout
+            -- Commons, a vendored submodule -- is asked for its own files."""
+            paths = set()
+            for root, dirs, files in os.walk(repo):
+                rel = Path(root).relative_to(repo)
+                if ".git" in dirs or ".git" in files:
+                    ls = subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True, check=True)
+                    paths.update(str(rel / f) for f in ls.stdout.decode().split("\0") if f)
+                    g = Path(root) / ".git"
+                    if g.is_dir():                          # git wants its empty dirs too
+                        for r2, d2, f2 in os.walk(g):
+                            paths.update(str((Path(r2) / f).relative_to(repo)) for f in d2 + f2)
+                    else:
+                        paths.add(str(rel / ".git"))
+                dirs[:] = [d for d in dirs if d != ".git"]
+            return [(repo / p, f"{prefix}/{p}") for p in sorted(paths)
+                    if (repo / p).is_symlink() or (repo / p).is_file() or (repo / p).is_dir()]
+
+        cache = self._get_registry_dir() / "cache" / ("monocypher-" + MONOCYPHER_COMMIT[:12])
+        if not (cache / "src" / "monocypher.c").is_file():
+            self._monocypher_tree()
+        unpack = (
+            "#!/bin/sh\n"
+            "# Unpack anywhere, and that is this machine's ACE_ROOT: the tree is <dir>/ETCS.\n"
+            "#     mkdir -p <dir> && tar -xf etcs-source-*.tar -C <dir> && sh <dir>/unpack.sh\n"
+            "# The root is compiled into the loader, so witnesses that chose one root\n"
+            "# agree with each other, and a witness at another root is a group of its own.\n"
+            "set -e\n"
+            "here=$(cd \"$(dirname \"$0\")\" && pwd)\n"
+            "mkdir -p \"$HOME/.etcs_registry/cache\"\n"
+            "cp -a \"$here/registry-cache/.\" \"$HOME/.etcs_registry/cache/\"\n"
+            "python3 \"$here/ACE-Build-Tools/ace_install.py\" root \"$here/ETCS\"\n"
+            "echo \"ace: python3 $here/ACE-Build-Tools/ace_install.py\"\n").encode()
+
+        def add(t, disk, name, data=None):
+            info = tarfile.TarInfo(name)
+            info.mtime, info.uid, info.gid, info.uname, info.gname = 0, 0, 0, "", ""
+            if data is None and disk.is_symlink():          # tracked as a link, kept one
+                info.type, info.linkname, info.mode = tarfile.SYMTYPE, os.readlink(disk), 0o777
+                t.addfile(info)
+            elif data is None and disk.is_dir():
+                info.type, info.mode = tarfile.DIRTYPE, 0o755
+                t.addfile(info)
+            elif data is None:
+                st = disk.stat()
+                info.size, info.mode = st.st_size, 0o755 if st.st_mode & 0o111 else 0o644
+                with open(disk, "rb") as f:
+                    t.addfile(info, f)
+            else:
+                info.size, info.mode = len(data), 0o755
+                import io
+                t.addfile(info, io.BytesIO(data))
+
+        print(f"[*] collecting the trees ...")
+        files = (entries(self.ace_root, "ETCS") + entries(self.tool_root, "ACE-Build-Tools")
+                 + [(p, f"registry-cache/{cache.name}/{p.relative_to(cache)}")
+                    for p in sorted(cache.rglob("*"))])
+        with tarfile.open(tar_path, "w", format=tarfile.PAX_FORMAT) as t:
+            add(t, None, "unpack.sh", unpack)
+            for disk, name in files:
+                add(t, disk, name)
+        digest = hashlib.sha256()
+        with open(tar_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        (out / (tar_path.name + ".sha256")).write_text(f"{digest.hexdigest()}  {tar_path.name}\n")
+        size = tar_path.stat().st_size / (1 << 20)
+        print(f"{GREEN}[+] {tar_path} ({size:.0f} MiB, {len(files)} files){RESET}")
+        print(f"{DIM}    sha256 {digest.hexdigest()}{RESET}")
+        print(f"{DIM}    there: mkdir -p <dir> && tar -xf {tar_path.name} -C <dir> && sh <dir>/unpack.sh "
+              f"(<dir>/ETCS is that machine's ACE_ROOT){RESET}")
         return 0
