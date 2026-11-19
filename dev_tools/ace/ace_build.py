@@ -395,7 +395,9 @@ class BuildMixin:
         the key of the loader building it (ETCS_BUILDER_KEY), whose local half
         it takes with no keystore -- a browser's, and a machine with nothing on
         it but etcs -- and the identity it is built with (ETCS_IDENTITY), what
-        it requires at the head of what it takes globally: `ace identity`."""
+        it requires at the head of what it takes globally, and its parent
+        (ETCS_IDENTITY_PARENT), which lets it recognise its successor across a
+        re-sync: `ace identity`."""
         defs = []
         if not any(a.startswith(("-DETCS_BUILDER_KEY", "-UETCS_BUILDER_KEY")) for a in args):
             key, why = self.builder_key()
@@ -408,6 +410,9 @@ class BuildMixin:
             ident, _ = self.build_identity()
             if ident:
                 defs.append(f"-DETCS_IDENTITY={ident}")
+                parent = self.build_identity_parent()
+                if parent:
+                    defs.append(f"-DETCS_IDENTITY_PARENT={parent}")
         return defs
 
     def _sign_after_loader(self, extras):

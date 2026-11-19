@@ -2,12 +2,14 @@
 
     ace sign            sign every current module artifact in bin/ and bin/wasm/,
                         and the native loader binaries in bin/
-    ace identity [<hex> | store | none]
-                        the identity every loader built here is compiled with:
-                        by default this store's own (bin/etcs --identity)
-    ace mint <witnessed> <statement>... [quorum=N] [--out <dir>]
+    ace identity [<hex>[:<parent hex>] | store | none]
+                        the identity every loader built here is compiled with,
+                        and its parent: by default this store's own
+                        (bin/etcs --identity, --identity-parent)
+    ace mint <witnessed> <statement>... [quorum=N] [--release <store>] [--out <dir>]
                         the minting server signs a witnessed build, the loader
-                        among it too, with the marketplace key: what the site serves
+                        among it too, with the marketplace key, and the release
+                        store countersigns the loader: what the site serves
     ace publish [dir] [--from <minted>]
                         what the site serves at /dist: the minted binaries, and
                         the marketplace's signed list of them
@@ -179,9 +181,12 @@ class SignMixin:
     # that builder is authorized to build with, and what every loader it builds
     # requires at the head of what it takes globally. Not a header, so no
     # epoch: builders of every identity share one. By default it is this
-    # store's own, which bin/etcs answers; `ace identity <hex>` builds for
-    # another's -- a witness for the minting server's, a developer whose loader
-    # should take what the site serves -- and `none` for no identity at all.
+    # store's own, which bin/etcs answers; `ace identity <hex>[:<parent>]`
+    # builds for another's -- a witness for the minting server's, a developer
+    # whose loader should take what the site serves -- and `none` for no
+    # identity at all. The parent (the fold one step short of the key) goes in
+    # beside it: a checksum is followed only down a chain, so a loader that is
+    # to bridge to a sibling marketplace is told the parent, never finds it.
     # $ACE_IDENTITY, while set, wins.
 
     def _identity_cache_path(self):
@@ -197,28 +202,51 @@ class SignMixin:
             text = ""
         return (text or "store"), ("ace identity" if text else "the default")
 
+    @staticmethod
+    def _identity_pair(text):
+        """(head, parent or None) from "<hex>[:<hex>]", or None."""
+        head, _, parent = text.partition(":")
+        if not _HEX64.match(head) or (parent and not _HEX64.match(parent)):
+            return None
+        return head, (parent or None)
+
     def build_identity(self):
         """(hex or None, where it came from)."""
         setting, source = self._identity_setting()
         if setting == "none":
             return None, source + ": none"
-        if _HEX64.match(setting):
-            return setting, source
+        pair = self._identity_pair(setting)
+        if pair:
+            return pair[0], source
         ident, why = self._loader_answer("--identity")
         return ident, ("this store's own" if ident else why)
 
+    def build_identity_parent(self):
+        """The identity's parent, hex, or None: unregistered, none set, or no identity."""
+        setting, _ = self._identity_setting()
+        if setting == "none":
+            return None
+        pair = self._identity_pair(setting)
+        if pair:
+            return pair[1]
+        parent, _ = self._loader_answer("--identity-parent")
+        return parent
+
     def identity_cmd(self, args):
-        """ace identity [<hex> | store | none]: what loaders built here are
-        compiled with, or set it."""
-        if len(args) > 1 or (args and args[0] not in ("store", "none") and not _HEX64.match(args[0].lower())):
-            print("Usage: ace identity [<64 hex> | store | none]")
+        """ace identity [<hex>[:<parent>] | store | none]: what loaders built
+        here are compiled with, or set it."""
+        if len(args) > 1 or (args and args[0] not in ("store", "none") and not self._identity_pair(args[0].lower())):
+            print("Usage: ace identity [<64 hex>[:<64 hex parent>] | store | none]")
             return 1
         if args:
             f = self._identity_cache_path()
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(args[0].lower() + "\n")
         ident, source = self.build_identity()
+        parent = self.build_identity_parent() if ident else None
         print(f"{ident or 'none'}  ({source})")
+        if ident:
+            print(f"parent {parent or 'none'}")
         if os.environ.get("ACE_IDENTITY") and args:
             print(f"{YELLOW}[!] ACE_IDENTITY is set, and wins while it is{RESET}")
         if args:
@@ -490,19 +518,31 @@ class SignMixin:
             return None
         return dict(kv.split("=", 1) for kv in first[2:] if "=" in kv)
 
+    def _countersign(self, signer, art, epoch, release):
+        """The release store's countersignature onto a minted loader: 'signed' or why not."""
+        with tempfile.TemporaryDirectory(prefix="ace-count-") as d:
+            out = Path(d) / "section"
+            rc, _, err = self._ask_loader(signer, "--countersign", "etcs", str(art), epoch, str(out),
+                                          env={"ETCS_STORE": str(release)})
+            if rc != 0 or not out.is_file():
+                return "not countersigned: " + (err.splitlines()[-1] if err else f"exited {rc}")
+            return self._place_chain(art, out) or "signed"
+
     def mint(self, args):
-        out = None
-        if "--out" in args:
-            i = args.index("--out")
-            if i + 1 >= len(args):
-                args = []
-            else:
-                out = Path(args[i + 1]).expanduser().resolve()
+        out, release = None, None
+        for flag in ("--out", "--release"):
+            if flag in args:
+                i = args.index(flag)
+                if i + 1 >= len(args):
+                    args = []
+                    break
+                val = Path(args[i + 1]).expanduser().resolve()
+                out, release = (val, release) if flag == "--out" else (out, val)
                 args = args[:i] + args[i + 2:]
         quorum = [a for a in args if a.startswith("quorum=")]
         args = [a for a in args if not a.startswith("quorum=")]
         if len(args) < 2:
-            print("Usage: ace mint <witnessed dir> <statement>... [quorum=N] [--out <dir>]")
+            print("Usage: ace mint <witnessed dir> <statement>... [quorum=N] [--release <store>] [--out <dir>]")
             return 1
         src = Path(args[0]).expanduser().resolve()
         statements = [str(Path(a).expanduser().resolve()) for a in args[1:]]
@@ -521,6 +561,15 @@ class SignMixin:
         if rc != 0 or not ident:
             print(f"{RED}[-] bin/etcs gave no identity: {err or 'no answer'}{RESET}")
             return 1
+        _, parent, _ = self._ask_loader(signer, "--identity-parent")
+        parent = parent or "none"
+        if release:
+            r = subprocess.run([str(signer), "--attest"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                               timeout=120, env={**os.environ, "ETCS_STORE": str(release)})
+            if not re.search(r"^key\s+[0-9a-f]{64} \(release, proven\)$", r.stdout, re.M):
+                print(f"{RED}[-] {release} is not a release key's store: its key is not registered as release, "
+                      f"or the keystore does not hold it.{RESET}")
+                return 1
 
         # The builders agree on these bytes, or nothing is minted.
         c = subprocess.run([str(signer), "--consensus", *quorum, f"check={src}", *statements],
@@ -533,9 +582,11 @@ class SignMixin:
             return 1
         heads = [self._statement_head(s) for s in statements]
         built_for = {(h or {}).get("identity", "none") for h in heads}
-        if built_for != {ident}:
-            print(f"{RED}[-] not minted: the witnesses built for identity {', '.join(sorted(built_for))}, "
-                  f"and this server mints {ident}. `ace witness <out> --identity {ident}`{RESET}")
+        built_parent = {(h or {}).get("parent", "none") for h in heads}
+        if built_for != {ident} or built_parent != {parent}:
+            print(f"{RED}[-] not minted: the witnesses built for identity {', '.join(sorted(built_for))} "
+                  f"(parent {', '.join(sorted(built_parent))}), and this server mints {ident} (parent {parent}). "
+                  f"`ace witness <out> --identity {ident}{'' if parent == 'none' else ':' + parent}`{RESET}")
             return 1
         epoch = heads[0].get("epoch")
 
@@ -553,11 +604,20 @@ class SignMixin:
             kernel = name == "etcs"
             r = self._sign_one(signer, name, dest, epoch, verb="--succeed" if kernel else "--sign")
             result = r[0] if kernel else r
+            if kernel and release and result in ("signed", "unchanged"):
+                result = self._countersign(signer, dest, epoch, release)
             if result in ("signed", "unchanged"):
                 minted += 1
             else:
                 left += 1
                 print(f"{RED}[-] {art.name} is not minted -- {result}{RESET}")
+        if release:
+            chain = release / "loader.chain"
+            if chain.is_file():
+                shutil.copy2(chain, out / "release.chain")      # the release certs ride beside the binaries
+        else:
+            print(f"{YELLOW}[!] no --release store: the loader is not countersigned, and no loader of this "
+                  f"identity's parent takes it as a successor across a re-sync.{RESET}")
         etcs = out / ("etcs" + suffix)
         if etcs.is_file():
             with tempfile.TemporaryDirectory(prefix="ace-mint-") as empty:
@@ -769,16 +829,17 @@ class SignMixin:
         <out>/witness-<host>-<arch>.txt. The loader is built for the identity
         given -- the minting server's, for a build it will mint -- or for none;
         never this machine's own, which is no other witness's."""
-        ident = None
+        ident, parent = None, None
         if "--identity" in args:
             i = args.index("--identity")
-            if i + 1 >= len(args) or not _HEX64.match(args[i + 1].lower()):
-                print("Usage: ace witness <out> [--identity <64 hex>] [module...]")
+            pair = self._identity_pair(args[i + 1].lower()) if i + 1 < len(args) else None
+            if not pair:
+                print("Usage: ace witness <out> [--identity <64 hex>[:<64 hex parent>]] [module...]")
                 return 1
-            ident = args[i + 1].lower()
+            ident, parent = pair
             args = args[:i] + args[i + 2:]
         if not args:
-            print("Usage: ace witness <out> [--identity <64 hex>] [module...]")
+            print("Usage: ace witness <out> [--identity <64 hex>[:<64 hex parent>]] [module...]")
             return 1
         out = Path(args[0]).expanduser().resolve()
         mods = args[1:] or list(self._WITNESS_MODULES)
@@ -791,7 +852,8 @@ class SignMixin:
                     print(f"{RED}[-] {mod} did not build{RESET}")
                     return 1
             if self.make(["loader", "etcs", "--force", "-UETCS_BUILDER_KEY",
-                          f"-DETCS_IDENTITY={ident}" if ident else "-UETCS_IDENTITY"]):
+                          f"-DETCS_IDENTITY={ident}" if ident else "-UETCS_IDENTITY",
+                          f"-DETCS_IDENTITY_PARENT={parent}" if parent else "-UETCS_IDENTITY_PARENT"]):
                 print(f"{RED}[-] etcs did not build{RESET}")
                 return 1
             d = out / run
@@ -805,6 +867,7 @@ class SignMixin:
                 shutil.copy2(art, d / name)
         account = self._build_account()
         account["identity"] = ident or "none"
+        account["parent"] = parent or "none"
         host = re.sub(r"[^A-Za-z0-9._-]", "", platform.node()) or "unnamed"
         arch = f"{platform.system().lower()}-{platform.machine().lower()}"
         statement = out / f"witness-{host}-{arch}.txt"
