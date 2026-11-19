@@ -142,6 +142,40 @@ def _var(name):
     return "DEP_" + re.sub(r"[^A-Za-z0-9]", "_", name).upper()
 
 
+# THE KERNEL'S VERSION ON EVERY EXPORTED SYMBOL. A version script's node is
+# the version an ELF symbol carries (Foo_Make@@<node>), so naming the node
+# for the ABI's version -- BASE_SOURCE_STRING in core/ETCS_API.h,
+# "ETCS_Kernel_v1.0" -> ETCS_ABI_KERNEL_V_1.0 -- tags each function with the
+# kernel it was built for, at its source. exports.map keeps the bare node
+# (ETCS_ABI, ETCS_LOADER_1.0); the Makefile writes a renamed copy beside it
+# and links with that, and the version is in the Makefile, so a kernel bump
+# regenerates it and relinks.
+KERNEL_EXPORTS_FILE = ".ace_exports_kernel.map"
+
+
+def _kernel_version(ace_root):
+    """"1.0" from BASE_SOURCE_STRING, or None."""
+    try:
+        text = (Path(ace_root) / "core" / "ETCS_API.h").read_text()
+    except OSError:
+        return None
+    m = re.search(r'#define\s+BASE_SOURCE_STRING\s+"ETCS_Kernel_v([0-9]+(?:\.[0-9]+)*)"', text)
+    return m.group(1) if m else None
+
+
+def _kernel_exports_rule(w, source, prefix, node):
+    """The rule writing the kernel-tagged copy of `source`: its first node,
+    whatever its name after `prefix`, renamed `node`."""
+    w("# The exported symbols carry the kernel's version (ace_manifest.py,")
+    w("# KERNEL_EXPORTS_FILE): the version script's node, renamed for it.")
+    w(f"KERNEL_NODE := {node}")
+    w("ifneq ($(KERNEL_EXPORTS),)")
+    w(f"$(KERNEL_EXPORTS): {source} Makefile")
+    w(f"\t@sed 's/^{prefix}[A-Za-z0-9_.]*[[:space:]]*{{/$(KERNEL_NODE) {{/' $< > $@")
+    w("endif")
+    w("")
+
+
 def _abi_tag(abi_defines):
     """Short, stable tag for a set of ABI-affecting defines.
 
@@ -1026,7 +1060,8 @@ class ManifestMixin:
                 # ELF only. On Win the version script is silently ignored,
                 # which reads as an exported surface that is not actually
                 # enforced -- better to not claim it at all.
-                ld.append(f"-Wl,--version-script={exports}")
+                ld.append("-Wl,--version-script=$(KERNEL_EXPORTS)")
+                w(f"    KERNEL_EXPORTS := {KERNEL_EXPORTS_FILE}")
             w(f"    LDFLAGS := {' '.join(ld)}")
             w(f"    SYSLIBS := {' '.join('-l' + l for l in blk.get('system_libs', []))}")
 
@@ -1204,9 +1239,12 @@ class ManifestMixin:
         # BUILD_STAMP is a REAL prerequisite, not order-only: it is how a
         # changed architecture, sanitizer or ABI-define set forces a relink.
         # Order-only would let a stale .so built with different flags stand.
-        prereqs = (["$(MODULE_DEPS)", "$(HASH_HEADER)", "$(BUILD_STAMP)"]
+        prereqs = (["$(MODULE_DEPS)", "$(HASH_HEADER)", "$(BUILD_STAMP)", "$(KERNEL_EXPORTS)"]
                    + obj_targets + build_markers)
         order_only = fetch_markers
+        if exports:
+            kv = _kernel_version(self.ace_root)
+            _kernel_exports_rule(w, exports, "ETCS_ABI", f"ETCS_ABI_KERNEL_V_{kv}" if kv else "ETCS_ABI")
         w("# Archives come AFTER the translation unit that needs them: gold does")
         w("# not rescan an archive it has already passed, so a dependency listed")
         w("# among the flags resolves only by accident.")
@@ -1986,7 +2024,8 @@ class ManifestMixin:
             # ELF-only: audited export surface under -rdynamic (see module
             # version-script note). Loader needs this so module static-init
             # can dlsym(RTLD_DEFAULT, ETCS_GetLoaderManifest).
-            parts.append(f"-Wl,--version-script={exports}")
+            parts.append("-Wl,--version-script=$(KERNEL_EXPORTS)")
+            w(f"    KERNEL_EXPORTS := {KERNEL_EXPORTS_FILE}")
         w(f"    LDFLAGS := {' '.join(parts)}".rstrip())
         w("else ifeq ($(UNAME_S),Windows_NT)")
         blk = default.get("build", {}).get("Win", {})
@@ -2104,11 +2143,14 @@ class ManifestMixin:
         w("# Both recipes link to $@$(WEB_SUFFIX). On a native build WEB_SUFFIX is")
         w("# empty, so the target and the file are the same name and make's own")
         w("# up-to-date check still works.")
-        w("%Loader: %Loader.cc")
+        if exports:
+            kv = _kernel_version(self.ace_root)
+            _kernel_exports_rule(w, exports, "ETCS_LOADER", f"ETCS_LOADER_KERNEL_V_{kv}" if kv else "ETCS_LOADER")
+        w("%Loader: %Loader.cc $(KERNEL_EXPORTS)")
         w("\t$(CXX) $(CXXFLAGS) $(EXTRA_CXXFLAGS) $(EXTRADEFINES) -o Run_$@$(WEB_SUFFIX) $< "
           "$(EXTRA_LINK) $(LDFLAGS)")
         w("")
-        w("etcs: etcs.cc")
+        w("etcs: etcs.cc $(KERNEL_EXPORTS)")
         w("\t$(CXX) $(CXXFLAGS) $(EXTRA_CXXFLAGS) $(EXTRADEFINES) -o $@$(WEB_SUFFIX) $< "
           "$(EXTRA_LINK) $(LDFLAGS)")
         w("")

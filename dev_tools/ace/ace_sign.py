@@ -2,12 +2,15 @@
 
     ace sign            sign every current module artifact in bin/ and bin/wasm/,
                         and the native loader binaries in bin/
-    ace release [store] sign bin/etcs as a release, with the release machine's
-                        loader: the binary the site serves for download
-    ace publish [dir]   what the site serves at /dist: the current modules, the
-                        last release, and the marketplace's signed list of them
-    ace pin <root.cert | hex | clear>
-                        the root every loader built here is compiled with
+    ace identity [<hex> | store | none]
+                        the identity every loader built here is compiled with:
+                        by default this store's own (bin/etcs --identity)
+    ace mint <witnessed> <statement>... [quorum=N] [--out <dir>]
+                        the minting server signs a witnessed build, the loader
+                        among it too, with the marketplace key: what the site serves
+    ace publish [dir] [--from <minted>]
+                        what the site serves at /dist: the minted binaries, and
+                        the marketplace's signed list of them
     ace bundle <dir> [module...]
                         bin/etcs and the modules a machine with nothing else on
                         it needs to run the ceremony (or anything else)
@@ -51,7 +54,7 @@ from .ace_common import CYAN, YELLOW, GREEN, RED, RESET, DIM
 _EPOCH_PREFIXES = ("CORE:", "ONTOLOGY:", "LIB:", "HEADER:")
 _MANIFEST_LINE = re.compile(r'getManifest\(\)\["([^"]+)"\]\s*=\s*"([^"]*)"')
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
-_LINEAGE = re.compile(r"^etcs-lineage [12] ")
+_LINEAGE = re.compile(r"^etcs-lineage [123] ")
 
 _ELF_SECTION = ".etcs.sig"
 _WASM_SECTION = b"etcs.sig"
@@ -168,21 +171,59 @@ class SignMixin:
         (ETCS_BUILDER_KEY)."""
         return self._loader_answer("--loader-key")
 
-    def _off_root(self, signer, env=None):
-        """Why `signer` cannot sign a release for this tree, or None. A release
-        is ACE's half: a signer built for another root, or none, signs only its
-        local half, which no download takes. Modules and a developer's own
-        loaders need no root -- the local half runs on its own loader."""
-        pin = self.root_pin()
-        if not pin:
-            return None
-        rc, root, err = self._ask_loader(signer, "--root", env=env)
-        if rc == 0 and root == pin:
-            return None
-        if rc != 0 or not root:
-            return err.splitlines()[-1] if err else "bin/etcs gave no root"
-        return (f"it signs under root {root[:12]}, and this tree pins {pin[:12]}; "
-                f"register its key under the pinned root first (`bin/etcs --registration`)")
+    # ------------------------------------------------------------------
+    # The identity a loader built here is compiled with
+    # ------------------------------------------------------------------
+    #
+    # The fold along a registration to the key that builds (core/Trust.h): what
+    # that builder is authorized to build with, and what every loader it builds
+    # requires at the head of what it takes globally. Not a header, so no
+    # epoch: builders of every identity share one. By default it is this
+    # store's own, which bin/etcs answers; `ace identity <hex>` builds for
+    # another's -- a witness for the minting server's, a developer whose loader
+    # should take what the site serves -- and `none` for no identity at all.
+    # $ACE_IDENTITY, while set, wins.
+
+    def _identity_cache_path(self):
+        return self._root_cache_path().with_name("etcs_identity")
+
+    def _identity_setting(self):
+        env = os.environ.get("ACE_IDENTITY", "").strip().lower()
+        if env:
+            return env, "$ACE_IDENTITY"
+        try:
+            text = self._identity_cache_path().read_text().strip().lower()
+        except OSError:
+            text = ""
+        return (text or "store"), ("ace identity" if text else "the default")
+
+    def build_identity(self):
+        """(hex or None, where it came from)."""
+        setting, source = self._identity_setting()
+        if setting == "none":
+            return None, source + ": none"
+        if _HEX64.match(setting):
+            return setting, source
+        ident, why = self._loader_answer("--identity")
+        return ident, ("this store's own" if ident else why)
+
+    def identity_cmd(self, args):
+        """ace identity [<hex> | store | none]: what loaders built here are
+        compiled with, or set it."""
+        if len(args) > 1 or (args and args[0] not in ("store", "none") and not _HEX64.match(args[0].lower())):
+            print("Usage: ace identity [<64 hex> | store | none]")
+            return 1
+        if args:
+            f = self._identity_cache_path()
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(args[0].lower() + "\n")
+        ident, source = self.build_identity()
+        print(f"{ident or 'none'}  ({source})")
+        if os.environ.get("ACE_IDENTITY") and args:
+            print(f"{YELLOW}[!] ACE_IDENTITY is set, and wins while it is{RESET}")
+        if args:
+            print(f"{DIM}    the next loader build is built with it: `ace make loader etcs`{RESET}")
+        return 0
 
     def _loader_answer(self, verb):
         signer = self._signer()
@@ -279,9 +320,10 @@ class SignMixin:
     # keeps a copy of bin/etcs before a loader build replaces it, and that copy
     # signs its successor and the pass-off into it. Where there is no outgoing
     # loader, or what it signs does not attest the new one, the new one passes
-    # itself off: a lineage beginning, which an experimental epoch takes and the
-    # guild does not -- there a lineage begins at a release (`ace release`),
-    # and the build after it is passed off by the release. Every other loader
+    # itself off: a lineage beginning, which a loader of no identity, or of its
+    # own key's, takes -- and one built for a minted identity does not: there a
+    # lineage begins at a mint (`ace mint`, or the site's etcs as bin/etcs), and
+    # the build after it is passed off by the minted loader. Every other loader
     # binary (the Run_* testers) is passed off by the new etcs.
 
     def keep_outgoing(self):
@@ -313,8 +355,8 @@ class SignMixin:
                     result, edge = self._sign_one(signer, "etcs", new, epoch, verb="--succeed")
                     if result in ("signed", "unchanged"):
                         break
-                # A signature the new loader does not take -- the outgoing one signed
-                # under a half the new one has no root for -- is no attestation.
+                # A signature the new loader does not take -- the outgoing one was
+                # built for another identity -- is no attestation.
                 # The new loader may then sign itself where its own rule allows.
                 if result == "signed" and by == "the outgoing loader":
                     rc, _, _ = self._ask_loader(new, "--attest", want=re.compile(r"^attested\s"))
@@ -326,9 +368,10 @@ class SignMixin:
                     rc, line, _ = self._ask_loader(new, "--attest", want=re.compile(r"^attested\s"))
                     if rc != 0 and line:
                         print(f"{YELLOW}[!] bin/etcs does not attest -- {line.split(':', 1)[-1].strip()}{RESET}")
-                        if self.root_pin():
-                            print(f"{DIM}    it runs with a warning, and signs its local half alone. In the guild a "
-                                  f"lineage begins at a release: `ace release`, then build again.{RESET}")
+                        if "mint" in line:
+                            print(f"{DIM}    it runs with a warning, and signs its local half alone. Under a minted "
+                                  f"identity a lineage begins at a mint: the site's etcs as bin/etcs, then build "
+                                  f"again.{RESET}")
                 if result == "signed":
                     print(f"{GREEN}[+] bin/etcs signed by {by}{RESET}")
                     if edge:
@@ -425,76 +468,117 @@ class SignMixin:
         return 1 if (self.sign_modules() or left) else 0
 
     # ------------------------------------------------------------------
-    # A release: the loader the site serves for download
+    # Minting: the marketplace key over a witnessed build
     # ------------------------------------------------------------------
     #
-    # bin/etcs signed by the release machine's loader -- a store whose key the
-    # active key certified as a release key. A loader binary a release key
-    # signed attests on any machine that holds the same root, with an empty
-    # store; one signed by a loader's own key attests only on that loader.
-    #
-    # The signer is the last release this store made, kept beside it as
-    # <store>/etcs: it attests anywhere, so it may sign the next. The first
-    # release is bin/etcs signing itself -- the release lineage's genesis.
+    # Builders of lower trust run the build first (`ace witness`, built for the
+    # minting server's identity), and only bytes they agree on are minted: the
+    # minting server's loader -- its store registered as the marketplace --
+    # checks the consensus, then signs those exact bytes, modules and the
+    # loader alike. A loader binary the marketplace signed is minted: it
+    # attests on any machine built for that identity, with an empty store, and
+    # a lineage there begins at it.
 
-    def _release_store(self, args):
-        if args:
-            return Path(args[0]).expanduser().resolve()
-        env = os.environ.get("ETCS_RELEASE_STORE")
-        return Path(env).expanduser().resolve() if env else Path.home() / ".local" / "share" / "etcs-release"
+    @staticmethod
+    def _statement_head(path):
+        """The first line of a witness statement, as {key: value}."""
+        try:
+            first = Path(path).read_text().splitlines()[0].split()
+        except (OSError, IndexError):
+            return None
+        if first[:2] != ["etcs-witness", "1"]:
+            return None
+        return dict(kv.split("=", 1) for kv in first[2:] if "=" in kv)
 
-    def release(self, args):
-        if len(args) > 1:
-            print("Usage: ace release [<store>]")
+    def mint(self, args):
+        out = None
+        if "--out" in args:
+            i = args.index("--out")
+            if i + 1 >= len(args):
+                args = []
+            else:
+                out = Path(args[i + 1]).expanduser().resolve()
+                args = args[:i] + args[i + 2:]
+        quorum = [a for a in args if a.startswith("quorum=")]
+        args = [a for a in args if not a.startswith("quorum=")]
+        if len(args) < 2:
+            print("Usage: ace mint <witnessed dir> <statement>... [quorum=N] [--out <dir>]")
             return 1
-        if not self.root_pin():
-            print(f"{RED}[-] a release is signed under ACE's root, and none is pinned (`ace pin`).{RESET}")
+        src = Path(args[0]).expanduser().resolve()
+        statements = [str(Path(a).expanduser().resolve()) for a in args[1:]]
+        out = out or self.ace_root / "minted"
+        signer = self._signer()
+        if not signer:
+            print(f"{RED}[-] there is no bin/etcs to mint with. `ace make loader etcs` first.{RESET}")
             return 1
-        new = self._signer()
-        if not new:
-            print(f"{RED}[-] there is no bin/etcs to release. `ace make loader etcs` first.{RESET}")
+        p = subprocess.run([str(signer), "--attest"], capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=120)
+        if not re.search(r"^key\s+[0-9a-f]{64} \(marketplace, proven\)$", p.stdout, re.M):
+            print(f"{RED}[-] this store is not the minting server's: its key is not registered as the "
+                  f"marketplace, or the keystore does not hold it.{RESET}")
             return 1
-        if not self._ensure_generated():
+        rc, ident, err = self._ask_loader(signer, "--identity")
+        if rc != 0 or not ident:
+            print(f"{RED}[-] bin/etcs gave no identity: {err or 'no answer'}{RESET}")
             return 1
-        if self._run_root_make("generate_hashes"):
-            os.environ["ACE_HASHES_READY"] = "1"
-        if not self.check_loader_epoch():
+
+        # The builders agree on these bytes, or nothing is minted.
+        c = subprocess.run([str(signer), "--consensus", *quorum, f"check={src}", *statements],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300)
+        for line in c.stdout.splitlines():
+            if not line.startswith("["):                   # the loader's own log
+                print(f"    {line}")
+        if c.returncode != 0:
+            print(f"{RED}[-] not minted: {src} is not the witnesses' consensus build{RESET}")
             return 1
-        store = self._release_store(args)
-        env = {"ETCS_STORE": str(store)}
-        p = subprocess.run([str(new), "--attest"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                           timeout=120, env={**os.environ, **env})
-        if not re.search(r"^key\s+[0-9a-f]{64} \(release, proven\)$", p.stdout, re.M):
-            print(f"{RED}[-] {store} is not a release machine's loader: its key is not registered as a "
-                  f"release key, or the keystore does not hold it.{RESET}")
-            print(f"{DIM}    ETCS_STORE={store} bin/etcs --loader-key, have the active key certify it as "
-                  f"release, then --registration.{RESET}")
+        heads = [self._statement_head(s) for s in statements]
+        built_for = {(h or {}).get("identity", "none") for h in heads}
+        if built_for != {ident}:
+            print(f"{RED}[-] not minted: the witnesses built for identity {', '.join(sorted(built_for))}, "
+                  f"and this server mints {ident}. `ace witness <out> --identity {ident}`{RESET}")
             return 1
-        kept = store / new.name
-        epoch = self.epoch_id()
-        result, edge, by = "no signer", None, None
-        for signer, who in ((kept if kept.is_file() else None, "the last release"), (new, "itself")):
-            if not signer:
+        epoch = heads[0].get("epoch")
+
+        suffix = ".exe" if platform.system() == "Windows" else ""
+        exts = (".so", ".dll", ".wasm", ".exe")
+        shutil.rmtree(out, ignore_errors=True)
+        out.mkdir(parents=True)
+        minted, left = 0, 0
+        for art in sorted(src.iterdir()):
+            if not art.is_file() or art.name.startswith("witness-"):
                 continue
-            result, edge, by = self._off_root(signer, env=env), None, who
-            if result:
-                continue
-            result, edge = self._sign_one(signer, "etcs", new, epoch, verb="--succeed", env=env)
+            name = next((art.name[:-len(e)] for e in exts if art.name.endswith(e)), art.name)
+            dest = out / art.name
+            shutil.copy2(art, dest)
+            kernel = name == "etcs"
+            r = self._sign_one(signer, name, dest, epoch, verb="--succeed" if kernel else "--sign")
+            result = r[0] if kernel else r
             if result in ("signed", "unchanged"):
-                break
-        if result not in ("signed", "unchanged"):
-            print(f"{RED}[-] bin/etcs is not released -- {result}{RESET}")
+                minted += 1
+            else:
+                left += 1
+                print(f"{RED}[-] {art.name} is not minted -- {result}{RESET}")
+        etcs = out / ("etcs" + suffix)
+        if etcs.is_file():
+            with tempfile.TemporaryDirectory(prefix="ace-mint-") as empty:
+                try:
+                    a = subprocess.run([str(etcs), "--attest"], capture_output=True, text=True,
+                                       stdin=subprocess.DEVNULL, timeout=120,
+                                       env={**os.environ, "ETCS_STORE": empty})
+                    line = next((l for l in a.stdout.splitlines() if l.startswith("attested")), "")
+                    if a.returncode != 0:
+                        left += 1
+                        print(f"{RED}[-] the minted etcs does not attest on an empty store -- "
+                              f"{line.split(':', 1)[-1].strip() or 'no answer'}{RESET}")
+                    else:
+                        print(f"{DIM}    the minted etcs attests on an empty store{RESET}")
+                except OSError:
+                    print(f"{DIM}    the minted etcs is another machine's: not run here{RESET}")
+        if left:
+            print(f"{RED}[-] {left} not minted; {out} is incomplete{RESET}")
             return 1
-        shutil.copy2(new, kept)
-        if result == "unchanged":
-            print(f"{DIM}[=] bin/etcs is already this release{RESET}")
-        else:
-            print(f"{GREEN}[+] bin/etcs released, signed by {by}{RESET}")
-        if edge:
-            f = dict(kv.split("=", 1) for kv in edge.split()[3:] if "=" in kv)
-            print(f"{DIM}    lineage: {f.get('parent', '?')[:12]} -> {f.get('child', '?')[:12]}"
-                  f"  epoch {f.get('from', '?')[:12]} -> {f.get('to', '?')[:12]}"
-                  f"  on {f.get('host', '?')}{RESET}")
+        print(f"{GREEN}[+] minted {minted} binaries into {out} for identity {ident[:12]}{RESET}")
+        print(f"{DIM}    then: ace publish [<dir>] --from {out}{RESET}")
         return 0
 
 
@@ -502,20 +586,28 @@ class SignMixin:
     # What the site serves at /dist
     # ------------------------------------------------------------------
     #
-    # The current module binaries, the last release (<release store>/etcs), and
-    # bin/etcs --manifest's list of them: the marketplace's signature over each
-    # one's digest and epochs, and over the epoch the site is in. A loader reads
-    # the list (CryptProvider::Upstream) and fetches what it is behind on. What
-    # a download would not take -- a module only this loader's own key signed --
-    # is left off by the loader, and said.
+    # What `ace mint` made (<ACE_ROOT>/minted, or --from), and bin/etcs
+    # --manifest's list of it: the marketplace's signature over each one's
+    # digest and epochs, and over the epoch the site is in. With nothing minted,
+    # the current modules and bin/etcs, as the minting server built them. A
+    # loader reads the list (CryptProvider::Upstream) and fetches what it is
+    # behind on. What a download would not take -- what does not come to the
+    # identity bin/etcs is built with -- is left off by the loader, and said.
 
     def publish(self, args):
+        source = None
+        if "--from" in args:
+            i = args.index("--from")
+            if i + 1 >= len(args):
+                print("Usage: ace publish [<dir>] [--from <minted>]")
+                return 1
+            source = Path(args[i + 1]).expanduser().resolve()
+            args = args[:i] + args[i + 2:]
         if len(args) > 1:
-            print("Usage: ace publish [<dir>]")
+            print("Usage: ace publish [<dir>] [--from <minted>]")
             return 1
-        if not self.root_pin():
-            print(f"{RED}[-] a site publishes under ACE's root, and none is pinned (`ace pin`).{RESET}")
-            return 1
+        if source is None and (self.ace_root / "minted").is_dir():
+            source = self.ace_root / "minted"
         signer = self._signer()
         if not signer:
             print(f"{RED}[-] there is no bin/etcs to sign the list. `ace make loader etcs` first.{RESET}")
@@ -531,23 +623,28 @@ class SignMixin:
         for old in out.iterdir():
             if old.is_file():
                 old.unlink()
-        mods = sorted(set(self._all_manifests()) | set(self._defaulted_modules()))
-        taken, stale = 0, []
-        for mod in mods:
-            art = self._bin_dir() / f"{mod}.{self._lib_ext()}"
-            if not art.is_file():
-                continue
-            if not self._module_current(mod, False):
-                stale.append(art.name)
-                continue
-            shutil.copy2(art, out / art.name)
-            taken += 1
-        release = self._release_store([]) / ("etcs.exe" if platform.system() == "Windows" else "etcs")
-        if release.is_file():
-            shutil.copy2(release, out / release.name)
+        stale = []
+        if source:
+            if not source.is_dir():
+                print(f"{RED}[-] {source} is not a directory{RESET}")
+                return 1
+            for art in sorted(source.iterdir()):
+                if art.is_file():
+                    shutil.copy2(art, out / art.name)
+            print(f"{DIM}    from {source}{RESET}")
         else:
-            print(f"{YELLOW}[!] no release to publish ({release}); `ace release` first. "
-                  f"The list will name modules only.{RESET}")
+            mods = sorted(set(self._all_manifests()) | set(self._defaulted_modules()))
+            for mod in mods:
+                art = self._bin_dir() / f"{mod}.{self._lib_ext()}"
+                if not art.is_file():
+                    continue
+                if not self._module_current(mod, False):
+                    stale.append(art.name)
+                    continue
+                shutil.copy2(art, out / art.name)
+            shutil.copy2(signer, out / signer.name)
+            print(f"{YELLOW}[!] nothing minted ({self.ace_root / 'minted'}): publishing this server's own "
+                  f"build. `ace mint` publishes what witnesses agreed on.{RESET}")
         if stale:
             print(f"{YELLOW}[!] not published, older than the tree ({len(stale)}): {' '.join(stale)}{RESET}")
         try:
@@ -570,39 +667,8 @@ class SignMixin:
 
 
     # ------------------------------------------------------------------
-    # The root, and a machine with nothing but etcs
+    # A machine with nothing but etcs
     # ------------------------------------------------------------------
-
-    def pin(self, args):
-        """ace pin <root.cert | 64 hex | clear>: write manifests/root.pub. The
-        next build is in that root's epoch -- the guild, once it is ACE's."""
-        from .ace_generate import ROOT_PIN_FILE
-        if len(args) != 1:
-            print("Usage: ace pin <root.cert | key hex | clear>")
-            return 1
-        f = self.tool_root / ROOT_PIN_FILE
-        if args[0] == "clear":
-            f.unlink(missing_ok=True)
-            print(f"{GREEN}[+] no root pinned: loaders built now are an experimental epoch's{RESET}")
-            return 0
-        text = args[0].strip().lower()
-        if not _HEX64.match(text):
-            try:
-                raw = Path(args[0]).read_text().strip()
-                b = bytes.fromhex(raw)
-            except (OSError, ValueError):
-                print(f"{RED}[-] {args[0]} is neither a key nor a certificate file{RESET}")
-                return 1
-            # "ETCSCRT1" | role u8 | subject[32] | issuer[32] ...; a root is role 1, its own issuer.
-            if len(b) < 73 or b[:8] != b"ETCSCRT1" or b[8] != 1 or b[9:41] != b[41:73]:
-                print(f"{RED}[-] {args[0]} is not a root certificate{RESET}")
-                return 1
-            text = b[9:41].hex()
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(text + "\n")
-        print(f"{GREEN}[+] pinned root {text}{RESET}")
-        print(f"{DIM}    the next build is that root's epoch: `ace make modules && ace make loader etcs`{RESET}")
-        return 0
 
     def bundle(self, args):
         """ace bundle <dir> [--from <built>] [module...]: bin/etcs and the named
@@ -697,11 +763,22 @@ class SignMixin:
         return {k: v for k, v in about.items() if v}
 
     def witness(self, args):
-        """ace witness <out> [module...]: build bin/etcs and the modules (the
-        ceremony's by default) twice from scratch into <out>/a and <out>/b,
-        and have the loader built write <out>/witness-<host>-<arch>.txt."""
+        """ace witness <out> [--identity <hex>] [module...]: build bin/etcs and
+        the modules (the ceremony's by default) twice from scratch into <out>/a
+        and <out>/b, and have the loader built write
+        <out>/witness-<host>-<arch>.txt. The loader is built for the identity
+        given -- the minting server's, for a build it will mint -- or for none;
+        never this machine's own, which is no other witness's."""
+        ident = None
+        if "--identity" in args:
+            i = args.index("--identity")
+            if i + 1 >= len(args) or not _HEX64.match(args[i + 1].lower()):
+                print("Usage: ace witness <out> [--identity <64 hex>] [module...]")
+                return 1
+            ident = args[i + 1].lower()
+            args = args[:i] + args[i + 2:]
         if not args:
-            print("Usage: ace witness <out> [module...]")
+            print("Usage: ace witness <out> [--identity <64 hex>] [module...]")
             return 1
         out = Path(args[0]).expanduser().resolve()
         mods = args[1:] or list(self._WITNESS_MODULES)
@@ -713,7 +790,8 @@ class SignMixin:
                 if self.make(["module", mod, "--force"]):
                     print(f"{RED}[-] {mod} did not build{RESET}")
                     return 1
-            if self.make(["loader", "etcs", "--force", "-UETCS_BUILDER_KEY"]):
+            if self.make(["loader", "etcs", "--force", "-UETCS_BUILDER_KEY",
+                          f"-DETCS_IDENTITY={ident}" if ident else "-UETCS_IDENTITY"]):
                 print(f"{RED}[-] etcs did not build{RESET}")
                 return 1
             d = out / run
@@ -726,6 +804,7 @@ class SignMixin:
                     return 1
                 shutil.copy2(art, d / name)
         account = self._build_account()
+        account["identity"] = ident or "none"
         host = re.sub(r"[^A-Za-z0-9._-]", "", platform.node()) or "unnamed"
         arch = f"{platform.system().lower()}-{platform.machine().lower()}"
         statement = out / f"witness-{host}-{arch}.txt"

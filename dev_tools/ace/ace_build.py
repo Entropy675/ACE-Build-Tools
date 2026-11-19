@@ -391,20 +391,24 @@ class BuildMixin:
                     print(f"{RED}[-] could not remove stale {rel}/{n}: {ex}{RESET}")
 
     def _trust_defines(self, args):
-        """The key of the loader building this one, compiled into it
-        (ETCS_BUILDER_KEY): what a loader trusts is what was compiled into it,
-        and its builder's local half is the one it can take with no keystore --
-        a browser's, and a machine with nothing on it but etcs. The root is the
-        pin, in the loader already. core/Trust.h."""
-        if any(a.startswith(("-DETCS_BUILDER_KEY", "-UETCS_BUILDER_KEY")) for a in args):
-            return []
-        key, why = self.builder_key()
-        if not key:
-            if self._is_web_build(args):
+        """What a loader trusts is what was compiled into it (core/Trust.h):
+        the key of the loader building it (ETCS_BUILDER_KEY), whose local half
+        it takes with no keystore -- a browser's, and a machine with nothing on
+        it but etcs -- and the identity it is built with (ETCS_IDENTITY), what
+        it requires at the head of what it takes globally: `ace identity`."""
+        defs = []
+        if not any(a.startswith(("-DETCS_BUILDER_KEY", "-UETCS_BUILDER_KEY")) for a in args):
+            key, why = self.builder_key()
+            if key:
+                defs.append(f"-DETCS_BUILDER_KEY={key}")
+            elif self._is_web_build(args):
                 print(f"{YELLOW}[!] this web loader is given no builder key ({why}) -- it will "
                       f"refuse locally built modules. `ace make loader etcs` first.{RESET}")
-            return []
-        return [f"-DETCS_BUILDER_KEY={key}"]
+        if not any(a.startswith(("-DETCS_IDENTITY", "-UETCS_IDENTITY")) for a in args):
+            ident, _ = self.build_identity()
+            if ident:
+                defs.append(f"-DETCS_IDENTITY={ident}")
+        return defs
 
     def _sign_after_loader(self, extras):
         """A loader build is where a first loader key appears, and where a new
@@ -634,8 +638,8 @@ class BuildMixin:
         # probe sweep, on every subsequent build.
         self._deps_first_run()
 
-        # Generated sources (core/AirtyMacros_Generated.h, libs/monocypher.h,
-        # core/AceIdentity.h) come before the hash pass, which hashes them into the epoch. A
+        # Generated sources (core/AirtyMacros_Generated.h, libs/monocypher.h)
+        # come before the hash pass, which hashes them into the epoch. A
         # no-op compare on an unchanged tree; see ace_generate.py.
         if not self._ensure_generated():
             return 1

@@ -17,9 +17,9 @@ Targets:
     core/AirtyMacros_Generated.h  from dev_tools/generate_airty_macros.py
     libs/monocypher.h             from Monocypher at a pinned commit,
                                   amalgamated into one stb-style header
-    core/AceIdentity.h            from the pin (manifests/root.pub): ACE's
-                                  identity at its shortest, the root every
-                                  chain ACE attests ends at
+
+The identity a loader is built with is not generated: it is a define
+(-DETCS_IDENTITY, ace_build.py), so it is in no header and no epoch.
 """
 from pathlib import Path
 import hashlib
@@ -53,18 +53,6 @@ MONOCYPHER_FILES = {
 }
 MONOCYPHER_PURPOSE = ("Ed25519 (RFC 8032, SHA-512) for the loader's module "
                       "signature chain and CryptProvider.")
-
-
-# ---------------------------------------------------------------- ACE's root
-# The super-root's public key, 64 hex digits: manifests/root.pub, which `ace
-# pin` writes from the ceremony's root.cert. This is where it enters a build:
-# compiled into every loader as the one root a chain may end at (core/Trust.h),
-# and, being a core header, hashed into the epoch -- a build for another root is
-# another epoch, and a build with none is an experimental one.
-#
-# ACE_ROOT_KEY is read only when there is no file.
-ACE_ROOT_KEY = ""
-ROOT_PIN_FILE = "manifests/root.pub"
 
 
 def _sha256(data):
@@ -107,12 +95,11 @@ class GenerateMixin:
         return [
             ("core/AirtyMacros_Generated.h", self._gen_airty_macros),
             ("libs/monocypher.h",            self._gen_monocypher),
-            ("core/AceIdentity.h",           self._gen_ace_identity),
         ]
 
-    # Generated once, and named otherwise since: a core header is hashed into
-    # the epoch, so one left behind would put this tree in an epoch of its own.
-    _RETIRED_TARGETS = ("core/AceRoot.h",)
+    # Generated once, and retired since: a core header is hashed into the
+    # epoch, so one left behind would put this tree in an epoch of its own.
+    _RETIRED_TARGETS = ("core/AceRoot.h", "core/AceIdentity.h")
 
     def _write_if_changed(self, path, content):
         data = content.encode("utf-8")
@@ -162,27 +149,6 @@ class GenerateMixin:
         print(f"{RED}[-] Generated sources incomplete; the epoch would differ from "
               f"every other build. Fix the error above, then 'ace deps generate'.{RESET}")
         return False
-
-    # ----------------------------------------------------------- ACE's root
-    def root_pin(self):
-        """The pinned root, lower-case hex, or "" while there is none."""
-        f = self.tool_root / ROOT_PIN_FILE
-        key = (f.read_text() if f.is_file() else ACE_ROOT_KEY).strip().lower()
-        if key and not re.fullmatch(r"[0-9a-f]{64}", key):
-            raise RuntimeError("ACE_ROOT_KEY is not 64 hex digits")
-        return "" if key == "0" * 64 else key
-
-    def _gen_ace_identity(self):
-        key = self.root_pin()
-        head = _provenance(
-            "ACE-Build-Tools " + ROOT_PIN_FILE + " (ace pin)",
-            "n/a -- a pure function of the pin",
-            "ACE's identity at its shortest: the root every chain ACE attests ends at (core/Trust.h).",
-            extra=["", "All zero: no root is pinned, and a loader built so is an experimental epoch's."])
-        return (head
-                + "#ifndef ETCS_CORE_ACEIDENTITY_H__\n#define ETCS_CORE_ACEIDENTITY_H__\n\n"
-                + '#define ETCS_ACE_IDENTITY_ROOT "%s"\n\n' % (key or "0" * 64)
-                + "#endif // ETCS_CORE_ACEIDENTITY_H__\n")
 
     # ------------------------------------------------------- AirtyMacros
     def _gen_airty_macros(self):

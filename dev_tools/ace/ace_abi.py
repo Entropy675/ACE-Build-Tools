@@ -17,7 +17,10 @@ from .ace_common import (CYAN, YELLOW, GREEN, RED, PURPLE, ORANGE, RESET, DIM)
 
 class AbiMixin:
 
+    # Foo_Make@@ETCS_ABI, or @@ETCS_ABI_KERNEL_V_<n.n> since the node carries
+    # the kernel's version (ace_manifest.py, KERNEL_EXPORTS_FILE).
     ABI_SUFFIX = "@@ETCS_ABI"
+    _ABI_VERSION_RE = re.compile(r"@@ETCS_ABI(?:_KERNEL_V_[0-9.]+)?$")
     _ABI_DISPATCH_KINDS = ("Work", "Stream")
     _ABI_TRIAD = ("Make", "MakeChild", "List", "GetHash")
     _ABI_LOADER_HOOKS = ("RegisterDynamicLoader", "RegisterRootSignalContext")
@@ -118,8 +121,9 @@ class AbiMixin:
                         parts = line.split()
                         if len(parts) >= 3 and parts[1] in ("T", "t"):
                             sym = parts[2]
-                            if sym.endswith(self.ABI_SUFFIX):
-                                names.append(sym[:-len(self.ABI_SUFFIX)])
+                            m = self._ABI_VERSION_RE.search(sym)
+                            if m:
+                                names.append(sym[:m.start()])
                     return sorted(set(names))
             except (subprocess.SubprocessError, OSError):
                 pass
@@ -139,8 +143,9 @@ class AbiMixin:
                         if not parts:
                             continue
                         sym = parts[-1]
-                        if sym.endswith(self.ABI_SUFFIX):
-                            names.append(sym[:-len(self.ABI_SUFFIX)])
+                        m = self._ABI_VERSION_RE.search(sym)
+                        if m:
+                            names.append(sym[:m.start()])
                     return sorted(set(names))
             except (subprocess.SubprocessError, OSError):
                 pass
