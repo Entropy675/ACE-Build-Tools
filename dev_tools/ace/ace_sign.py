@@ -2,6 +2,9 @@
 
     ace sign            sign every current module artifact in bin/ and bin/wasm/,
                         and the native loader binaries in bin/
+    ace untrusted [on | off]
+                        build untrusted loaders: no signature check, no identity,
+                        nothing signed -- rapid recompiles; they warn all through
     ace identity [<hex>[:<parent hex>] | store | none]
                         the identity every loader built here is compiled with,
                         and its parent: by default this store's own
@@ -210,6 +213,39 @@ class SignMixin:
             return None
         return head, (parent or None)
 
+    # ------------------------------------------------------------------
+    # An untrusted loader, for rapid recompiles (core/Trust.h, ETCS_UNTRUSTED)
+    # ------------------------------------------------------------------
+
+    def _untrusted_cache_path(self):
+        return self._root_cache_path().with_name("etcs_untrusted")
+
+    def untrusted_setting(self):
+        try:
+            return self._untrusted_cache_path().read_text().strip() == "on"
+        except OSError:
+            return False
+
+    def untrusted_cmd(self, args):
+        """ace untrusted [on | off]: whether loaders built here are untrusted --
+        no signature check on any module, no identity, nothing signed -- so a
+        module rebuilt is a module run, with no signing between. They say so
+        all the time they run."""
+        if len(args) > 1 or (args and args[0] not in ("on", "off")):
+            print("Usage: ace untrusted [on | off]")
+            return 1
+        if args:
+            f = self._untrusted_cache_path()
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(args[0] + "\n")
+        on = self.untrusted_setting()
+        print(f"{RED if on else GREEN}[{'!' if on else '+'}] loaders built here are "
+              f"{'UNTRUSTED' if on else 'trusted'}{RESET}")
+        if args:
+            print(f"{DIM}    the next loader build takes it: `ace make loader etcs`"
+                  f"{'; ace then signs the current modules again' if not on else ''}{RESET}")
+        return 0
+
     def build_identity(self):
         """(hex or None, where it came from)."""
         setting, source = self._identity_setting()
@@ -331,7 +367,9 @@ class SignMixin:
         with tempfile.TemporaryDirectory(prefix="ace-sign-") as d:
             out = Path(d) / "chain"
             rc, edge, err = self._ask_loader(signer, verb, mod, str(art), epoch, str(out), want=_LINEAGE, env=env)
-            if rc == 3:
+            if rc == 4:
+                result = "untrusted"                    # an untrusted bin/etcs signs nothing
+            elif rc == 3:
                 result = "unchanged"
             elif rc != 0 or not out.is_file():
                 result = err.splitlines()[-1] if err else f"bin/etcs {verb} exited {rc}"
@@ -383,6 +421,9 @@ class SignMixin:
                     result, edge = self._sign_one(signer, "etcs", new, epoch, verb="--succeed")
                     if result in ("signed", "unchanged"):
                         break
+                if result == "untrusted":
+                    print(f"{RED}[!] bin/etcs is an UNTRUSTED build: it is not signed, loads every module "
+                          f"unchecked, and nothing it builds runs on a trusted loader{RESET}")
                 # A signature the new loader does not take -- the outgoing one was
                 # built for another identity -- is no attestation.
                 # The new loader may then sign itself where its own rule allows.
@@ -407,7 +448,7 @@ class SignMixin:
                         print(f"{DIM}    lineage: {f.get('parent', '?')[:12]} -> {f.get('child', '?')[:12]}"
                               f"  epoch {f.get('from', '?')[:12]} -> {f.get('to', '?')[:12]}"
                               f"  on {f.get('host', '?')}{RESET}")
-                elif result != "unchanged":
+                elif result not in ("unchanged", "untrusted"):
                     left += 1
                     print(f"{RED}[-] bin/etcs is not signed -- {result}{RESET}")
             for name in names:
@@ -415,7 +456,7 @@ class SignMixin:
                 if name == "etcs" or not art.is_file():
                     continue
                 result, _ = self._sign_one(new, name, art, epoch, verb="--succeed")
-                if result not in ("signed", "unchanged"):
+                if result not in ("signed", "unchanged", "untrusted"):
                     left += 1
                     print(f"{RED}[-] bin/{name} is not signed -- {result}{RESET}")
             return left
@@ -454,6 +495,10 @@ class SignMixin:
             if "predates signing" in r:
                 print(f"{YELLOW}[!] {len(arts)} module artifact(s) left unsigned: {r}.{RESET}")
                 return len(arts)
+            if r == "untrusted":
+                print(f"{RED}[!] bin/etcs is an UNTRUSTED build: {len(arts)} module artifact(s) left unsigned. "
+                      f"It loads them unchecked; a trusted loader will not.{RESET}")
+                return 0
             if r == "signed":
                 signed.append(art.name)
             elif r == "unchanged":
@@ -851,7 +896,7 @@ class SignMixin:
                 if self.make(["module", mod, "--force"]):
                     print(f"{RED}[-] {mod} did not build{RESET}")
                     return 1
-            if self.make(["loader", "etcs", "--force", "-UETCS_BUILDER_KEY",
+            if self.make(["loader", "etcs", "--force", "-UETCS_BUILDER_KEY", "-UETCS_UNTRUSTED",
                           f"-DETCS_IDENTITY={ident}" if ident else "-UETCS_IDENTITY",
                           f"-DETCS_IDENTITY_PARENT={parent}" if parent else "-UETCS_IDENTITY_PARENT"]):
                 print(f"{RED}[-] etcs did not build{RESET}")

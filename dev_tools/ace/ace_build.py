@@ -399,6 +399,16 @@ class BuildMixin:
         (ETCS_IDENTITY_PARENT), which lets it recognise its successor across a
         re-sync: `ace identity`."""
         defs = []
+        # An untrusted loader (`ace untrusted on`): checks nothing, has no
+        # identity, signs nothing -- for rapid recompiles. Said on every build.
+        explicit = [a for a in args if a.startswith(("-DETCS_UNTRUSTED", "-UETCS_UNTRUSTED"))]
+        untrusted = explicit[-1].startswith("-D") if explicit else self.untrusted_setting()
+        if untrusted:
+            if not explicit:
+                defs.append("-DETCS_UNTRUSTED")
+            print(f"{RED}[!] building an UNTRUSTED loader: modules load unchecked and nothing is signed "
+                  f"(`ace untrusted off` for a trusted one){RESET}")
+            return defs
         if not any(a.startswith(("-DETCS_BUILDER_KEY", "-UETCS_BUILDER_KEY")) for a in args):
             key, why = self.builder_key()
             if key:
