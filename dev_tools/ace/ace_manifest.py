@@ -72,6 +72,16 @@ _BUILTIN_LIBS = {
 }
 _HOST_PLATFORM = {"Linux": "Linux", "Windows": "Win"}.get(platform.system())
 
+# What the core itself links on Windows, so every image that includes it does:
+# Trust.h (bcrypt), SandboxGuard.h (dbghelp; its #pragma comment is MSVC-only),
+# the sockets under ETCS_API.h (ws2_32). A manifest names only its own.
+_CORE_LIBS = {"Win": ["ws2_32", "bcrypt", "dbghelp"]}
+
+
+def _system_libs(blk, plat):
+    libs = list(blk.get("system_libs", []))
+    return libs + [l for l in _CORE_LIBS.get(plat, []) if l not in libs]
+
 # Build systems we know how to drive. Deliberately closed -- see module docstring.
 BUILD_SYSTEMS = {"none", "cmake", "autotools", "make"}
 
@@ -683,7 +693,13 @@ class ManifestMixin:
         w("SRC_MODULE := $(TARGET_BASE_NAME).cc")
         w("HASH_HEADER := module_hashes.h")
         w("")
-        w("UNAME_S := $(shell uname -s)")
+        # Windows names itself in $(OS); uname there is MSYS's (MINGW64_NT-...)
+        # or absent. A cross build passes UNAME_S=Windows_NT.
+        w("ifeq ($(OS),Windows_NT)")
+        w("    UNAME_S := Windows_NT")
+        w("else")
+        w("    UNAME_S := $(shell uname -s)")
+        w("endif")
         w("ARCH    := $(shell uname -m)")
         w("NPROC   := $(shell nproc)")
         w("CXX := g++")
@@ -1053,7 +1069,8 @@ class ManifestMixin:
             # by a pool thread. The loader block below says why in full.
             ld = (["-sSIDE_MODULE", "-pthread", "-fwasm-exceptions"]
                   if plat == "Web" else ["-shared"])
-            if plat != "Web":
+            if plat == "Linux":
+                # ELF only: no binutils carries gold for PE.
                 ld += ["-fuse-ld=gold", "-Wl,--threads", "-Wl,--thread-count,$(NPROC)"]
             ld += blk.get("ldflags", [])
             if plat == "Linux" and exports:
@@ -1063,7 +1080,7 @@ class ManifestMixin:
                 ld.append("-Wl,--version-script=$(KERNEL_EXPORTS)")
                 w(f"    KERNEL_EXPORTS := {KERNEL_EXPORTS_FILE}")
             w(f"    LDFLAGS := {' '.join(ld)}")
-            w(f"    SYSLIBS := {' '.join('-l' + l for l in blk.get('system_libs', []))}")
+            w(f"    SYSLIBS := {' '.join('-l' + l for l in _system_libs(blk, plat))}")
 
         w("else")
         w("    $(error Unsupported platform: $(UNAME_S))")
@@ -1730,7 +1747,13 @@ class ManifestMixin:
         w("# loader builds from the defaults alone.")
         w("# " + "=" * 68)
         w("")
-        w("UNAME_S := $(shell uname -s)")
+        # Windows names itself in $(OS); uname there is MSYS's (MINGW64_NT-...)
+        # or absent. A cross build passes UNAME_S=Windows_NT.
+        w("ifeq ($(OS),Windows_NT)")
+        w("    UNAME_S := Windows_NT")
+        w("else")
+        w("    UNAME_S := $(shell uname -s)")
+        w("endif")
         w("NPROC   := $(shell nproc)")
         w("CXX := g++")
         w("BIN_DIR := ../bin")
@@ -2029,7 +2052,7 @@ class ManifestMixin:
         w(f"    LDFLAGS := {' '.join(parts)}".rstrip())
         w("else ifeq ($(UNAME_S),Windows_NT)")
         blk = default.get("build", {}).get("Win", {})
-        parts = list(blk.get("ldflags", [])) + ["-l" + l for l in blk.get("system_libs", [])]
+        parts = list(blk.get("ldflags", [])) + ["-l" + l for l in _system_libs(blk, "Win")]
         w(f"    LDFLAGS := {' '.join(parts)}".rstrip())
         w("else")
         w("    $(error Unsupported platform: $(UNAME_S))")
@@ -2045,6 +2068,8 @@ class ManifestMixin:
         w("# which the web path never built and has no business touching.")
         w("ifdef EMSCRIPTEN")
         w("    LOADER_ARTIFACTS := Run_*Loader.js Run_*Loader.wasm etcs.js etcs.wasm")
+        w("else ifeq ($(UNAME_S),Windows_NT)")
+        w("    LOADER_ARTIFACTS := Run_*Loader.exe etcs.exe")
         w("else")
         w("    LOADER_ARTIFACTS := Run_*Loader etcs")
         w("endif")
@@ -2100,9 +2125,11 @@ class ManifestMixin:
                       "\n      with a signature mismatch in a header nobody edited.")
             extra_cxx = [f"-D{d}" for d in abi] + inc + ob.get("cxxflags", []) + \
                 [f"-D{d}" for d in ob.get("defines", [])]
-            extra_link = links + ["-l" + l for l in syslibs] + \
-                ob.get("link", [])
-            if not extra_cxx and not extra_link:
+            extra_link = links + ob.get("link", [])
+            # The modules' Linux system libraries, read from their Linux
+            # blocks, so linked on Linux only (-ldl has no PE import library).
+            linux_libs = ["-l" + l for l in syslibs]
+            if not extra_cxx and not extra_link and not linux_libs:
                 continue
             if o.get("inherits_modules"):
                 w(f"# {name} inherits: {', '.join(o['inherits_modules'])}")
@@ -2110,6 +2137,10 @@ class ManifestMixin:
                 w(f"{name}: EXTRA_CXXFLAGS += {' '.join(extra_cxx)}")
             if extra_link:
                 w(f"{name}: EXTRA_LINK += {' '.join(extra_link)}")
+            if linux_libs:
+                w("ifeq ($(UNAME_S),Linux)")
+                w(f"{name}: EXTRA_LINK += {' '.join(linux_libs)}")
+                w("endif")
             w("")
 
         w("# If FILE is specified, build only that one; otherwise every *Loader.cc.")
@@ -2397,7 +2428,9 @@ class ManifestMixin:
             if names == ["loaders"]:
                 self.generate_loaders_makefile(force=force)
                 return
-            for n in (names or self._all_manifests()):
+            # Every module, as clean does: one with no manifest of its own
+            # builds from default.json and is just as generated.
+            for n in (names or sorted(set(self._all_manifests()) | set(self._defaulted_modules()))):
                 self.generate_makefile(n, force=force)
             if not names:
                 self.generate_loaders_makefile(force=force)
