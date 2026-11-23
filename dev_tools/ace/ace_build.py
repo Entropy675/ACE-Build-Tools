@@ -653,6 +653,10 @@ class BuildMixin:
         # probe sweep, on every subsequent build.
         self._deps_first_run()
 
+        # The signing state, before the build that will need it (ace_resolve.py).
+        if args[0] != "clean":
+            self.identity_preflight()
+
         # Generated sources (core/AirtyMacros_Generated.h, libs/monocypher.h)
         # come before the hash pass, which hashes them into the epoch. A
         # no-op compare on an unchanged tree; see ace_generate.py.

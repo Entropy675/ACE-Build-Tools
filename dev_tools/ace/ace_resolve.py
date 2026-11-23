@@ -4,6 +4,9 @@
                         the loader's key: libsecret, a secrets provider, the
                         user's session bus, the keyring's lock, the store
 
+Also run before every build (identity_preflight, from ace make): in full the
+first time per user and machine, then as one line of signing state.
+
 THE KEY IS THE USER'S, NEVER ROOT'S. A loader keeps its key in the keystore of
 whoever runs it (core/Keystore.h), under $HOME/.local/share/etcs. Under sudo,
 root does only what needs root (packages, lingering, ownership) and everything
@@ -91,6 +94,12 @@ class ResolveMixin:
         self._resolve_profile(t)
         self._resolve_ownership(t, root, later)
 
+        if not self._signer():
+            for step in later:
+                print(f"{YELLOW}[!] needs root: {step}{RESET}")
+            print(f"{DIM}[=] no native bin/etcs yet: the key is checked once the loader is built{RESET}")
+            return 2
+
         state, detail = self._probe_key(t)
         if state == "locked":
             print(f"{YELLOW}[!] the keyring is locked, or there is none yet -- {detail}{RESET}")
@@ -111,6 +120,59 @@ class ResolveMixin:
             print(f"{DIM}    identity {ident}{RESET}")
         self._resolve_stray_root_store(t)
         return 0
+
+    # ------------------------------------------------------------------
+    # Before every build (ace make)
+    # ------------------------------------------------------------------
+
+    _PREFLIGHT_TIMEOUT = 3   # seconds; an unlocked keystore answers in milliseconds
+
+    def _identity_marker(self):
+        return self._get_registry_dir() / ".identity_checked"
+
+    def identity_preflight(self):
+        """THE SIGNING STATE, BEFORE THE BUILD THAT WILL NEED IT. Signing runs
+        after the build (ace sign), so a keystore that can't answer used to be
+        found minutes in, at the end. Never stops a build: unsigned modules are
+        reported by the sign step as before.
+
+        The first build per user and machine runs the whole resolve (the same
+        confirms, so -y answers them); after that, one line, from a probe short
+        enough to sit in front of every build. A locked keyring -- every reboot
+        on a headless machine -- is offered its unlock at a terminal."""
+        if platform.system() != "Linux":
+            return
+        if self.untrusted_setting():
+            print(f"{DIM}[=] signing: off -- untrusted loaders (`ace untrusted off` to sign){RESET}")
+            return
+        t = self._resolve_target()
+        stamp = f"{t.name} {platform.node()}"
+        marker = self._identity_marker()
+        try:
+            first = marker.read_text().strip() != stamp
+        except OSError:
+            first = True
+        if first:
+            print(f"{CYAN}[*] First build for {t.name} on this machine -- checking the signing identity.{RESET}")
+            rc = self._resolve_identity()
+            if rc == 0:
+                marker.write_text(stamp + "\n")
+            elif rc == 1:
+                print(f"{DIM}    the build goes on; modules stay unsigned until `ace resolve identity` passes{RESET}")
+            return
+        if not self._signer():
+            print(f"{DIM}[=] signing: no native bin/etcs yet -- the key is checked once it is built{RESET}")
+            return
+        state, detail = self._probe_key(t, timeout=self._PREFLIGHT_TIMEOUT)
+        if state == "locked" and sys.stdin.isatty():
+            print(f"{YELLOW}[!] signing: the keyring is locked -- {detail}{RESET}")
+            if self._confirm(f"{YELLOW}[?] Unlock it now?{RESET}", False) and self._unlock_keyring(t, False):
+                state, detail = self._probe_key(t, timeout=self._PREFLIGHT_TIMEOUT)
+        if state == "ok":
+            print(f"{GREEN}[+] signing: {t.name}'s loader key {detail[:16]}...{RESET}")
+        else:
+            print(f"{YELLOW}[!] signing: {detail}{RESET}")
+            print(f"{DIM}    modules built now stay unsigned -- `ace resolve identity`{RESET}")
 
     def _resolve_target(self):
         name = os.environ.get("SUDO_USER") if os.geteuid() == 0 else None
@@ -255,7 +317,7 @@ class ResolveMixin:
             os.chown(profile, t.uid, t.gid)
         print(f"{GREEN}[+] ~/.profile exports the bus (new shells){RESET}")
 
-    def _probe_key(self, t):
+    def _probe_key(self, t, timeout=_PROBE_TIMEOUT):
         """(state, detail): 'ok' and the key, or 'locked' / 'fail' and why. The
         real thing: bin/etcs --loader-key as the user, which mints the key on
         first use."""
@@ -263,9 +325,9 @@ class ResolveMixin:
         if not signer:
             return "fail", "there is no native bin/etcs -- `ace make loader etcs`, then run this again"
         try:
-            p = self._as_user(t, [str(signer), "--loader-key"], timeout=_PROBE_TIMEOUT)
+            p = self._as_user(t, [str(signer), "--loader-key"], timeout=timeout)
         except subprocess.TimeoutExpired:
-            return "locked", f"no answer in {_PROBE_TIMEOUT} s: the keyring is waiting on an unlock prompt"
+            return "locked", f"no answer in {timeout} s: the keyring is waiting on an unlock prompt"
         except OSError as e:
             return "fail", str(e)
         key = next((l.strip() for l in p.stdout.splitlines() if _HEX64.match(l.strip())), None)
