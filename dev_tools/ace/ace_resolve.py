@@ -174,6 +174,21 @@ class ResolveMixin:
             print(f"{YELLOW}[!] signing: {detail}{RESET}")
             print(f"{DIM}    modules built now stay unsigned -- `ace resolve identity`{RESET}")
 
+    def offer_keyring_restart(self):
+        """A signature timed out on the keystore: offer, at a terminal, to
+        restart the keyring daemon and unlock it (_unlock_keyring: --replace,
+        then the password). True when the key answers afterwards. Elsewhere it
+        only says what to run."""
+        print(f"{YELLOW}[!] the keyring did not answer -- its daemon may be stuck, or its password "
+              f"prompt was closed or is hidden behind another window{RESET}")
+        if platform.system() != "Linux" or not sys.stdin.isatty():
+            print(f"{DIM}    `ace resolve identity` at a terminal restarts and unlocks it{RESET}")
+            return False
+        if not self._confirm(f"{YELLOW}[?] Restart the keyring daemon and unlock it with your password?{RESET}",
+                             False):
+            return False
+        return self._unlock_keyring(self._resolve_target(), False)
+
     def _resolve_target(self):
         name = os.environ.get("SUDO_USER") if os.geteuid() == 0 else None
         try:
