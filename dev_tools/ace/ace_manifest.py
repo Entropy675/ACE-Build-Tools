@@ -1818,8 +1818,9 @@ class ManifestMixin:
         w("    # flag does not touch. What it removes from the export table is the")
         w("    # loader's own header-inline statics -- EventNode, ThreadPool,")
         w("    # MemoryArena -- so a module can only ever bind to its own copy, the")
-        w("    # per-DSO grain core/ is written to. The one symbol a module dlsym()s")
-        w("    # out of the loader, ETCS_GetLoaderManifest, marks itself default.")
+        w("    # per-DSO grain core/ is written to. What a module dlsym()s out of")
+        w("    # the loader -- ETCS_GetLoaderManifest, ETCS_GetLoaderEpoch -- marks")
+        w("    # itself default.")
         w("    CXX := em++")
         w("    CC  := emcc")
         w("    CXXFLAGS += -pthread -fwasm-exceptions")
@@ -2046,7 +2047,8 @@ class ManifestMixin:
         if exports:
             # ELF-only: audited export surface under -rdynamic (see module
             # version-script note). Loader needs this so module static-init
-            # can dlsym(RTLD_DEFAULT, ETCS_GetLoaderManifest).
+            # can dlsym(RTLD_DEFAULT, ...) what loaders/exports.map lists:
+            # ETCS_GetLoaderManifest, ETCS_GetLoaderEpoch.
             parts.append("-Wl,--version-script=$(KERNEL_EXPORTS)")
             w(f"    KERNEL_EXPORTS := {KERNEL_EXPORTS_FILE}")
         w(f"    LDFLAGS := {' '.join(parts)}".rstrip())
