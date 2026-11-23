@@ -521,6 +521,8 @@ class SignMixin:
         for why, names in reasons.items():
             print(f"{RED}[-] not signed ({len(names)}) -- {why}{RESET}")
             self._print_name_grid(names, per_row=4, indent="    ", color=RED)
+        if any("Secret Service" in why or "libsecret" in why for why in reasons):
+            print(f"{DIM}    `sudo ace resolve identity` finds and fixes what the keystore needs{RESET}")
         return len(stale) + len(failed)
 
     def sign(self, args):

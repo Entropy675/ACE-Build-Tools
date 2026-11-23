@@ -12,3 +12,4 @@ from .ace_wasm import WasmMixin
 from .ace_hash import HashMixin
 from .ace_generate import GenerateMixin
 from .ace_sign import SignMixin
+from .ace_resolve import ResolveMixin
