@@ -234,7 +234,7 @@ if __name__ == "__main__":
     ace.assume_yes = len(args) != len(sys.argv) - 1
     if not args:
         print("Usage: ace [-y] { install | uninstall | list | setup <mod> [OS] | remove <mod> | stage <mod> <dest> }")
-        print("           | make { all | modules | loaders | clean | clean modules | clean loaders }")
+        print("           | make { all | modules | loaders | clean | clean modules | clean loaders } [--vendor]")
         print("           | make { module <n> | clean module <n> }")
         print("           | make { loader <n> | clean loader <n> }")
         print("           | registry verify")

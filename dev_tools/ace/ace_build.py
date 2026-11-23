@@ -747,22 +747,42 @@ class BuildMixin:
         if not args:
             print("[-] Error: No make target specified.")
             print("    Usage: ace make { all | modules | loaders | clean | clean modules | clean loaders | module <n> | clean module <n> | loader <n> | clean loader <n> }")
+            print("           --vendor with a module clean: also delete and refetch its git dependencies")
             return
 
         # --force is ACE's own flag, not make's, so it comes out of the
         # argument list before anything tries to validate it as a make target.
         # Accepted anywhere in the line because that is where people type it.
         force = False
+        vendor = False
         filtered = []
         for a in args:
             if a in ("--force", "-B"):
                 force = True
+                continue
+            if a == "--vendor":
+                vendor = True
                 continue
             filtered.append(a)
         args = filtered
         if not args:
             print("[-] Error: No make target specified.")
             return 1
+
+        # --vendor: the clean that also deletes and refetches every git
+        # dependency of the modules it cleans (refresh_vendored, ace_manifest.py).
+        if vendor:
+            if args[0] != "clean" or args[1:2] == ["loaders"]:
+                print("[-] --vendor goes with `clean`, `clean modules` or `clean module <n>...`")
+                return 1
+            if args[1:2] == ["module"]:
+                mods = [self._validate_module_name(n)
+                        for n in self._split_names_and_flags(args[2:])[0]]
+            else:
+                mods = sorted(set(self._all_manifests()) | set(self._defaulted_modules()))
+            print(f"[*] Refetching the vendored dependencies of {len(mods)} module(s):")
+            if self.refresh_vendored(mods):
+                print(f"{YELLOW}[!] not every dependency came back fresh -- see above{RESET}")
 
         if self._is_web_build(args):
             if not shutil.which("em++"):
@@ -969,6 +989,9 @@ class BuildMixin:
                                           color=CYAN)
                     print()
                 for mod in mods:
+                    # Its Makefile first: a clean already removed it, and the
+                    # root clean target runs out of it -- a second clean failed.
+                    self.ensure_makefile(mod)
                     # make clean FIRST -- it runs out of the very Makefile
                     # removed next, and a generated Makefile is itself a build
                     # artifact now, so leaving it behind means `clean` did not
