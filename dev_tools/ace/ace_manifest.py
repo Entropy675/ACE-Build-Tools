@@ -1205,9 +1205,11 @@ class ManifestMixin:
         # rule stayed newer than its source and was linked, flags and all, into
         # a module built under the new one. ace regenerates this file whenever
         # the generator's output changes (ensure_makefile), and this is the other
-        # half of that: the regeneration reaches the objects.
+        # half of that: the regeneration reaches the objects. ace's fingerprint
+        # file shares the prefix and is not a stamp: deleting it here dropped
+        # the other platform's record on every native/web switch.
         w("$(BUILD_STAMP): Makefile")
-        w("\t@rm -f .ace_build_*")
+        w("\t@rm -f $(filter-out .ace_build_fingerprint,$(wildcard .ace_build_*))")
         w("\t@touch $@")
         w("")
 

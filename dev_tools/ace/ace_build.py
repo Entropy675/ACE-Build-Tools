@@ -76,8 +76,13 @@ class BuildMixin:
     # FLAGS ARE IN IT TOO. A DEBUG or ASAN build is a different artifact from
     # the same sources, and the module Makefiles already encode that in their
     # own build stamp; this is the same fact, one level up.
+    #
+    # ONE RECORD PER PLATFORM, in one file. Native and web artifacts sit side
+    # by side (bin/ and bin/wasm/), so building one must not make the other
+    # stale.
 
     _FINGERPRINT_NAME = ".ace_build_fingerprint"
+    _PLATFORMS = ("native", "web")
 
     # Generated headers first: they are what the loader compares. The umbrella
     # headers are listed because they are includable directly and are not
@@ -176,24 +181,40 @@ class BuildMixin:
     def _fingerprint_path(self, mod):
         return self.ace_root / "modules" / mod / self._FINGERPRINT_NAME
 
-    def _module_build_reason(self, mod, extras):
-        """None if the module is up to date, else why it is not.
+    @staticmethod
+    def _platform_key(web):
+        return "web" if web else "native"
 
-        The .so has to EXIST as well as match: a fingerprint describes what a
-        build would produce, and a fingerprint with no artifact beside it is a
-        record of a build somebody deleted."""
-        so = self._artifact_path(mod, extras)
-        if not so.is_file():
-            return "no built artifact in bin/"
-
-        path = self._fingerprint_path(mod)
-        if not path.is_file():
-            return "never built through this check"
+    def _read_fingerprints(self, mod):
+        """{platform: record}, {} if there is no file, None if it is unreadable.
+        A record written before records were per platform has neither key and
+        reads as never built."""
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                old = json.load(fh)
+            with open(self._fingerprint_path(mod), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return {}
         except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return {k: v for k, v in data.items()
+                if k in self._PLATFORMS and isinstance(v, dict)}
+
+    def _module_build_reason(self, mod, extras):
+        """None if the module is up to date for this platform, else why it is
+        not. The artifact has to EXIST as well as match: a record with no
+        artifact beside it describes a build somebody deleted."""
+        art = self._artifact_path(mod, extras)
+        if not art.is_file():
+            return f"no {art.relative_to(self.ace_root)}"
+
+        records = self._read_fingerprints(mod)
+        if records is None:
             return "unreadable build record"
+        old = records.get(self._platform_key(self._is_web_build(extras)))
+        if old is None:
+            return "never built through this check"
 
         new = self._module_fingerprint(mod, extras)
         if old.get("global") != new["global"]:
@@ -207,24 +228,20 @@ class BuildMixin:
         return None
 
     def _record_module_fingerprint(self, mod, extras):
-        """Written only after a build that SUCCEEDED and left an artifact.
-
-        BOTH CONDITIONS, and the first one is the one that bites. A failed
-        build leaves the PREVIOUS .so sitting in bin/, so "an artifact exists"
-        is true for a module that did not build at all -- record on that alone
-        and the next run skips a module whose binary predates the change,
-        which surfaces later as the loader refusing it for a hash mismatch.
-        Found exactly that way, by an interrupted batch.
-
-        So the caller passes make's own verdict, and a failure leaves no
-        record at all: the module is rebuilt next time, which is the only safe
-        default when the truth is unknown."""
-        so = self._artifact_path(mod, extras)
-        if not so.is_file():
+        """Called only after make reported success: a failed build leaves the
+        previous artifact in bin/, so existence alone would record a binary
+        older than its source. The other platform's record is kept."""
+        if not self._artifact_path(mod, extras).is_file():
             return
+        records = self._read_fingerprints(mod) or {}
+        records[self._platform_key(self._is_web_build(extras))] = \
+            self._module_fingerprint(mod, extras)
+        path = self._fingerprint_path(mod)
+        tmp = path.with_name(path.name + ".tmp")
         try:
-            with open(self._fingerprint_path(mod), "w", encoding="utf-8") as fh:
-                json.dump(self._module_fingerprint(mod, extras), fh, indent=1)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(records, fh, indent=1)
+            os.replace(tmp, path)
         except OSError as e:
             print(f"    {DIM}(could not record build fingerprint for {mod}: {e}){RESET}")
 

@@ -317,21 +317,11 @@ class SignMixin:
         return True
 
     def _module_current(self, mod, web):
-        """The build-skip check's record, asked of one artifact: the last build
-        of this module was for this platform, from these sources, against these
-        generated hashes. Other flags are not provenance -- a DEBUG build of
-        this tree is still this tree's build. The record is one per module, so
-        a native build makes the .wasm beside it not current, and the other
-        way round: it keeps whatever signature it has, it gets no new one."""
-        path = self._fingerprint_path(mod)
-        if not path.is_file():
-            return False
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                old = json.load(fh)
-        except (OSError, ValueError):
-            return False
-        if ("EMSCRIPTEN=1" in old.get("flags", "").split()) != web:
+        """The build-skip record for this platform matches the tree: same
+        sources, manifest and generated hashes. Other flags are not provenance
+        -- a DEBUG build of this tree is still this tree's build."""
+        old = (self._read_fingerprints(mod) or {}).get(self._platform_key(web))
+        if old is None:
             return False
         new = self._module_fingerprint(mod, [])
         return all(old.get(k) == new[k] for k in ("global", "local", "manifest"))

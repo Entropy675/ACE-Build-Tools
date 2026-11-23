@@ -289,9 +289,13 @@ class WasmMixin:
         """
         if not args:
             print("    Usage: ace wasm make { all | modules | loaders | module <n> "
-                  "| loader <n> } [FLAGS...]")
+                  "| loader <n> } [FLAGS...] [--force]")
             return 0
 
+        force = any(a in ("--force", "-B") for a in args)
+        args = [a for a in args if a not in ("--force", "-B")]
+        if not args:
+            return self.wasm_make([])
         target, rest = args[0], args[1:]
         extras = list(rest) + ["EMSCRIPTEN=1"]
 
@@ -326,17 +330,49 @@ class WasmMixin:
                 print(f"    {DIM}ace wasm make module <n> builds one anyway; a manifest "
                       f"with \"Web\" in module.platforms puts it in this set.{RESET}")
             print()
-            failed = []
+
+            # The same skip as `ace make modules`, against the web record: a
+            # named build always builds, so only the modules that need it are
+            # named, and all of them in one call (one parallel batch, one
+            # signing pass).
+            # Every input the record hashes is brought current before it is
+            # compared, as make() does for the native batch: a reason computed
+            # against the previous generated headers misses an ontology edit.
             for name in mods:
-                # BOTH failure shapes. make() raises for a broken invocation and
-                # RETURNS non-zero for a build that ran and failed; catching only
-                # the first meant every compile error in this loop was reported
-                # to the console and then to the caller as success.
+                self.ensure_makefile(name)
+            if not self._ensure_generated():
+                return 1
+            if self._run_root_make("generate_hashes"):
+                os.environ["ACE_HASHES_READY"] = "1"
+            web_extras = self._validate_make_args(list(rest) + ["EMSCRIPTEN=1"])
+            build, skipped = [], []
+            for name in mods:
+                reason = "forced" if force else self._module_build_reason(name, web_extras)
+                if reason is None:
+                    skipped.append(name)
+                else:
+                    build.append((name, reason))
+            if skipped:
+                print(f"[=] Unchanged, not rebuilt ({len(skipped)}):")
+                self._print_name_grid(skipped, per_row=4, indent="    ", color=DIM)
+            if build:
+                print(f"[*] Building {len(build)} module(s):")
+                for name, reason in build:
+                    print(f"    {CYAN}{name}{RESET}  {DIM}({reason}){RESET}")
+            print()
+
+            failed = []
+            if build:
+                # BOTH failure shapes: make() raises for a broken invocation
+                # and returns non-zero for a build that ran and failed.
                 try:
-                    if self.make(["module", name] + list(rest) + ["EMSCRIPTEN=1"]):
-                        failed.append((name, "build failed"))
+                    if self.make(["module"] + [n for n, _ in build] + list(rest)
+                                 + ["EMSCRIPTEN=1"]):
+                        failed.append(("modules", "build failed (listed above)"))
                 except Exception as ex:
-                    failed.append((name, ex))
+                    failed.append(("modules", ex))
+            if skipped:
+                self.sign_modules(only=skipped, web=True)
             rc = 0
             if target == "all":
                 rc = self.make(["loaders"] + extras) or 0
