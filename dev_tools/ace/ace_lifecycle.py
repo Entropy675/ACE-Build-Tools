@@ -59,6 +59,24 @@ class LifecycleMixin:
     def print_root(self):
         print(self.ace_root)
 
+    def root_cmd(self, args):
+        """ace root [<ETCS dir>]: the ACE_ROOT this machine builds at, or set
+        it -- the source of truth ace remembers, and what a witness says it
+        built at. $ETCS_ROOT, while set, still wins."""
+        if not args:
+            self.print_root()
+            return 0
+        p = Path(args[0]).expanduser().resolve()
+        if not self._is_etcs_root(p):
+            print(f"{RED}[-] {p} is not an ETCS tree (a directory named ETCS holding ETCS.h){RESET}")
+            return 1
+        self._write_root_cache(p)
+        self._ace_root = None
+        print(f"{GREEN}[+] ACE_ROOT is {p}{RESET}")
+        if os.environ.get("ETCS_ROOT") and Path(os.environ["ETCS_ROOT"]).expanduser().resolve() != p:
+            print(f"{YELLOW}[!] ETCS_ROOT={os.environ['ETCS_ROOT']} is set, and wins while it is{RESET}")
+        return 0
+
     def install(self, silent=False):
         """Install ace globally via symlink or shim, then replay the global registry."""
         system = platform.system()

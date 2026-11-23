@@ -50,6 +50,7 @@ escape hatch IS the thing this format exists to stop accepting.
 from pathlib import Path
 import hashlib
 import json
+import platform
 import re
 import subprocess
 
@@ -57,6 +58,29 @@ from .ace_common import (CYAN, YELLOW, GREEN, RED, RESET, DIM, ORANGE)
 
 
 SCHEMA_VERSION = 1
+
+# What the base system links without a package: libc's own pieces on Linux,
+# and on Windows the import libraries of the OS's own DLLs, which every MinGW
+# and Windows SDK carries. A Windows package has no manifest form yet
+# (ace_deps), so anything else a Win build links is the developer's to install.
+_BUILTIN_LIBS = {
+    "Linux": {"dl", "pthread", "m", "rt", "stdc++", "c"},
+    "Win":   {"advapi32", "bcrypt", "comdlg32", "crypt32", "dbghelp", "dwmapi", "gdi32", "imm32",
+              "iphlpapi", "kernel32", "ncrypt", "ntdll", "ole32", "oleaut32", "psapi", "secur32",
+              "setupapi", "shell32", "shlwapi", "user32", "userenv", "uuid", "version", "winmm",
+              "ws2_32"},
+}
+_HOST_PLATFORM = {"Linux": "Linux", "Windows": "Win"}.get(platform.system())
+
+# What the core itself links on Windows, so every image that includes it does:
+# Trust.h (bcrypt), SandboxGuard.h (dbghelp; its #pragma comment is MSVC-only),
+# the sockets under ETCS_API.h (ws2_32). A manifest names only its own.
+_CORE_LIBS = {"Win": ["ws2_32", "bcrypt", "dbghelp"]}
+
+
+def _system_libs(blk, plat):
+    libs = list(blk.get("system_libs", []))
+    return libs + [l for l in _CORE_LIBS.get(plat, []) if l not in libs]
 
 # Build systems we know how to drive. Deliberately closed -- see module docstring.
 BUILD_SYSTEMS = {"none", "cmake", "autotools", "make"}
@@ -126,6 +150,40 @@ def _sanitize(text):
 def _var(name):
     """Make variable name for a dependency."""
     return "DEP_" + re.sub(r"[^A-Za-z0-9]", "_", name).upper()
+
+
+# THE KERNEL'S VERSION ON EVERY EXPORTED SYMBOL. A version script's node is
+# the version an ELF symbol carries (Foo_Make@@<node>), so naming the node
+# for the ABI's version -- BASE_SOURCE_STRING in core/ETCS_API.h,
+# "ETCS_Kernel_v1.0" -> ETCS_ABI_KERNEL_V_1.0 -- tags each function with the
+# kernel it was built for, at its source. exports.map keeps the bare node
+# (ETCS_ABI, ETCS_LOADER_1.0); the Makefile writes a renamed copy beside it
+# and links with that, and the version is in the Makefile, so a kernel bump
+# regenerates it and relinks.
+KERNEL_EXPORTS_FILE = ".ace_exports_kernel.map"
+
+
+def _kernel_version(ace_root):
+    """"1.0" from BASE_SOURCE_STRING, or None."""
+    try:
+        text = (Path(ace_root) / "core" / "ETCS_API.h").read_text()
+    except OSError:
+        return None
+    m = re.search(r'#define\s+BASE_SOURCE_STRING\s+"ETCS_Kernel_v([0-9]+(?:\.[0-9]+)*)"', text)
+    return m.group(1) if m else None
+
+
+def _kernel_exports_rule(w, source, prefix, node):
+    """The rule writing the kernel-tagged copy of `source`: its first node,
+    whatever its name after `prefix`, renamed `node`."""
+    w("# The exported symbols carry the kernel's version (ace_manifest.py,")
+    w("# KERNEL_EXPORTS_FILE): the version script's node, renamed for it.")
+    w(f"KERNEL_NODE := {node}")
+    w("ifneq ($(KERNEL_EXPORTS),)")
+    w(f"$(KERNEL_EXPORTS): {source} Makefile")
+    w(f"\t@sed 's/^{prefix}[A-Za-z0-9_.]*[[:space:]]*{{/$(KERNEL_NODE) {{/' $< > $@")
+    w("endif")
+    w("")
 
 
 def _abi_tag(abi_defines):
@@ -559,21 +617,27 @@ class ManifestMixin:
                         f"escape by design -- an arbitrary command is the raw Makefile this "
                         f"format exists to replace.")
 
-        # Every -l should have something that installs it. A warning rather
-        # than an error: a module may legitimately link something supplied by
-        # the base system, and failing the build over that would be worse
-        # than saying so.
+        # Every -l should have something that installs it -- on the platform
+        # being built here, which is the only one this machine can install
+        # for, said once a run however often the manifest is read. Web links
+        # no packages (its libraries are emscripten's ports and the loader's
+        # jslibs). A warning rather than an error: failing the build over a
+        # library the system supplies would be worse than saying so.
+        plat = _HOST_PLATFORM
+        if plat is None:
+            return
         claimed = set()
         for pkgs in m.get("requires", {}).get("system", {}).values():
             for p in pkgs:
                 claimed.update(p.get("provides_link", []))
-        builtin = {"dl", "pthread", "m", "rt", "stdc++", "c"}
-        for plat, blk in m.get("build", {}).items():
-            for lib in blk.get("system_libs", []):
-                if lib in claimed or lib in builtin or lib.endswith("32"):
-                    continue
-                print(f"  {YELLOW}[!]{RESET} {module} [{plat}] links -l{lib}, "
-                      f"but no declared package provides it.")
+        said = self.__dict__.setdefault("_unprovided_said", set())
+        for lib in m.get("build", {}).get(plat, {}).get("system_libs", []):
+            if lib in claimed or lib in _BUILTIN_LIBS[plat] or (module, lib) in said:
+                continue
+            said.add((module, lib))
+            hint = " (Windows packages have no manifest form yet)" if plat == "Win" else ""
+            print(f"  {YELLOW}[!]{RESET} {module} [{plat}] links -l{lib}, "
+                  f"but no declared package provides it{hint}.")
 
     # ------------------------------------------------------------------
     # emission
@@ -629,7 +693,13 @@ class ManifestMixin:
         w("SRC_MODULE := $(TARGET_BASE_NAME).cc")
         w("HASH_HEADER := module_hashes.h")
         w("")
-        w("UNAME_S := $(shell uname -s)")
+        # Windows names itself in $(OS); uname there is MSYS's (MINGW64_NT-...)
+        # or absent. A cross build passes UNAME_S=Windows_NT.
+        w("ifeq ($(OS),Windows_NT)")
+        w("    UNAME_S := Windows_NT")
+        w("else")
+        w("    UNAME_S := $(shell uname -s)")
+        w("endif")
         w("ARCH    := $(shell uname -m)")
         w("NPROC   := $(shell nproc)")
         w("CXX := g++")
@@ -999,16 +1069,18 @@ class ManifestMixin:
             # by a pool thread. The loader block below says why in full.
             ld = (["-sSIDE_MODULE", "-pthread", "-fwasm-exceptions"]
                   if plat == "Web" else ["-shared"])
-            if plat != "Web":
+            if plat == "Linux":
+                # ELF only: no binutils carries gold for PE.
                 ld += ["-fuse-ld=gold", "-Wl,--threads", "-Wl,--thread-count,$(NPROC)"]
             ld += blk.get("ldflags", [])
             if plat == "Linux" and exports:
                 # ELF only. On Win the version script is silently ignored,
                 # which reads as an exported surface that is not actually
                 # enforced -- better to not claim it at all.
-                ld.append(f"-Wl,--version-script={exports}")
+                ld.append("-Wl,--version-script=$(KERNEL_EXPORTS)")
+                w(f"    KERNEL_EXPORTS := {KERNEL_EXPORTS_FILE}")
             w(f"    LDFLAGS := {' '.join(ld)}")
-            w(f"    SYSLIBS := {' '.join('-l' + l for l in blk.get('system_libs', []))}")
+            w(f"    SYSLIBS := {' '.join('-l' + l for l in _system_libs(blk, plat))}")
 
         w("else")
         w("    $(error Unsupported platform: $(UNAME_S))")
@@ -1184,9 +1256,12 @@ class ManifestMixin:
         # BUILD_STAMP is a REAL prerequisite, not order-only: it is how a
         # changed architecture, sanitizer or ABI-define set forces a relink.
         # Order-only would let a stale .so built with different flags stand.
-        prereqs = (["$(MODULE_DEPS)", "$(HASH_HEADER)", "$(BUILD_STAMP)"]
+        prereqs = (["$(MODULE_DEPS)", "$(HASH_HEADER)", "$(BUILD_STAMP)", "$(KERNEL_EXPORTS)"]
                    + obj_targets + build_markers)
         order_only = fetch_markers
+        if exports:
+            kv = _kernel_version(self.ace_root)
+            _kernel_exports_rule(w, exports, "ETCS_ABI", f"ETCS_ABI_KERNEL_V_{kv}" if kv else "ETCS_ABI")
         w("# Archives come AFTER the translation unit that needs them: gold does")
         w("# not rescan an archive it has already passed, so a dependency listed")
         w("# among the flags resolves only by accident.")
@@ -1672,7 +1747,13 @@ class ManifestMixin:
         w("# loader builds from the defaults alone.")
         w("# " + "=" * 68)
         w("")
-        w("UNAME_S := $(shell uname -s)")
+        # Windows names itself in $(OS); uname there is MSYS's (MINGW64_NT-...)
+        # or absent. A cross build passes UNAME_S=Windows_NT.
+        w("ifeq ($(OS),Windows_NT)")
+        w("    UNAME_S := Windows_NT")
+        w("else")
+        w("    UNAME_S := $(shell uname -s)")
+        w("endif")
         w("NPROC   := $(shell nproc)")
         w("CXX := g++")
         w("BIN_DIR := ../bin")
@@ -1737,8 +1818,9 @@ class ManifestMixin:
         w("    # flag does not touch. What it removes from the export table is the")
         w("    # loader's own header-inline statics -- EventNode, ThreadPool,")
         w("    # MemoryArena -- so a module can only ever bind to its own copy, the")
-        w("    # per-DSO grain core/ is written to. The one symbol a module dlsym()s")
-        w("    # out of the loader, ETCS_GetLoaderManifest, marks itself default.")
+        w("    # per-DSO grain core/ is written to. What a module dlsym()s out of")
+        w("    # the loader -- ETCS_GetLoaderManifest, ETCS_GetLoaderEpoch -- marks")
+        w("    # itself default.")
         w("    CXX := em++")
         w("    CC  := emcc")
         w("    CXXFLAGS += -pthread -fwasm-exceptions")
@@ -1942,7 +2024,11 @@ class ManifestMixin:
         w("    LDFLAGS := -sMAIN_MODULE=1 -sEXPORT_ALL=1 -pthread -fwasm-exceptions \\")
         w("               $(ETCS_WEB_MEMORY) $(ETCS_WEB_POOL) $(ETCS_WEB_JSLIBS) \\")
         w("               -sERROR_ON_UNDEFINED_SYMBOLS=0 \\")
-        w("               -sSTACK_SIZE=4MB -sDEFAULT_PTHREAD_STACK_SIZE=4MB")
+        w("               -sSTACK_SIZE=4MB -sDEFAULT_PTHREAD_STACK_SIZE=4MB \\")
+        w("               -Wno-experimental")
+        w("    # -Wno-experimental: side modules on pthreads is emscripten's")
+        w("    # experimental pairing and this loader's design -- modules run on")
+        w("    # the pool's threads. Said here, once, not by em++ on every link.")
         w("    # THE OUTPUT NAME HAS AN EXTENSION, and it is not cosmetic: an")
         w("    # extensionless `etcs` is JavaScript served as application/octet-stream,")
         w("    # which a browser warns is not a script, and every page would have to")
@@ -1961,12 +2047,14 @@ class ManifestMixin:
         if exports:
             # ELF-only: audited export surface under -rdynamic (see module
             # version-script note). Loader needs this so module static-init
-            # can dlsym(RTLD_DEFAULT, ETCS_GetLoaderManifest).
-            parts.append(f"-Wl,--version-script={exports}")
+            # can dlsym(RTLD_DEFAULT, ...) what loaders/exports.map lists:
+            # ETCS_GetLoaderManifest, ETCS_GetLoaderEpoch.
+            parts.append("-Wl,--version-script=$(KERNEL_EXPORTS)")
+            w(f"    KERNEL_EXPORTS := {KERNEL_EXPORTS_FILE}")
         w(f"    LDFLAGS := {' '.join(parts)}".rstrip())
         w("else ifeq ($(UNAME_S),Windows_NT)")
         blk = default.get("build", {}).get("Win", {})
-        parts = list(blk.get("ldflags", [])) + ["-l" + l for l in blk.get("system_libs", [])]
+        parts = list(blk.get("ldflags", [])) + ["-l" + l for l in _system_libs(blk, "Win")]
         w(f"    LDFLAGS := {' '.join(parts)}".rstrip())
         w("else")
         w("    $(error Unsupported platform: $(UNAME_S))")
@@ -1982,6 +2070,8 @@ class ManifestMixin:
         w("# which the web path never built and has no business touching.")
         w("ifdef EMSCRIPTEN")
         w("    LOADER_ARTIFACTS := Run_*Loader.js Run_*Loader.wasm etcs.js etcs.wasm")
+        w("else ifeq ($(UNAME_S),Windows_NT)")
+        w("    LOADER_ARTIFACTS := Run_*Loader.exe etcs.exe")
         w("else")
         w("    LOADER_ARTIFACTS := Run_*Loader etcs")
         w("endif")
@@ -2037,9 +2127,11 @@ class ManifestMixin:
                       "\n      with a signature mismatch in a header nobody edited.")
             extra_cxx = [f"-D{d}" for d in abi] + inc + ob.get("cxxflags", []) + \
                 [f"-D{d}" for d in ob.get("defines", [])]
-            extra_link = links + ["-l" + l for l in syslibs] + \
-                ob.get("link", [])
-            if not extra_cxx and not extra_link:
+            extra_link = links + ob.get("link", [])
+            # The modules' Linux system libraries, read from their Linux
+            # blocks, so linked on Linux only (-ldl has no PE import library).
+            linux_libs = ["-l" + l for l in syslibs]
+            if not extra_cxx and not extra_link and not linux_libs:
                 continue
             if o.get("inherits_modules"):
                 w(f"# {name} inherits: {', '.join(o['inherits_modules'])}")
@@ -2047,6 +2139,10 @@ class ManifestMixin:
                 w(f"{name}: EXTRA_CXXFLAGS += {' '.join(extra_cxx)}")
             if extra_link:
                 w(f"{name}: EXTRA_LINK += {' '.join(extra_link)}")
+            if linux_libs:
+                w("ifeq ($(UNAME_S),Linux)")
+                w(f"{name}: EXTRA_LINK += {' '.join(linux_libs)}")
+                w("endif")
             w("")
 
         w("# If FILE is specified, build only that one; otherwise every *Loader.cc.")
@@ -2080,11 +2176,14 @@ class ManifestMixin:
         w("# Both recipes link to $@$(WEB_SUFFIX). On a native build WEB_SUFFIX is")
         w("# empty, so the target and the file are the same name and make's own")
         w("# up-to-date check still works.")
-        w("%Loader: %Loader.cc")
+        if exports:
+            kv = _kernel_version(self.ace_root)
+            _kernel_exports_rule(w, exports, "ETCS_LOADER", f"ETCS_LOADER_KERNEL_V_{kv}" if kv else "ETCS_LOADER")
+        w("%Loader: %Loader.cc $(KERNEL_EXPORTS)")
         w("\t$(CXX) $(CXXFLAGS) $(EXTRA_CXXFLAGS) $(EXTRADEFINES) -o Run_$@$(WEB_SUFFIX) $< "
           "$(EXTRA_LINK) $(LDFLAGS)")
         w("")
-        w("etcs: etcs.cc")
+        w("etcs: etcs.cc $(KERNEL_EXPORTS)")
         w("\t$(CXX) $(CXXFLAGS) $(EXTRA_CXXFLAGS) $(EXTRADEFINES) -o $@$(WEB_SUFFIX) $< "
           "$(EXTRA_LINK) $(LDFLAGS)")
         w("")
@@ -2331,7 +2430,9 @@ class ManifestMixin:
             if names == ["loaders"]:
                 self.generate_loaders_makefile(force=force)
                 return
-            for n in (names or self._all_manifests()):
+            # Every module, as clean does: one with no manifest of its own
+            # builds from default.json and is just as generated.
+            for n in (names or sorted(set(self._all_manifests()) | set(self._defaulted_modules()))):
                 self.generate_makefile(n, force=force)
             if not names:
                 self.generate_loaders_makefile(force=force)

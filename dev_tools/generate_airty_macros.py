@@ -1,4 +1,6 @@
-MAX_ARITY = 64
+# 128: a game's verb list (KartBattle, GolfMatch) passed 64 once lobbies
+# grew menus. ETCS_COUNT_ARGS is emitted here too, so this is the one place.
+MAX_ARITY = 128
 GUARD = "AIRTYMACROS_GENERATED_H__"
 
 def fe_block(prefix, n, comma=False, fixed=False):
@@ -86,6 +88,7 @@ def generate(n):
     out.append("#define BRACKET_UNWRAP(...) __VA_ARGS__")
     out.append(get_macro_block("GET_MACRO", n))
     out.append(for_each_block("FOR_EACH", "GET_MACRO", "FE", n))
+    out.append("#define ETCS_COUNT_ARGS(...) \\\n    GET_MACRO(__VA_ARGS__," + ",".join(str(i) for i in range(n, 0, -1)) + ")")
     out.append(f"// --- Fixed-Argument Expansion Helpers (arity {n}) ---")
     out.extend(fe_block("FE_FIXED", n, fixed=True))
     out.append(get_macro_block("GET_MACRO_FIXED", n))

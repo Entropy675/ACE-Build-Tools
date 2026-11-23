@@ -21,6 +21,7 @@ Layout (all under dev_tools/):
     ace_manifest.py  <- module manifests -> generated Makefiles
     ace_wasm.py      <- what a -sMAIN_MODULE link did not report
     ace_generate.py  <- sources built from pins, not kept in git
+    ace_resolve.py   <- what the machine lacks (the keystore), fixed
 
     manifests/       <- one <Module>.json per module, read by ace_manifest
 """
@@ -40,12 +41,14 @@ from dev_tools.ace import (
     ManifestMixin,
     WasmMixin,
     HashMixin,
-    GenerateMixin
+    GenerateMixin,
+    SignMixin,
+    ResolveMixin
 )
 
 class AceManager(RegistryMixin, DepsMixin, AbiMixin, OntologyMixin, BuildMixin,
                  LifecycleMixin, ScriptMixin, ManifestMixin, WasmMixin, HashMixin,
-                 GenerateMixin):
+                 GenerateMixin, SignMixin, ResolveMixin):
     """Assembled from the subsystem mixins. Method resolution runs left to
     right across the bases; none of them define colliding names (verified at
     split time), so the order is for readability, not disambiguation."""
@@ -241,6 +244,16 @@ if __name__ == "__main__":
         print("           | ontology")
         print("           | wasm { link [main.wasm side.wasm ...] [--got] | addr <file.wasm> <offset> }")
         print("           | hash regions --out <header.h> [--append] <sources...>")
+        print("           | sign")
+        print("           | identity [<hex>[:<parent>] | store | none]")
+        print("           | untrusted [on | off]")
+        print("           | resolve identity [--password-stdin]")
+        print("           | mint <witnessed> <statement>... [quorum=N] [--release <store>] [--out <dir>]")
+        print("           | publish [dir] [--from <minted>]")
+        print("           | bundle <dir> [module...]")
+        print("           | root [<ETCS dir>]")
+        print("           | witness <out> [--identity <hex>[:<parent>]] [module...]")
+        print("           | source <dir>")
         print("           | script [name]")
         print("  -y / --yes answers every prompt with yes (dependency installs, hooks, removals).")
         sys.exit(0)
@@ -249,7 +262,7 @@ if __name__ == "__main__":
     try:
         if   cmd == "install":                          ace.install()
         elif cmd == "uninstall":                        ace.uninstall()
-        elif cmd == "root":                             ace.print_root()
+        elif cmd == "root":                             sys.exit(ace.root_cmd(args[1:]) or 0)
         elif cmd == "list":                             ace.list_modules()
         elif cmd == "setup" and len(args) > 1:          ace.setup(args[1], args[2] if len(args) > 2 else "default")
         elif cmd == "remove" and len(args) > 1:         ace.remove(args[1])
@@ -262,6 +275,15 @@ if __name__ == "__main__":
         elif cmd == "ontology":                         ace.ontology(args[1:])
         elif cmd == "wasm":                             sys.exit(ace.wasm(args[1:]) or 0)
         elif cmd == "hash":                             sys.exit(ace.hash(args[1:]) or 0)
+        elif cmd == "sign":                             sys.exit(ace.sign(args[1:]) or 0)
+        elif cmd == "identity":                         sys.exit(ace.identity_cmd(args[1:]) or 0)
+        elif cmd == "untrusted":                        sys.exit(ace.untrusted_cmd(args[1:]) or 0)
+        elif cmd == "resolve":                          sys.exit(ace.resolve(args[1:]) or 0)
+        elif cmd == "mint":                             sys.exit(ace.mint(args[1:]) or 0)
+        elif cmd == "publish":                          sys.exit(ace.publish(args[1:]) or 0)
+        elif cmd == "bundle":                           sys.exit(ace.bundle(args[1:]) or 0)
+        elif cmd == "witness":                          sys.exit(ace.witness(args[1:]) or 0)
+        elif cmd == "source":                           sys.exit(ace.source(args[1:]) or 0)
         elif cmd == "script":                           ace.create_script(args[1:])
         else:
             print(f"[-] Unknown or incomplete command: '{cmd}'")

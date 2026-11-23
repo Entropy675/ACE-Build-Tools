@@ -17,6 +17,9 @@ Targets:
     core/AirtyMacros_Generated.h  from dev_tools/generate_airty_macros.py
     libs/monocypher.h             from Monocypher at a pinned commit,
                                   amalgamated into one stb-style header
+
+The identity a loader is built with is not generated: it is a define
+(-DETCS_IDENTITY, ace_build.py), so it is in no header and no epoch.
 """
 from pathlib import Path
 import hashlib
@@ -94,6 +97,10 @@ class GenerateMixin:
             ("libs/monocypher.h",            self._gen_monocypher),
         ]
 
+    # Generated once, and retired since: a core header is hashed into the
+    # epoch, so one left behind would put this tree in an epoch of its own.
+    _RETIRED_TARGETS = ("core/AceRoot.h", "core/AceIdentity.h")
+
     def _write_if_changed(self, path, content):
         data = content.encode("utf-8")
         try:
@@ -111,6 +118,11 @@ class GenerateMixin:
         """Regenerate every target. True when all succeeded. Writes only on a
         byte change, so mtimes -- and therefore make -- stay quiet otherwise."""
         ok = True
+        for rel in self._RETIRED_TARGETS:
+            old = self.ace_root / rel
+            if old.is_file():
+                old.unlink()
+                print(f"  [*] {rel}: {YELLOW}removed{RESET}  {DIM}retired{RESET}")
         for rel, producer in self._generated_targets():
             out = self.ace_root / rel
             try:
