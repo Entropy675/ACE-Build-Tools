@@ -288,6 +288,8 @@ if __name__ == "__main__":
         else:
             print(f"[-] Unknown or incomplete command: '{cmd}'")
             sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
     except Exception as e:
         print(f"Fatal error: {e}")
         sys.exit(1)
