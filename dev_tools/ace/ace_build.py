@@ -5,15 +5,17 @@ build surface and nothing else. Mixed into AceManager in ace_install.py --
 all methods are `self`-bound and may call across subsystems through the one
 assembled object, but each subsystem's *definition* lives in exactly one file.
 """
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import hashlib
 import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import re
+import threading
 
 from .ace_common import (CYAN, YELLOW, GREEN, RED, RESET, DIM)
 
@@ -76,8 +78,13 @@ class BuildMixin:
     # FLAGS ARE IN IT TOO. A DEBUG or ASAN build is a different artifact from
     # the same sources, and the module Makefiles already encode that in their
     # own build stamp; this is the same fact, one level up.
+    #
+    # ONE RECORD PER PLATFORM, in one file. Native and web artifacts sit side
+    # by side (bin/ and bin/wasm/), so building one must not make the other
+    # stale.
 
     _FINGERPRINT_NAME = ".ace_build_fingerprint"
+    _PLATFORMS = ("native", "web")
 
     # Generated headers first: they are what the loader compares. The umbrella
     # headers are listed because they are includable directly and are not
@@ -176,24 +183,40 @@ class BuildMixin:
     def _fingerprint_path(self, mod):
         return self.ace_root / "modules" / mod / self._FINGERPRINT_NAME
 
-    def _module_build_reason(self, mod, extras):
-        """None if the module is up to date, else why it is not.
+    @staticmethod
+    def _platform_key(web):
+        return "web" if web else "native"
 
-        The .so has to EXIST as well as match: a fingerprint describes what a
-        build would produce, and a fingerprint with no artifact beside it is a
-        record of a build somebody deleted."""
-        so = self._artifact_path(mod, extras)
-        if not so.is_file():
-            return "no built artifact in bin/"
-
-        path = self._fingerprint_path(mod)
-        if not path.is_file():
-            return "never built through this check"
+    def _read_fingerprints(self, mod):
+        """{platform: record}, {} if there is no file, None if it is unreadable.
+        A record written before records were per platform has neither key and
+        reads as never built."""
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                old = json.load(fh)
+            with open(self._fingerprint_path(mod), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return {}
         except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return {k: v for k, v in data.items()
+                if k in self._PLATFORMS and isinstance(v, dict)}
+
+    def _module_build_reason(self, mod, extras):
+        """None if the module is up to date for this platform, else why it is
+        not. The artifact has to EXIST as well as match: a record with no
+        artifact beside it describes a build somebody deleted."""
+        art = self._artifact_path(mod, extras)
+        if not art.is_file():
+            return f"no {art.relative_to(self.ace_root)}"
+
+        records = self._read_fingerprints(mod)
+        if records is None:
             return "unreadable build record"
+        old = records.get(self._platform_key(self._is_web_build(extras)))
+        if old is None:
+            return "never built through this check"
 
         new = self._module_fingerprint(mod, extras)
         if old.get("global") != new["global"]:
@@ -207,26 +230,43 @@ class BuildMixin:
         return None
 
     def _record_module_fingerprint(self, mod, extras):
-        """Written only after a build that SUCCEEDED and left an artifact.
-
-        BOTH CONDITIONS, and the first one is the one that bites. A failed
-        build leaves the PREVIOUS .so sitting in bin/, so "an artifact exists"
-        is true for a module that did not build at all -- record on that alone
-        and the next run skips a module whose binary predates the change,
-        which surfaces later as the loader refusing it for a hash mismatch.
-        Found exactly that way, by an interrupted batch.
-
-        So the caller passes make's own verdict, and a failure leaves no
-        record at all: the module is rebuilt next time, which is the only safe
-        default when the truth is unknown."""
-        so = self._artifact_path(mod, extras)
-        if not so.is_file():
+        """Called only after make reported success: a failed build leaves the
+        previous artifact in bin/, so existence alone would record a binary
+        older than its source. The other platform's record is kept."""
+        if not self._artifact_path(mod, extras).is_file():
             return
+        records = self._read_fingerprints(mod) or {}
+        records[self._platform_key(self._is_web_build(extras))] = \
+            self._module_fingerprint(mod, extras)
+        path = self._fingerprint_path(mod)
+        tmp = path.with_name(path.name + ".tmp")
         try:
-            with open(self._fingerprint_path(mod), "w", encoding="utf-8") as fh:
-                json.dump(self._module_fingerprint(mod, extras), fh, indent=1)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(records, fh, indent=1)
+            os.replace(tmp, path)
         except OSError as e:
             print(f"    {DIM}(could not record build fingerprint for {mod}: {e}){RESET}")
+
+    def _clear_module_fingerprint(self, mod, extras):
+        """Drop this platform's record before the module's make starts, so a
+        build that never reports back -- killed, OOM, power loss -- leaves the
+        module marked dirty with no handler involved."""
+        records = self._read_fingerprints(mod)
+        key = self._platform_key(self._is_web_build(extras))
+        if not records or key not in records:
+            return
+        del records[key]
+        path = self._fingerprint_path(mod)
+        try:
+            if records:
+                tmp = path.with_name(path.name + ".tmp")
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(records, fh, indent=1)
+                os.replace(tmp, path)
+            else:
+                path.unlink()
+        except OSError as e:
+            print(f"    {DIM}(could not clear build fingerprint for {mod}: {e}){RESET}")
 
     def _lib_ext(self):
         system = platform.system()
@@ -351,7 +391,7 @@ class BuildMixin:
             print(f"{GREEN}[=] {art} is the INTERACTIVE loader "
                   f"(-DETCS_REPL_SHELL).{RESET}")
 
-    def _drop_stale_artifact(self, name, extras, kind="module"):
+    def _drop_stale_artifact(self, name, extras, kind="module", why="failed"):
         """Remove what a FAILED build left behind in bin/.
 
         A build that fails leaves the PREVIOUS artifact sitting there, and
@@ -386,7 +426,7 @@ class BuildMixin:
                 try:
                     art.unlink()
                     print(f"{YELLOW}[!] removed stale {rel}/{n} -- the build that "
-                          f"should have replaced it failed.{RESET}")
+                          f"should have replaced it {why}.{RESET}")
                 except OSError as ex:
                     print(f"{RED}[-] could not remove stale {rel}/{n}: {ex}{RESET}")
 
@@ -546,14 +586,20 @@ class BuildMixin:
     def _build_modules_concurrently(self, mods, extras):
         """Build these modules at once, bounded by the cores available.
 
-        Returns [(module, ok)] in the order given.
+        Returns [(module, ok)] in the order given. A module's record is
+        cleared as its make starts and written the moment it succeeds, so an
+        interrupt costs only the modules in flight.
 
-        OUTPUT IS HELD AND PRINTED WHOLE, one block per module. Streaming it
-        would interleave several compilers' diagnostics exactly when it matters,
-        which is when one of them is the error -- and a wall of warnings whose
-        module cannot be told apart is the same as no output. The blocks are
-        printed in the order asked for rather than the order they finish, so two
-        runs of the same build produce logs that can be diffed.
+        OUTPUT IS HELD AND PRINTED WHOLE, one block per module, in the order
+        asked for: streaming would interleave several compilers' diagnostics
+        exactly when one of them is the error, and a fixed order keeps two runs'
+        logs diffable.
+
+        ON INTERRUPT (Ctrl-C, SIGTERM, SIGHUP): nothing new starts, the running
+        makes are stopped (each runs in its own process group, so a signal to
+        ace alone still reaches them), and every module whose make started but
+        was not recorded loses its artifact. bin/ then never holds a binary
+        without a record.
         """
         if not mods:
             return []
@@ -561,26 +607,101 @@ class BuildMixin:
         if workers > 1:
             print(f"{DIM}    parallel: {workers} modules at a time{RESET}")
 
+        posix = os.name == "posix"
+        lock = threading.Lock()
+        procs, started, recorded, results = {}, set(), set(), {}
+        aborting = threading.Event()
+
         def one(mod):
             cmd = ["make", "-C", str(self.ace_root), f"ACE_ROOT={self.ace_root}",
                    f"module_{mod}"] + list(extras)
-            try:
-                p = subprocess.run(cmd, capture_output=True, text=True)
-            except OSError as ex:
-                return False, f"[-] could not run make: {ex}\n"
-            return p.returncode == 0, (p.stdout or "") + (p.stderr or "")
+            with lock:
+                if aborting.is_set():
+                    return False, ""
+                started.add(mod)
+                self._clear_module_fingerprint(mod, extras)
+                try:
+                    p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True,
+                                         start_new_session=posix)
+                except OSError as ex:
+                    return False, f"[-] could not run make: {ex}\n"
+                procs[mod] = p
+            log, _ = p.communicate()
+            with lock:
+                procs.pop(mod, None)
+            return p.returncode == 0, log or ""
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [(mod, pool.submit(one, mod)) for mod in mods]
-            out = []
-            for mod, fut in futures:
-                ok, log = fut.result()
+        def stop(p, sig):
+            if posix:
+                try:
+                    os.killpg(p.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            elif sig == signal.SIGTERM:
+                p.terminate()
+            else:
+                p.kill()
+
+        def print_blocks(names):
+            for mod in names:
+                ok, log = results[mod]
                 mark = f"{CYAN}{mod}{RESET}" if ok else f"{RED}{mod}{RESET}"
                 print(f"\n--- {mark} ---")
                 if log.strip():
                     print(log.rstrip())
-                out.append((mod, ok))
-        return out
+
+        def on_signal(signum, frame):
+            raise KeyboardInterrupt
+
+        caught = [n for n in ("SIGTERM", "SIGHUP") if hasattr(signal, n)]
+        previous = {}
+        if threading.current_thread() is threading.main_thread():
+            for n in caught:
+                previous[n] = signal.signal(getattr(signal, n), on_signal)
+
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futures = {pool.submit(one, mod): mod for mod in mods}
+            for fut in as_completed(futures):
+                mod = futures[fut]
+                ok, log = fut.result()
+                if ok:
+                    self._record_module_fingerprint(mod, extras)
+                    recorded.add(mod)
+                results[mod] = (ok, log)
+        except KeyboardInterrupt:
+            aborting.set()
+            pool.shutdown(wait=False, cancel_futures=True)
+            with lock:
+                running = list(procs.values())
+            for p in running:
+                stop(p, signal.SIGTERM)
+            for p in running:
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    stop(p, signal.SIGKILL)
+                    p.wait()
+            pool.shutdown(wait=True)
+            print_blocks([m for m in mods if m in results])
+            in_flight = sorted(started - set(results))
+            print(f"\n{YELLOW}[!] interrupted: {len(recorded)} module(s) recorded, "
+                  f"{len(in_flight)} stopped in flight; those rebuild next run.{RESET}")
+            for mod in in_flight:
+                self._drop_stale_artifact(mod, extras, "module", why="was interrupted")
+            # The callers' failure path never runs past the raise.
+            for mod in results:
+                if not results[mod][0]:
+                    self._drop_stale_artifact(mod, extras, "module")
+            raise
+        finally:
+            pool.shutdown(wait=False)
+            for n, h in previous.items():
+                signal.signal(getattr(signal, n), h)
+
+        print_blocks(mods)
+        return [(mod, results[mod][0]) for mod in mods]
 
     def _run_root_make(self, target, extra_args=None, keep_going=False):
         """Run a target against the master Makefile at ace_root with extra flags.
@@ -626,22 +747,42 @@ class BuildMixin:
         if not args:
             print("[-] Error: No make target specified.")
             print("    Usage: ace make { all | modules | loaders | clean | clean modules | clean loaders | module <n> | clean module <n> | loader <n> | clean loader <n> }")
+            print("           --vendor with a module clean: also delete and refetch its git dependencies")
             return
 
         # --force is ACE's own flag, not make's, so it comes out of the
         # argument list before anything tries to validate it as a make target.
         # Accepted anywhere in the line because that is where people type it.
         force = False
+        vendor = False
         filtered = []
         for a in args:
             if a in ("--force", "-B"):
                 force = True
+                continue
+            if a == "--vendor":
+                vendor = True
                 continue
             filtered.append(a)
         args = filtered
         if not args:
             print("[-] Error: No make target specified.")
             return 1
+
+        # --vendor: the clean that also deletes and refetches every git
+        # dependency of the modules it cleans (refresh_vendored, ace_manifest.py).
+        if vendor:
+            if args[0] != "clean" or args[1:2] == ["loaders"]:
+                print("[-] --vendor goes with `clean`, `clean modules` or `clean module <n>...`")
+                return 1
+            if args[1:2] == ["module"]:
+                mods = [self._validate_module_name(n)
+                        for n in self._split_names_and_flags(args[2:])[0]]
+            else:
+                mods = sorted(set(self._all_manifests()) | set(self._defaulted_modules()))
+            print(f"[*] Refetching the vendored dependencies of {len(mods)} module(s):")
+            if self.refresh_vendored(mods):
+                print(f"{YELLOW}[!] not every dependency came back fresh -- see above{RESET}")
 
         if self._is_web_build(args):
             if not shutil.which("em++"):
@@ -823,13 +964,9 @@ class BuildMixin:
                     if not web:
                         print(f"[*] ABI interface for {mod} (post-build):")
                         self.introspect_and_record(mod, announce=True)
-                    # A named module is ALWAYS built -- asking for it by name
-                    # is the request -- but the record is written only if the
-                    # build worked, so a later `ace make modules` knows this
-                    # one is current and leaves it alone.
-                    if ok:
-                        self._record_module_fingerprint(mod, extras)
-                    else:
+                    # A named module is ALWAYS built; the builder recorded it
+                    # if it worked, so a later `ace make modules` leaves it.
+                    if not ok:
                         failed.append(mod)
                         self._drop_stale_artifact(mod, extras, "module")
                 self.sign_modules(only=[m for m, ok in results if ok], web=web)
@@ -852,6 +989,9 @@ class BuildMixin:
                                           color=CYAN)
                     print()
                 for mod in mods:
+                    # Its Makefile first: a clean already removed it, and the
+                    # root clean target runs out of it -- a second clean failed.
+                    self.ensure_makefile(mod)
                     # make clean FIRST -- it runs out of the very Makefile
                     # removed next, and a generated Makefile is itself a build
                     # artifact now, so leaving it behind means `clean` did not
@@ -954,15 +1094,10 @@ class BuildMixin:
                     results = self._build_modules_concurrently(
                         [mod for mod, _ in build], extras)
                     for mod, ok in results:
-                        if ok:
-                            self._record_module_fingerprint(mod, extras)
-                        else:
-                            # No record at all -- the next run rebuilds it, and
-                            # the OLD artifact goes with it. Leaving it was the
-                            # quiet half of this failure: anything that keyed
-                            # off the artifact's existence called the module
-                            # current, and staging bin/ shipped a binary older
-                            # than its source.
+                        if not ok:
+                            # No record (the builder cleared it), and the OLD
+                            # artifact goes too: left in bin/, it is a binary
+                            # older than its source that staging would ship.
                             failed.append(mod)
                             self._drop_stale_artifact(mod, extras, "module")
                     if failed:

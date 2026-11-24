@@ -51,7 +51,10 @@ from pathlib import Path
 import hashlib
 import json
 import platform
+import os
+import pwd
 import re
+import shutil
 import subprocess
 
 from .ace_common import (CYAN, YELLOW, GREEN, RED, RESET, DIM, ORANGE)
@@ -1205,9 +1208,11 @@ class ManifestMixin:
         # rule stayed newer than its source and was linked, flags and all, into
         # a module built under the new one. ace regenerates this file whenever
         # the generator's output changes (ensure_makefile), and this is the other
-        # half of that: the regeneration reaches the objects.
+        # half of that: the regeneration reaches the objects. ace's fingerprint
+        # file shares the prefix and is not a stamp: deleting it here dropped
+        # the other platform's record on every native/web switch.
         w("$(BUILD_STAMP): Makefile")
-        w("\t@rm -f .ace_build_*")
+        w("\t@rm -f $(filter-out .ace_build_fingerprint,$(wildcard .ace_build_*))")
         w("\t@touch $@")
         w("")
 
@@ -2340,6 +2345,97 @@ class ManifestMixin:
             if (p / f"{p.name}.cc").is_file():
                 found.append(p.name)
         return found
+
+    # ------------------------------------------------------------------
+    # ace make clean --vendor: every fetched dependency deleted and fetched
+    # again at its pin, so the next build makes it from nothing
+    # ------------------------------------------------------------------
+
+    def refresh_vendored(self, modules):
+        """`clean` keeps vendored sources on purpose (a refetch is the network).
+        This is the clean that doesn't: for each git dependency of `modules`,
+        the whole directory goes -- the build products a dependency leaves in
+        its own tree (sqlite's in-tree configure, a cmake build/) included --
+        and comes back at the manifest's pin. A submodule is restored from its
+        repository's own store, with no network; anything else is cloned. The
+        next build's fetch rule checks the pin as always.
+
+        FILES ANOTHER USER OWNS (a build once run as root) stop it BEFORE
+        anything is deleted: a half-deleted dependency is worse than a dirty
+        one. Under sudo the delete is root's and the fetch is the tree owner's,
+        so what comes back is theirs. Returns the number that failed."""
+        failed = 0
+        for mod in modules:
+            try:
+                m = self.load_manifest(mod, silent=True)
+            except ManifestError as e:
+                print(f"  {YELLOW}[!]{RESET} {mod}: {e}")
+                continue
+            for dep in _vendor_union(_vendor_profiles(m, mod)):
+                src = dep.get("source", {})
+                if src.get("type") != "git":
+                    continue        # in-tree sources: the repository's, not ours to delete
+                if not self._refresh_one(mod, dep):
+                    failed += 1
+        return failed
+
+    def _refresh_one(self, mod, dep):
+        mod_dir = self._module_dir(mod)
+        d = mod_dir / dep["name"]
+        src = dep["source"]
+        label = f"{mod}/{dep['name']}"
+        owner = mod_dir.stat().st_uid if mod_dir.exists() else os.geteuid()
+        root = os.geteuid() == 0
+
+        if d.exists() or d.is_symlink():
+            foreign = [] if root else [p for p in [d, *d.rglob("*")]
+                                       if p.lstat().st_uid != os.geteuid()]
+            if foreign:
+                print(f"  {RED}[-]{RESET} {label}: {len(foreign)} paths are owned by another user "
+                      f"(e.g. {foreign[0].relative_to(mod_dir)}) -- nothing deleted. "
+                      f"`sudo ace make clean --vendor` deletes them and fetches as you.")
+                return False
+            try:
+                shutil.rmtree(d) if d.is_dir() and not d.is_symlink() else d.unlink()
+            except OSError as e:
+                print(f"  {RED}[-]{RESET} {label}: could not delete: {e}")
+                return False
+
+        def git(*a, cwd=None):
+            """git as the tree's owner, so nothing fetched under sudo is root's."""
+            kw = {}
+            if root and owner != 0:
+                pw = pwd.getpwuid(owner)
+                kw = {"user": owner, "group": pw.pw_gid,
+                      "extra_groups": os.getgrouplist(pw.pw_name, pw.pw_gid),
+                      "env": {**os.environ, "HOME": pw.pw_dir, "USER": pw.pw_name}}
+            return subprocess.run(["git", *a], cwd=str(cwd or mod_dir),
+                                  capture_output=True, text=True, **kw)
+
+        ref, url = src["ref"], src["url"]
+        top = git("rev-parse", "--show-toplevel").stdout.strip()
+        rel = os.path.relpath(d, top) if top else None
+        is_sub = bool(rel) and git("ls-files", "--stage", "--", rel, cwd=top).stdout.startswith("160000")
+        if is_sub:
+            r = git("submodule", "update", "--init", "--recursive", "--force", "--", rel, cwd=top)
+        else:
+            r = git("clone", *(["--depth", "1", "--branch", ref] if src.get("shallow", True) else []),
+                    url, str(d))
+            if r.returncode != 0 and src.get("shallow", True):
+                r = git("clone", url, str(d))
+        if r.returncode == 0 and git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", cwd=d).returncode != 0:
+            r = git("fetch", "--tags", "origin", ref, cwd=d)
+        if r.returncode == 0:
+            r = git("checkout", "--quiet", "--detach", ref, cwd=d)
+        if r.returncode == 0 and src.get("submodules"):
+            r = git("submodule", "update", "--init", "--recursive", "--depth", "1", cwd=d)
+        if r.returncode != 0:
+            print(f"  {RED}[-]{RESET} {label}: deleted, but the fetch failed -- the next build "
+                  f"fetches it: {(r.stderr or r.stdout).strip().splitlines()[-1:]}")
+            return False
+        print(f"  {GREEN}[+]{RESET} {label}: fresh at {ref[:12]}"
+              f"{' (submodule)' if is_sub else ''}")
+        return True
 
     def manifest(self, args):
         """Dispatch for `ace manifest ...`."""

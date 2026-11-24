@@ -234,7 +234,7 @@ if __name__ == "__main__":
     ace.assume_yes = len(args) != len(sys.argv) - 1
     if not args:
         print("Usage: ace [-y] { install | uninstall | list | setup <mod> [OS] | remove <mod> | stage <mod> <dest> }")
-        print("           | make { all | modules | loaders | clean | clean modules | clean loaders }")
+        print("           | make { all | modules | loaders | clean | clean modules | clean loaders } [--vendor]")
         print("           | make { module <n> | clean module <n> }")
         print("           | make { loader <n> | clean loader <n> }")
         print("           | registry verify")
@@ -288,6 +288,8 @@ if __name__ == "__main__":
         else:
             print(f"[-] Unknown or incomplete command: '{cmd}'")
             sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
     except Exception as e:
         print(f"Fatal error: {e}")
         sys.exit(1)

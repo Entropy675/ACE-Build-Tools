@@ -317,21 +317,11 @@ class SignMixin:
         return True
 
     def _module_current(self, mod, web):
-        """The build-skip check's record, asked of one artifact: the last build
-        of this module was for this platform, from these sources, against these
-        generated hashes. Other flags are not provenance -- a DEBUG build of
-        this tree is still this tree's build. The record is one per module, so
-        a native build makes the .wasm beside it not current, and the other
-        way round: it keeps whatever signature it has, it gets no new one."""
-        path = self._fingerprint_path(mod)
-        if not path.is_file():
-            return False
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                old = json.load(fh)
-        except (OSError, ValueError):
-            return False
-        if ("EMSCRIPTEN=1" in old.get("flags", "").split()) != web:
+        """The build-skip record for this platform matches the tree: same
+        sources, manifest and generated hashes. Other flags are not provenance
+        -- a DEBUG build of this tree is still this tree's build."""
+        old = (self._read_fingerprints(mod) or {}).get(self._platform_key(web))
+        if old is None:
             return False
         new = self._module_fingerprint(mod, [])
         return all(old.get(k) == new[k] for k in ("global", "local", "manifest"))
@@ -361,9 +351,34 @@ class SignMixin:
         os.replace(tmp, art)
         return None
 
+    # What libsecret says when nothing on the bus answers for the keyring in
+    # time: a daemon that is stuck, or whose password prompt was closed or is
+    # hidden behind another window. Each such signature waits out a timeout.
+    _KEYSTORE_TIMEOUT = ("Timeout was reached", "Failed to activate service 'org.freedesktop.secrets'")
+
     def _sign_one(self, signer, mod, art, epoch, verb="--sign", env=None):
         """'signed', 'unchanged', or why not. With --succeed, also the lineage
-        edge the signer recorded (or None): (result, edge)."""
+        edge the signer recorded (or None): (result, edge).
+
+        A KEYSTORE THAT TIMES OUT is asked about once per run: at a terminal,
+        restart and unlock it (offer_keyring_restart) and sign again. Left
+        unanswered, the rest of the run's signatures are skipped with that
+        reason instead of each waiting out the same timeout."""
+        down = getattr(self, "_keystore_down", None)
+        if down:
+            result = f"skipped: {down}"
+            return (result, None) if verb == "--succeed" else result
+        result, edge = self._sign_one_raw(signer, mod, art, epoch, verb, env)
+        if any(t in result for t in self._KEYSTORE_TIMEOUT):
+            if not getattr(self, "_keystore_offered", False):
+                self._keystore_offered = True
+                if self.offer_keyring_restart():
+                    result, edge = self._sign_one_raw(signer, mod, art, epoch, verb, env)
+            if any(t in result for t in self._KEYSTORE_TIMEOUT):
+                self._keystore_down = "the keyring did not answer earlier in this run (`ace resolve identity`)"
+        return (result, edge) if verb == "--succeed" else result
+
+    def _sign_one_raw(self, signer, mod, art, epoch, verb, env):
         with tempfile.TemporaryDirectory(prefix="ace-sign-") as d:
             out = Path(d) / "chain"
             rc, edge, err = self._ask_loader(signer, verb, mod, str(art), epoch, str(out), want=_LINEAGE, env=env)
@@ -375,7 +390,7 @@ class SignMixin:
                 result = err.splitlines()[-1] if err else f"bin/etcs {verb} exited {rc}"
             else:
                 result = self._place_chain(art, out) or "signed"
-            return (result, edge) if verb == "--succeed" else result
+            return result, edge
 
     # ------------------------------------------------------------------
     # The loader's own binary, and the lineage
@@ -521,7 +536,8 @@ class SignMixin:
         for why, names in reasons.items():
             print(f"{RED}[-] not signed ({len(names)}) -- {why}{RESET}")
             self._print_name_grid(names, per_row=4, indent="    ", color=RED)
-        if any("Secret Service" in why or "libsecret" in why for why in reasons):
+        if any("Secret Service" in why or "libsecret" in why or "keyring did not answer" in why
+               for why in reasons):
             print(f"{DIM}    `sudo ace resolve identity` finds and fixes what the keystore needs{RESET}")
         return len(stale) + len(failed)
 

@@ -55,13 +55,27 @@ _PROBE_TIMEOUT = 10     # seconds; D-Bus's own is 25, spent waiting on a prompt 
 
 
 class _Target:
+    """The user whose key signs, and the bus that reaches their keystore.
+
+    THE BUS IS THE ONE SIGNING USES. Signing runs bin/etcs in ace's own
+    environment, so when ace runs as this user, the bus the build was started
+    on (a desktop login, dbus-run-session) is the one asked here too;
+    /run/user/<uid>/bus is only the guess for a user ace is not (sudo)."""
+
     def __init__(self, entry):
         self.name, self.uid, self.gid, self.home = entry.pw_name, entry.pw_uid, entry.pw_gid, entry.pw_dir
         self.groups = os.getgrouplist(self.name, self.gid)
+        own = self.uid == os.geteuid()
+        self.inherited = (os.environ.get("DBUS_SESSION_BUS_ADDRESS") or None) if own else None
+        self.runtime = (os.environ.get("XDG_RUNTIME_DIR") if own else None) or f"/run/user/{self.uid}"
 
     @property
     def bus(self):
         return Path(f"/run/user/{self.uid}/bus")
+
+    @property
+    def address(self):
+        return self.inherited or f"unix:path={self.bus}"
 
 
 class ResolveMixin:
@@ -140,8 +154,10 @@ class ResolveMixin:
         confirms, so -y answers them); after that, one line, from a probe short
         enough to sit in front of every build. A locked keyring -- every reboot
         on a headless machine -- is offered its unlock at a terminal."""
-        if platform.system() != "Linux":
+        if platform.system() != "Linux" or getattr(self, "_identity_preflighted", False):
             return
+        # Once per ace run: `ace witness` and `ace wasm make all` call make() more than once.
+        self._identity_preflighted = True
         if self.untrusted_setting():
             print(f"{DIM}[=] signing: off -- untrusted loaders (`ace untrusted off` to sign){RESET}")
             return
@@ -174,6 +190,21 @@ class ResolveMixin:
             print(f"{YELLOW}[!] signing: {detail}{RESET}")
             print(f"{DIM}    modules built now stay unsigned -- `ace resolve identity`{RESET}")
 
+    def offer_keyring_restart(self):
+        """A signature timed out on the keystore: offer, at a terminal, to
+        restart the keyring daemon and unlock it (_unlock_keyring: --replace,
+        then the password). True when the key answers afterwards. Elsewhere it
+        only says what to run."""
+        print(f"{YELLOW}[!] the keyring did not answer -- its daemon may be stuck, or its password "
+              f"prompt was closed or is hidden behind another window{RESET}")
+        if platform.system() != "Linux" or not sys.stdin.isatty():
+            print(f"{DIM}    `ace resolve identity` at a terminal restarts and unlocks it{RESET}")
+            return False
+        if not self._confirm(f"{YELLOW}[?] Restart the keyring daemon and unlock it with your password?{RESET}",
+                             False):
+            return False
+        return self._unlock_keyring(self._resolve_target(), False)
+
     def _resolve_target(self):
         name = os.environ.get("SUDO_USER") if os.geteuid() == 0 else None
         try:
@@ -187,10 +218,10 @@ class ResolveMixin:
         expects."""
         env = {"HOME": t.home, "USER": t.name, "LOGNAME": t.name, "LANG": "C",
                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-               "XDG_RUNTIME_DIR": f"/run/user/{t.uid}",
-               "DBUS_SESSION_BUS_ADDRESS": f"unix:path={t.bus}"}
-        if t.uid == os.geteuid():                    # not sudo: their own overrides still hold
-            for k in ("ETCS_STORE", "XDG_DATA_HOME"):
+               "XDG_RUNTIME_DIR": t.runtime,
+               "DBUS_SESSION_BUS_ADDRESS": t.address}
+        if t.uid == os.geteuid():                    # not sudo: what signing sees, so their own overrides hold
+            for k in ("HOME", "ETCS_STORE", "XDG_DATA_HOME"):
                 if os.environ.get(k):
                     env[k] = os.environ[k]
         drop = {} if t.uid == os.geteuid() else {"user": t.uid, "group": t.gid, "extra_groups": t.groups}
@@ -224,6 +255,9 @@ class ResolveMixin:
                 print(f"{GREEN}[+] libsecret installed{RESET}")
 
     def _resolve_bus(self, t, root, later):
+        if t.inherited:
+            print(f"{GREEN}[+] session bus {t.inherited.split(',')[0]} (this build's){RESET}")
+            return
         if t.bus.is_socket():
             print(f"{GREEN}[+] session bus {t.bus}{RESET}")
             return
@@ -252,7 +286,7 @@ class ResolveMixin:
               f"--components=secrets; ace -y make all'{RESET}")
 
     def _resolve_provider(self, t, root, later):
-        if t.bus.is_socket() and "org.freedesktop.secrets" in self._bus_names(t):
+        if (t.inherited or t.bus.is_socket()) and "org.freedesktop.secrets" in self._bus_names(t):
             print(f"{GREEN}[+] secrets provider on the bus{RESET}")
             return
         if shutil.which("gnome-keyring-daemon"):
