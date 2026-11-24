@@ -6,4 +6,3 @@ Automates:
 - identity, signature authority, local self-signing default
 - informational read outs like 'ace abi' or 'ace ontology'
 - quorum management when comparing ETCS determinism across different underlying hardware sets
-- and more 
