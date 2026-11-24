@@ -55,6 +55,26 @@
             ]
           }
         }
+      },
+      {
+        "name": "stb",
+        "_comment": "stb_image, for the board's piece pictures (CChess's piece_images): one public-domain header at PaintProvider's pin, compiled once and static in ChessProvider.cc, PNG only.",
+        "source": {
+          "type": "git",
+          "url": "https://github.com/nothings/stb.git",
+          "ref": "2c980bb59875b0d32144a71867fbdebb2f77cd20",
+          "shallow": true
+        },
+        "build": {
+          "system": "none"
+        },
+        "arch_sensitive": false,
+        "hash_scope": false,
+        "provides": {
+          "include": [
+            "."
+          ]
+        }
       }
     ]
   },
