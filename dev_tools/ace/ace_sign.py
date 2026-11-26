@@ -246,6 +246,40 @@ class SignMixin:
                   f"{'; ace then signs the current modules again' if not on else ''}{RESET}")
         return 0
 
+    # ------------------------------------------------------------------
+    # The remotes a loader built here heals from (core/Trust.h, ETCS_REMOTES)
+    # ------------------------------------------------------------------
+
+    _REMOTES = re.compile(r"[A-Za-z0-9.-]+(:\d{1,5})?(\+/[A-Za-z0-9.:/_-]+)?(,[A-Za-z0-9.-]+(:\d{1,5})?(\+/[A-Za-z0-9.:/_-]+)?)*")
+
+    def _remotes_cache_path(self):
+        return self._root_cache_path().with_name("etcs_remotes")
+
+    def remotes_setting(self):
+        try:
+            text = self._remotes_cache_path().read_text().strip()
+        except OSError:
+            return ""
+        return text if self._REMOTES.fullmatch(text) else ""
+
+    def remotes_cmd(self, args):
+        """ace remotes [<host>[:<port>][+<ca pem path>][,...] | none]: where the
+        loaders built here heal from, the first their default. They are built
+        into the loader, as its identity is; a loader built with none heals
+        from nowhere."""
+        if len(args) > 1 or (args and args[0] != "none" and not self._REMOTES.fullmatch(args[0])):
+            print("Usage: ace remotes [<host>[:<port>][+<ca pem path>][,...] | none]")
+            return 1
+        if args:
+            f = self._remotes_cache_path()
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(("" if args[0] == "none" else args[0]) + "\n")
+        now = self.remotes_setting()
+        print(f"{GREEN}[+] loaders built here heal from {now.replace(',', ', ') if now else 'nowhere: no remote is built in'}{RESET}")
+        if args:
+            print(f"{DIM}    the next loader build takes it: `ace make loader etcs`{RESET}")
+        return 0
+
     def build_identity(self):
         """(hex or None, where it came from)."""
         setting, source = self._identity_setting()
@@ -891,18 +925,30 @@ class SignMixin:
         and <out>/b, and have the loader built write
         <out>/witness-<host>-<arch>.txt. The loader is built for the identity
         given -- the minting server's, for a build it will mint -- or for none;
-        never this machine's own, which is no other witness's."""
+        never this machine's own, which is no other witness's. The remotes it
+        heals from are built in too (core/Trust.h): this builder's (ace
+        remotes), or -DETCS_REMOTES=<...> given here. They go into the
+        statement, so witnesses built with different ones do not agree."""
+        usage = ("Usage: ace witness <out> [--identity <64 hex>[:<64 hex parent>]] "
+                 "[-DETCS_REMOTES=<host>[:<port>][+<ca>][,...]] [module...]")
+        given = [a for a in args if a.startswith("-DETCS_REMOTES=")]
+        if any(a.startswith(("-D", "-U")) and a not in given for a in args) \
+                or any(not self._REMOTES.fullmatch(a[len("-DETCS_REMOTES="):]) for a in given):
+            print(usage)
+            return 1
+        args = [a for a in args if a not in given]
+        remotes = given[-1][len("-DETCS_REMOTES="):] if given else self.remotes_setting()
         ident, parent = None, None
         if "--identity" in args:
             i = args.index("--identity")
             pair = self._identity_pair(args[i + 1].lower()) if i + 1 < len(args) else None
             if not pair:
-                print("Usage: ace witness <out> [--identity <64 hex>[:<64 hex parent>]] [module...]")
+                print(usage)
                 return 1
             ident, parent = pair
             args = args[:i] + args[i + 2:]
         if not args:
-            print("Usage: ace witness <out> [--identity <64 hex>[:<64 hex parent>]] [module...]")
+            print(usage)
             return 1
         out = Path(args[0]).expanduser().resolve()
         mods = args[1:] or list(self._WITNESS_MODULES)
@@ -916,7 +962,8 @@ class SignMixin:
                     return 1
             if self.make(["loader", "etcs", "--force", "-UETCS_BUILDER_KEY", "-UETCS_UNTRUSTED",
                           f"-DETCS_IDENTITY={ident}" if ident else "-UETCS_IDENTITY",
-                          f"-DETCS_IDENTITY_PARENT={parent}" if parent else "-UETCS_IDENTITY_PARENT"]):
+                          f"-DETCS_IDENTITY_PARENT={parent}" if parent else "-UETCS_IDENTITY_PARENT",
+                          f"-DETCS_REMOTES={remotes}" if remotes else "-UETCS_REMOTES"]):
                 print(f"{RED}[-] etcs did not build{RESET}")
                 return 1
             d = out / run
@@ -931,6 +978,7 @@ class SignMixin:
         account = self._build_account()
         account["identity"] = ident or "none"
         account["parent"] = parent or "none"
+        account["remotes"] = remotes or "none"
         host = re.sub(r"[^A-Za-z0-9._-]", "", platform.node()) or "unnamed"
         arch = f"{platform.system().lower()}-{platform.machine().lower()}"
         statement = out / f"witness-{host}-{arch}.txt"

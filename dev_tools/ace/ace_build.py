@@ -437,7 +437,8 @@ class BuildMixin:
         it but etcs -- and the identity it is built with (ETCS_IDENTITY), what
         it requires at the head of what it takes globally, and its parent
         (ETCS_IDENTITY_PARENT), which lets it recognise its successor across a
-        re-sync: `ace identity`."""
+        re-sync: `ace identity`. And where it heals from (ETCS_REMOTES): `ace
+        remotes`."""
         defs = []
         # An untrusted loader (`ace untrusted on`): checks nothing, has no
         # identity, signs nothing -- for rapid recompiles. Said on every build.
@@ -463,6 +464,10 @@ class BuildMixin:
                 parent = self.build_identity_parent()
                 if parent:
                     defs.append(f"-DETCS_IDENTITY_PARENT={parent}")
+        if not any(a.startswith(("-DETCS_REMOTES", "-UETCS_REMOTES")) for a in args):
+            remotes = self.remotes_setting()
+            if remotes:
+                defs.append(f"-DETCS_REMOTES={remotes}")
         return defs
 
     def _sign_after_loader(self, extras):
